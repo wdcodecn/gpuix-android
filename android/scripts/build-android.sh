@@ -68,6 +68,7 @@ case "$(uname -s)" in
       vc_tools_dir="$(cygpath -u "$VCToolsInstallDir")"
       msvc_linker="$vc_tools_dir/bin/HostX64/x64/link.exe"
       if [[ -x "$msvc_linker" ]]; then
+        export PATH="$vc_tools_dir/bin/HostX64/x64:$PATH"
         export CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER="$msvc_linker"
       fi
     fi
