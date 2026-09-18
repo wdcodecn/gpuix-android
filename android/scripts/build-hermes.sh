@@ -19,6 +19,12 @@ if ! command -v cmake >/dev/null 2>&1; then
   done
 fi
 build_jobs="${GPUIX_BUILD_JOBS:-2}"
+host_generator="Ninja"
+if [[ "$(uname -s)" == MINGW* || "$(uname -s)" == MSYS* || "$(uname -s)" == CYGWIN* ]]; then
+  # Hermes' Windows CMake graph contains duplicate test-library outputs that
+  # Ninja rejects. NMake consumes the same graph correctly inside VsDevCmd.
+  host_generator="NMake Makefiles"
+fi
 if [[ ! -d "$hermes_source/.git" ]]; then
   git clone --depth 1 --branch static_h https://github.com/facebook/hermes.git "$hermes_source"
 fi
@@ -39,7 +45,7 @@ host_args=(
 if [[ "$(uname -s)" == Darwin* ]]; then
   host_args+=("-DHERMES_APPLE_TARGET_PLATFORM=$(xcrun --sdk macosx --show-sdk-path)")
 fi
-cmake -S "$hermes_source" -B "$android_root/.build/hermes-host" -G Ninja \
+cmake -S "$hermes_source" -B "$android_root/.build/hermes-host" -G "$host_generator" \
   "${host_args[@]}"
 cmake --build "$android_root/.build/hermes-host" --target hermesc -j "$build_jobs"
 cmake -S "$android_root/hermes" -B "$android_root/.build/hermes-android" -G Ninja \
