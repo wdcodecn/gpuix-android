@@ -92,6 +92,8 @@ See [Architecture](docs/ARCHITECTURE.md) and
 ## Platform and release status
 
 - Android API 31+ and arm64-v8a are the currently validated target.
+- Windows desktop uses the published `@gpuix/native-win32-x64-msvc` binding;
+  Android builds run through Git Bash and the installed Windows NDK toolchain.
 - Debug APK, local release APK and AAB generation are implemented.
 - Release artifacts use the debug keystore by default for local verification.
   Configure a real upload key before store distribution.

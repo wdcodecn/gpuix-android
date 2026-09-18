@@ -55,7 +55,9 @@ gpuix build --release   # dist/android/<project>-release.apk
 gpuix build --aab       # dist/android/<project>-release.aab
 ```
 
-当前 Android host 支持 arm64-v8a。release APK/AAB 默认使用 debug keystore 方便本地
+当前 Android host 支持 arm64-v8a。Windows 桌面端使用已发布的
+`@gpuix/native-win32-x64-msvc` binding；Android 在 Git Bash 中调用 Windows NDK
+工具链。release APK/AAB 默认使用 debug keystore 方便本地
 验收；上传应用商店前必须配置正式 upload key、递增 `versionCode`，并独立完成商店验收。
 
 架构和性能契约见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)，交付边界与

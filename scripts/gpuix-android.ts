@@ -1,6 +1,7 @@
 #!/usr/bin/env bun
 
 import path from 'node:path'
+import { existsSync } from 'node:fs'
 import { cp, chmod, lstat } from 'node:fs/promises'
 
 type InitOptions = {
@@ -192,6 +193,14 @@ async function run(command: string, args: string[], cwd: string): Promise<void> 
   if (exitCode !== 0) fail(`${command} exited with status ${exitCode}`)
 }
 
+function shellCommand(): string {
+  if (process.platform !== 'win32') return 'bash'
+  for (const candidate of ['C:\\Program Files\\Git\\bin\\bash.exe', 'C:\\Program Files\\Git\\usr\\bin\\bash.exe']) {
+    if (existsSync(candidate)) return candidate
+  }
+  return 'bash'
+}
+
 async function main(): Promise<void> {
   const [command, ...rawArgs] = process.argv.slice(2)
   if (!command || command === '--help' || command === '-h' || command === 'help') {
@@ -217,13 +226,13 @@ async function main(): Promise<void> {
   await requireHost(cwd)
   if (command === 'build') {
     if (parsed.positional.length > 0) fail('build does not accept positional arguments')
-    await run('bash', ['android/scripts/build-android.sh'], cwd)
+    await run(shellCommand(), ['android/scripts/build-android.sh'], cwd)
     return
   }
   if (command === 'install') {
     const serial = option(parsed, 'serial') ?? parsed.positional[0]
     if (!serial || parsed.positional.length > 1) fail('install needs exactly one ADB serial')
-    await run('bash', ['android/scripts/install-android.sh', serial], cwd)
+    await run(shellCommand(), ['android/scripts/install-android.sh', serial], cwd)
     return
   }
   fail(`unknown command ${command}`)

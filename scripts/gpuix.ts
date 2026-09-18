@@ -2,6 +2,7 @@
 
 import path from 'node:path'
 import { homedir } from 'node:os'
+import { existsSync } from 'node:fs'
 import { cp, lstat, mkdir } from 'node:fs/promises'
 import { loadGpuixAndroidConfig } from '../android/scripts/config'
 
@@ -133,6 +134,17 @@ async function run(command: string, args: string[], cwd: string): Promise<void> 
   if (exitCode !== 0) fail(`${command} exited with status ${exitCode}`)
 }
 
+function shellCommand(): string {
+  if (process.platform !== 'win32') return 'bash'
+  // Git for Windows provides the POSIX shell used by the checked-in Android
+  // scripts. Windows also ships a `bash.exe` alias for WSL, which is not a
+  // reliable fallback when no Linux distribution is installed.
+  for (const candidate of ['C:\\Program Files\\Git\\bin\\bash.exe', 'C:\\Program Files\\Git\\usr\\bin\\bash.exe']) {
+    if (existsSync(candidate)) return candidate
+  }
+  return 'bash'
+}
+
 async function capture(command: string, args: string[], cwd = process.cwd()): Promise<{ ok: boolean; output: string }> {
   try {
     const child = Bun.spawn([command, ...args], { cwd, stdout: 'pipe', stderr: 'pipe' })
@@ -223,7 +235,7 @@ async function doctor(projectRoot: string): Promise<void> {
       process.stdout.write(`✗ ${label}: ${result.output.split('\n')[0] || 'not available'}\n`)
     }
   }
-  const sdkRoot = process.env.ANDROID_HOME || process.env.ANDROID_SDK_ROOT || path.join(homedir(), 'Library/Android/sdk')
+  const sdkRoot = process.env.ANDROID_HOME || process.env.ANDROID_SDK_ROOT || path.join(homedir(), process.platform === 'win32' ? 'AppData/Local/Android/Sdk' : 'Library/Android/sdk')
   const sdkAvailable = await exists(sdkRoot)
   if (!sdkAvailable) failures += 1
   process.stdout.write(`${sdkAvailable ? '✓' : '✗'} ANDROID_HOME: ${sdkRoot}\n`)
@@ -276,7 +288,7 @@ async function build(parsed: ParsedArgs, projectRoot: string): Promise<void> {
   const args: string[] = []
   if (hasFlag(parsed, 'release')) args.push('--release')
   if (hasFlag(parsed, 'aab')) args.push('--aab')
-  await run('bash', ['android/scripts/build-android.sh', ...args], projectRoot)
+  await run(shellCommand(), ['android/scripts/build-android.sh', ...args], projectRoot)
 }
 
 async function install(parsed: ParsedArgs, projectRoot: string): Promise<void> {
@@ -284,7 +296,7 @@ async function install(parsed: ParsedArgs, projectRoot: string): Promise<void> {
   if (!serial || parsed.positional.length !== 1) fail('install needs exactly one ADB serial')
   if (hasFlag(parsed, 'aab')) fail('an AAB cannot be installed directly; build an APK for adb')
   await requireHost(projectRoot)
-  await run('bash', ['android/scripts/install-android.sh', serial, ...(hasFlag(parsed, 'release') ? ['--release'] : [])], projectRoot)
+  await run(shellCommand(), ['android/scripts/install-android.sh', serial, ...(hasFlag(parsed, 'release') ? ['--release'] : [])], projectRoot)
 }
 
 async function main(): Promise<void> {

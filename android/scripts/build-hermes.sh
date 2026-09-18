@@ -6,6 +6,10 @@ libuv_source="$android_root/.deps/hermes-libuv"
 hermes_commit=4947871513667919bf2fe225134af3e3a1a3772c
 sdk_root="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-$HOME/Library/Android/sdk}}"
 ndk_root="${ANDROID_NDK_ROOT:-$sdk_root/ndk/28.2.13676358}"
+if command -v cygpath >/dev/null 2>&1; then
+  sdk_root="$(cygpath -u "$sdk_root")"
+  ndk_root="$(cygpath -u "$ndk_root")"
+fi
 build_jobs="${GPUIX_BUILD_JOBS:-2}"
 if [[ ! -d "$hermes_source/.git" ]]; then
   git clone --depth 1 --branch static_h https://github.com/facebook/hermes.git "$hermes_source"
@@ -17,13 +21,18 @@ fi
 if [[ ! -d "$libuv_source/.git" ]]; then
   git clone --depth 1 --branch v1.51.0 https://github.com/libuv/libuv.git "$libuv_source"
 fi
-cmake -S "$hermes_source" -B "$android_root/.build/hermes-host" -G Ninja \
-  -DCMAKE_BUILD_TYPE=MinSizeRel \
-  -DHERMES_APPLE_TARGET_PLATFORM="$(xcrun --sdk macosx --show-sdk-path)" \
-  -DHERMES_ENABLE_TEST_SUITE=OFF -DHERMES_ENABLE_DEBUGGER=OFF \
-  -DHERMES_ENABLE_INTL=OFF -DHERMESVM_ALLOW_JIT=0 \
-  -DHERMESVM_INTERNAL_JAVASCRIPT_NATIVE=OFF -DHERMES_ENABLE_CORE_EXTENSIONS=OFF \
+host_args=(
+  -DCMAKE_BUILD_TYPE=MinSizeRel
+  -DHERMES_ENABLE_TEST_SUITE=OFF -DHERMES_ENABLE_DEBUGGER=OFF
+  -DHERMES_ENABLE_INTL=OFF -DHERMESVM_ALLOW_JIT=0
+  -DHERMESVM_INTERNAL_JAVASCRIPT_NATIVE=OFF -DHERMES_ENABLE_CORE_EXTENSIONS=OFF
   -DHERMES_UNICODE_LITE=ON
+)
+if [[ "$(uname -s)" == Darwin* ]]; then
+  host_args+=("-DHERMES_APPLE_TARGET_PLATFORM=$(xcrun --sdk macosx --show-sdk-path)")
+fi
+cmake -S "$hermes_source" -B "$android_root/.build/hermes-host" -G Ninja \
+  "${host_args[@]}"
 cmake --build "$android_root/.build/hermes-host" --target hermesc -j "$build_jobs"
 cmake -S "$android_root/hermes" -B "$android_root/.build/hermes-android" -G Ninja \
   -DCMAKE_TOOLCHAIN_FILE="$ndk_root/build/cmake/android.toolchain.cmake" \

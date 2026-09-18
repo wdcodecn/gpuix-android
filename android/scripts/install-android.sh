@@ -24,7 +24,11 @@ app_id="$(bun "$android_root/scripts/config.ts" --field appId --project "$projec
 activity_name="${GPUIX_ANDROID_ACTIVITY:-dev.gpui.mobile.GpuiActivity}"
 adb -s "$device_serial" get-state
 adb -s "$device_serial" shell am force-stop "$app_id"
-apk_size="$(stat -f '%z' "$apk_path")"
+if stat -c '%s' "$apk_path" >/dev/null 2>&1; then
+  apk_size="$(stat -c '%s' "$apk_path")"
+else
+  apk_size="$(stat -f '%z' "$apk_path")"
+fi
 remote_apk="/data/local/tmp/$artifact_stem-$variant.apk"
 adb -s "$device_serial" push "$apk_path" "$remote_apk"
 session_output="$(adb -s "$device_serial" shell pm install-create -r -S "$apk_size")"

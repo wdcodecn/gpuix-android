@@ -5,6 +5,15 @@ android_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 project_root="$(dirname "$android_root")"
 sdk_root="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-$HOME/Library/Android/sdk}}"
 ndk_root="${ANDROID_NDK_ROOT:-$sdk_root/ndk/28.2.13676358}"
+if command -v cygpath >/dev/null 2>&1; then
+  sdk_root="$(cygpath -u "$sdk_root")"
+  ndk_root="$(cygpath -u "$ndk_root")"
+fi
+case "$(uname -s)" in
+  Darwin*) ndk_host="darwin-x86_64" ;;
+  MINGW*|MSYS*|CYGWIN*) ndk_host="windows-x86_64" ;;
+  *) ndk_host="linux-x86_64" ;;
+esac
 zed_revision=81c99f816b4a5f69d3c014774068034c24d1d7af
 
 variant="debug"
@@ -57,9 +66,9 @@ mkdir -p "$package_jni_dir"
 cp "$cargo_jni_dir/arm64-v8a/libgpuix_android.so" "$package_jni_dir/"
 cp "$android_root/.build/hermes-android/libgpuix_js.so" \
   "$package_jni_dir/"
-cp "$ndk_root/toolchains/llvm/prebuilt/darwin-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so" \
+cp "$ndk_root/toolchains/llvm/prebuilt/$ndk_host/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so" \
   "$package_jni_dir/"
-llvm_strip="$ndk_root/toolchains/llvm/prebuilt/darwin-x86_64/bin/llvm-strip"
+llvm_strip="$ndk_root/toolchains/llvm/prebuilt/$ndk_host/bin/llvm-strip"
 "$llvm_strip" --strip-debug "$package_jni_dir/libgpuix_js.so"
 "$llvm_strip" --strip-debug "$package_jni_dir/libgpuix_android.so"
 if (( bundle )); then

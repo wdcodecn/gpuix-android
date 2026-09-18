@@ -43,8 +43,10 @@ bash android/scripts/build-android.sh --aab
 ```
 
 Requires Bun, Rust Android target, cargo-ndk, Android SDK 35, NDK 28.2, JDK 17+,
-CMake/Ninja, and Xcode command line tools for the host Hermes compiler on macOS.
-First build compiles the native dependencies; subsequent builds reuse local caches.
+and CMake/Ninja. macOS additionally needs Xcode command line tools. Windows uses
+Git for Windows' Bash plus the MSVC C++ workload from Visual Studio Build Tools;
+the scripts select the Windows NDK toolchain automatically. First build compiles
+the native dependencies; subsequent builds reuse local caches.
 
 ## Reused upstream implementations
 
