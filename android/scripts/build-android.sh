@@ -57,6 +57,23 @@ export CARGO_PROFILE_DEV_DEBUG=0
 export CARGO_INCREMENTAL=0
 export CARGO_BUILD_JOBS="${GPUIX_BUILD_JOBS:-2}"
 
+# Git Bash puts /usr/bin/link.exe (the Unix compatibility wrapper) ahead of
+# the MSVC toolchain. Cargo's host build scripts then try to link Windows
+# proc-macros with that wrapper and fail before the Android target is built.
+# VsDevCmd exposes VCToolsInstallDir, so pin Cargo to the real MSVC linker
+# whenever this script is running under MINGW/MSYS/CYGWIN.
+case "$(uname -s)" in
+  MINGW*|MSYS*|CYGWIN*)
+    if [[ -n "${VCToolsInstallDir:-}" ]] && command -v cygpath >/dev/null 2>&1; then
+      vc_tools_dir="$(cygpath -u "$VCToolsInstallDir")"
+      msvc_linker="$vc_tools_dir/bin/HostX64/x64/link.exe"
+      if [[ -x "$msvc_linker" ]]; then
+        export CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER="$msvc_linker"
+      fi
+    fi
+    ;;
+esac
+
 cargo_jni_dir="$android_root/.build/cargo-jniLibs"
 package_jni_dir="$android_root/app/src/main/jniLibs/arm64-v8a"
 
