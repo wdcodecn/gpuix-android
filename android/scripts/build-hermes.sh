@@ -10,6 +10,14 @@ if command -v cygpath >/dev/null 2>&1; then
   sdk_root="$(cygpath -u "$sdk_root")"
   ndk_root="$(cygpath -u "$ndk_root")"
 fi
+if ! command -v cmake >/dev/null 2>&1; then
+  for cmake_dir in "$sdk_root/cmake/3.22.1/bin" "$sdk_root/cmake/3.22.1"; do
+    if [[ -x "$cmake_dir/cmake" || -x "$cmake_dir/cmake.exe" ]]; then
+      export PATH="$cmake_dir:$PATH"
+      break
+    fi
+  done
+fi
 build_jobs="${GPUIX_BUILD_JOBS:-2}"
 if [[ ! -d "$hermes_source/.git" ]]; then
   git clone --depth 1 --branch static_h https://github.com/facebook/hermes.git "$hermes_source"

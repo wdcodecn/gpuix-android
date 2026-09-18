@@ -14,6 +14,14 @@ case "$(uname -s)" in
   MINGW*|MSYS*|CYGWIN*) ndk_host="windows-x86_64" ;;
   *) ndk_host="linux-x86_64" ;;
 esac
+if ! command -v cmake >/dev/null 2>&1; then
+  for cmake_dir in "$sdk_root/cmake/3.22.1/bin" "$sdk_root/cmake/3.22.1"; do
+    if [[ -x "$cmake_dir/cmake" || -x "$cmake_dir/cmake.exe" ]]; then
+      export PATH="$cmake_dir:$PATH"
+      break
+    fi
+  done
+fi
 zed_revision=81c99f816b4a5f69d3c014774068034c24d1d7af
 
 variant="debug"
