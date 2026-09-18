@@ -1,0 +1,28 @@
+[package]
+name = "gpuix-android"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "gpuix_android"
+crate-type = ["cdylib"]
+
+[dependencies]
+gpuix-native = { path = "../vendor/gpuix-native", default-features = false }
+android-activity = { version = "0.6", features = ["native-activity"] }
+android_logger = "0.15"
+log = "0.4"
+
+[patch.crates-io]
+async-task = { git = "https://github.com/smol-rs/async-task.git", rev = "b4486cd71e4e94fbda54ce6302444de14f4d190e" }
+
+[profile.dev]
+debug = 0
+incremental = false
+
+[profile.release]
+opt-level = "s"
+debug = 0
+strip = "debuginfo"
+lto = "thin"

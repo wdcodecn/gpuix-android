@@ -1,0 +1,58 @@
+{
+  "name": "gpuix-android",
+  "version": "0.1.0",
+  "description": "Native Android host and CLI for React on GPUIX using GPUI, wgpu and standalone Hermes without WebView.",
+  "type": "module",
+  "license": "MIT",
+  "keywords": ["gpuix", "gpui", "android", "react", "hermes", "wgpu", "native"],
+  "files": [
+    "README.md",
+    "README.zh-CN.md",
+    "CONTRIBUTING.md",
+    "SECURITY.md",
+    "LICENSE",
+    "docs",
+    "templates",
+    "scripts/gpuix.ts",
+    "scripts/gpuix-android.ts",
+    "android/README.md",
+    "android/app/build.gradle.kts",
+    "android/app/src/main/AndroidManifest.xml",
+    "android/app/src/main/java",
+    "android/app/src/main/res",
+    "android/build.gradle.kts",
+    "android/gradle.properties",
+    "android/gradle",
+    "android/gradlew",
+    "android/hermes",
+    "android/rust/Cargo.lock",
+    "android/rust/Cargo.toml",
+    "android/rust/build.rs",
+    "android/rust/src",
+    "android/scripts",
+    "android/settings.gradle.kts",
+    "android/vendor/gpui-mobile/src",
+    "android/vendor/gpui-mobile/Cargo.toml",
+    "android/vendor/gpui-mobile/Cargo.lock",
+    "android/vendor/gpui-mobile/LICENSE-APACHE",
+    "android/vendor/gpui-mobile/LICENSE-AGPL",
+    "android/vendor/gpui-mobile/LICENSE-GPL",
+    "android/vendor/gpuix-native/src",
+    "android/vendor/gpuix-native/Cargo.toml",
+    "android/vendor/gpuix-native/Cargo.lock",
+    "android/vendor/gpuix-native/build.rs",
+    "android/vendor/gpuix-native/LICENSE"
+  ],
+  "bin": {
+    "gpuix": "./scripts/gpuix.ts",
+    "gpuix-android": "./scripts/gpuix.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "help": "bun scripts/gpuix.ts help"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.2.0",
+    "typescript": "^5.3.0"
+  }
+}

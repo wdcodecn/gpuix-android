@@ -1,0 +1,26 @@
+{
+  "name": "__PROJECT_NAME__",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "bun --hot src/main.tsx",
+    "typecheck": "tsc --noEmit",
+    "gpuix": "gpuix",
+    "gpuix:doctor": "gpuix doctor",
+    "gpuix:build": "gpuix build",
+    "gpuix:run": "gpuix run"
+  },
+  "dependencies": {
+    "@gpuix/native": "0.9.0",
+    "@gpuix/react": "0.9.0",
+    "gpuix-base-ui": "^__GPUX_BASE_UI_VERSION__",
+    "react": "19.3.0"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.2.0",
+    "@types/react": "^19.2.0",
+    "gpuix-android": "^__GPUIX_ANDROID_VERSION__",
+    "typescript": "^5.3.0"
+  }
+}
