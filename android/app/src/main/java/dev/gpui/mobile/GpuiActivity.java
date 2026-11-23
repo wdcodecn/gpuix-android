@@ -1,12 +1,17 @@
 package dev.gpui.mobile;
 
 import android.app.NativeActivity;
+import android.content.ClipData;
+import android.content.ClipboardManager;
+import android.content.Context;
 import android.content.Intent;
 import android.content.pm.ActivityInfo;
 import android.content.pm.PackageManager;
 import android.media.AudioManager;
 import android.net.Uri;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.util.Log;
 import android.view.KeyEvent;
 import android.view.View;
@@ -14,6 +19,10 @@ import android.view.WindowInsets;
 import android.view.WindowInsetsAnimation;
 import android.graphics.Insets;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 
 import androidx.core.splashscreen.SplashScreen;
 
@@ -40,8 +49,12 @@ public class GpuiActivity extends NativeActivity {
     /** Whether the native .so has been loaded via System.loadLibrary. */
     private static volatile boolean sNativeLibLoaded = false;
 
+    /** Live activity reference used by thread-safe JNI system helpers. */
+    private static volatile GpuiActivity sInstance = null;
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
+        sInstance = this;
         // Install the splash screen BEFORE calling super.onCreate().
         // This is required by the AndroidX SplashScreen API.
         SplashScreen splash = SplashScreen.installSplashScreen(this);
@@ -156,7 +169,94 @@ public class GpuiActivity extends NativeActivity {
 
     @Override
     protected void onDestroy() {
+        if (sInstance == this) {
+            sInstance = null;
+        }
         super.onDestroy();
+    }
+
+    /** Thread-safe clipboard reader invoked from Rust via JNI. */
+    public static String getClipboardText() {
+        final GpuiActivity activity = sInstance;
+        if (activity == null) {
+            return null;
+        }
+        RunnableWithResult<String> task = () -> {
+            try {
+                ClipboardManager cm = (ClipboardManager) activity.getSystemService(Context.CLIPBOARD_SERVICE);
+                if (cm == null || !cm.hasPrimaryClip()) {
+                    return null;
+                }
+                ClipData clip = cm.getPrimaryClip();
+                if (clip == null || clip.getItemCount() == 0) {
+                    return null;
+                }
+                CharSequence text = clip.getItemAt(0).coerceToText(activity);
+                return text != null ? text.toString() : null;
+            } catch (Throwable ignored) {
+                return null;
+            }
+        };
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            return task.run();
+        }
+        final AtomicReference<String> ref = new AtomicReference<>(null);
+        final CountDownLatch latch = new CountDownLatch(1);
+        new Handler(Looper.getMainLooper()).post(() -> {
+            try {
+                ref.set(task.run());
+            } finally {
+                latch.countDown();
+            }
+        });
+        try {
+            latch.await(500, TimeUnit.MILLISECONDS);
+        } catch (InterruptedException ignored) {
+            Thread.currentThread().interrupt();
+        }
+        return ref.get();
+    }
+
+    /** Thread-safe clipboard writer invoked from Rust via JNI. */
+    public static boolean setClipboardText(final String text) {
+        final GpuiActivity activity = sInstance;
+        if (activity == null || text == null) {
+            return false;
+        }
+        RunnableWithResult<Boolean> task = () -> {
+            try {
+                ClipboardManager cm = (ClipboardManager) activity.getSystemService(Context.CLIPBOARD_SERVICE);
+                if (cm == null) {
+                    return false;
+                }
+                cm.setPrimaryClip(ClipData.newPlainText("gpuix", text));
+                return true;
+            } catch (Throwable ignored) {
+                return false;
+            }
+        };
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            return Boolean.TRUE.equals(task.run());
+        }
+        final AtomicBoolean ok = new AtomicBoolean(false);
+        final CountDownLatch latch = new CountDownLatch(1);
+        new Handler(Looper.getMainLooper()).post(() -> {
+            try {
+                ok.set(Boolean.TRUE.equals(task.run()));
+            } finally {
+                latch.countDown();
+            }
+        });
+        try {
+            latch.await(500, TimeUnit.MILLISECONDS);
+        } catch (InterruptedException ignored) {
+            Thread.currentThread().interrupt();
+        }
+        return ok.get();
+    }
+
+    private interface RunnableWithResult<T> {
+        T run();
     }
 
     /**

@@ -64,21 +64,35 @@ use gpui_wgpu::GpuContext;
 
 // ── stub: clipboard ───────────────────────────────────────────────────────────
 
-/// Android clipboard (thin wrapper over `ClipboardManager` via JNI).
-///
-/// A real implementation would call into Java via `jni-rs`; for now we use
-/// an in-process string store so the rest of the platform compiles.
+/// Android clipboard backed by JNI `ClipboardManager` on live devices, with an
+/// in-memory fallback for headless unit tests.
 #[derive(Default)]
 pub struct AndroidClipboard {
     contents: Option<String>,
+    headless: bool,
 }
 
 impl AndroidClipboard {
+    pub fn new(headless: bool) -> Self {
+        Self {
+            contents: None,
+            headless,
+        }
+    }
+
     pub fn read(&self) -> Option<String> {
+        if !self.headless {
+            if let Some(text) = crate::android::jni::read_system_clipboard() {
+                return Some(text);
+            }
+        }
         self.contents.clone()
     }
 
     pub fn write(&mut self, text: String) {
+        if !self.headless {
+            let _ = crate::android::jni::write_system_clipboard(&text);
+        }
         self.contents = Some(text);
     }
 
@@ -281,115 +295,137 @@ impl AndroidPlatform {
 
         let text_system = Arc::new(CosmicTextSystem::new("Roboto"));
 
-        // Load Android system fonts so GPUI's fallback chain can resolve.
-        // GPUI tries ".SystemUIFont" → ".ZedMono" → … → "Noto Sans" → "DejaVu Sans" → "Arial".
-        // Android ships Roboto and DroidSans in /system/fonts/.  We load them
-        // explicitly because cosmic-text's fontdb may not scan Android paths.
+        // Two-phase font loading:
+        // Phase 1 (synchronous): load only minimal core Roboto faces needed
+        // for the first frame (<5 ms, avoids blocking cold start on CJK/Emoji
+        // font I/O and parsing).
         {
-            let font_paths: &[&str] = &[
-                // Core UI fonts
+            let core_fonts: &[&str] = &[
                 "/system/fonts/Roboto-Regular.ttf",
                 "/system/fonts/Roboto-Bold.ttf",
-                "/system/fonts/Roboto-Italic.ttf",
-                "/system/fonts/Roboto-BoldItalic.ttf",
-                "/system/fonts/Roboto-Medium.ttf",
-                "/system/fonts/Roboto-Light.ttf",
-                "/system/fonts/Roboto-Thin.ttf",
-                "/system/fonts/RobotoFlex-Regular.ttf",
-                // Monospace
-                "/system/fonts/DroidSans.ttf",
-                "/system/fonts/DroidSans-Bold.ttf",
-                "/system/fonts/DroidSansMono.ttf",
-                "/system/fonts/RobotoMono-Regular.ttf",
-                // Noto Sans (wide Unicode coverage)
-                "/system/fonts/NotoSans-Regular.ttf",
-                "/system/fonts/NotoSans-Bold.ttf",
-                "/system/fonts/NotoSans-Italic.ttf",
-                "/system/fonts/NotoSans-BoldItalic.ttf",
-                "/system/fonts/NotoSansCJK-Regular.ttc",
-                "/system/fonts/NotoSansDevanagari-Regular.otf",
-                "/system/fonts/NotoSansArabic-Regular.ttf",
-                "/system/fonts/NotoSansHebrew-Regular.ttf",
-                "/system/fonts/NotoSansThai-Regular.ttf",
-                // Emoji fonts — loaded so glyphs like 🦀 ✅ ❤️ render.
-                // NOTE: On Android 13+ (API 33+) the system NotoColorEmoji.ttf
-                // uses COLR v1 color outlines which swash cannot render.  We
-                // detect this below and load a bundled CBDT-based fallback
-                // instead.  The flag font is still useful regardless.
-                "/system/fonts/NotoColorEmojiFlags.ttf",
-                // Serif (fallback)
-                "/system/fonts/NotoSerif-Regular.ttf",
-                "/system/fonts/NotoSerif-Bold.ttf",
             ];
             let mut font_data: Vec<std::borrow::Cow<'static, [u8]>> = Vec::new();
-            for path in font_paths {
-                match std::fs::read(path) {
-                    Ok(bytes) => {
-                        log::info!("loaded system font: {path} ({} bytes)", bytes.len());
-                        font_data.push(std::borrow::Cow::Owned(bytes));
-                    }
-                    Err(e) => {
-                        log::debug!("skipping system font {path}: {e}");
-                    }
+            for path in core_fonts {
+                if let Ok(bytes) = std::fs::read(path) {
+                    log::info!("loaded core font: {path} ({} bytes)", bytes.len());
+                    font_data.push(std::borrow::Cow::Owned(bytes));
                 }
             }
-
-            // ── Emoji font: prefer CBDT (bitmap) over COLR v1 ───────────
-            //
-            // swash can render CBDT/CBLC bitmap emoji and COLR v0 colour
-            // outlines, but NOT COLR v1 (used by Android 13+ / API 33+).
-            // If the system font lacks CBDT tables we load a bundled
-            // CBDT-based NotoColorEmoji from the APK assets instead.
-            let system_emoji_path = "/system/fonts/NotoColorEmoji.ttf";
-            let mut emoji_loaded = false;
-
-            if let Ok(system_emoji_bytes) = std::fs::read(system_emoji_path) {
-                if font_has_cbdt_tables(&system_emoji_bytes) {
-                    log::info!(
-                        "system emoji font has CBDT tables — using it ({} bytes)",
-                        system_emoji_bytes.len()
-                    );
-                    font_data.push(std::borrow::Cow::Owned(system_emoji_bytes));
-                    emoji_loaded = true;
-                } else {
-                    log::info!(
-                        "system emoji font is COLR v1 (no CBDT) — will try bundled fallback"
-                    );
+            if font_data.is_empty() {
+                if let Ok(bytes) = std::fs::read("/system/fonts/DroidSans.ttf") {
+                    font_data.push(std::borrow::Cow::Owned(bytes));
                 }
             }
-
-            if !emoji_loaded {
-                // Try loading the bundled CBDT NotoColorEmoji from APK assets.
-                if let Some(app) = crate::android::jni::android_app() {
-                    match load_asset_bytes(&app, "fonts/NotoColorEmoji.ttf") {
-                        Ok(bytes) => {
-                            log::info!(
-                                "loaded bundled CBDT emoji font from assets ({} bytes)",
-                                bytes.len()
-                            );
-                            font_data.push(std::borrow::Cow::Owned(bytes));
-                            emoji_loaded = true;
-                        }
-                        Err(e) => {
-                            log::warn!("failed to load bundled emoji font from assets: {e:#}");
-                        }
-                    }
-                } else {
-                    log::debug!("no AndroidApp available — cannot load bundled emoji font");
-                }
-            }
-
-            if !emoji_loaded {
-                log::warn!("no compatible emoji font loaded — emoji glyphs may not render");
-            }
-
             if !font_data.is_empty() {
                 if let Err(e) = text_system.add_fonts(font_data) {
-                    log::warn!("failed to add system fonts: {e:#}");
+                    log::warn!("failed to add core fonts: {e:#}");
                 }
             } else {
-                log::warn!("no system fonts found in /system/fonts/");
+                log::warn!("no core system fonts found in /system/fonts/");
             }
+        }
+
+        // Phase 2 (background thread, non-headless): lazily load CJK, extended
+        // scripts, monospace variants, and CBDT emoji fonts, then schedule a
+        // repaint after each batch so fallback glyphs appear cleanly.
+        if !headless {
+            let bg_text_system = Arc::clone(&text_system);
+            let _ = std::thread::Builder::new()
+                .name("gpuix-fonts".into())
+                .spawn(move || {
+                    let batch1_paths: &[&str] = &[
+                        "/system/fonts/Roboto-Italic.ttf",
+                        "/system/fonts/Roboto-BoldItalic.ttf",
+                        "/system/fonts/Roboto-Medium.ttf",
+                        "/system/fonts/Roboto-Light.ttf",
+                        "/system/fonts/Roboto-Thin.ttf",
+                        "/system/fonts/RobotoFlex-Regular.ttf",
+                        "/system/fonts/DroidSans.ttf",
+                        "/system/fonts/DroidSans-Bold.ttf",
+                        "/system/fonts/DroidSansMono.ttf",
+                        "/system/fonts/RobotoMono-Regular.ttf",
+                        "/system/fonts/NotoSansCJK-Regular.ttc",
+                    ];
+                    let mut batch1: Vec<std::borrow::Cow<'static, [u8]>> = Vec::new();
+                    for path in batch1_paths {
+                        if let Ok(bytes) = std::fs::read(path) {
+                            log::info!("loaded bg font batch1: {path} ({} bytes)", bytes.len());
+                            batch1.push(std::borrow::Cow::Owned(bytes));
+                        }
+                    }
+                    if !batch1.is_empty() {
+                        if let Err(e) = bg_text_system.add_fonts(batch1) {
+                            log::warn!("failed to add bg fonts batch1: {e:#}");
+                        } else if let Some(p) = crate::android::jni::shared_platform() {
+                            if let Some(w) = p.0.primary_window() {
+                                w.schedule_frame();
+                            }
+                        }
+                    }
+
+                    let batch2_paths: &[&str] = &[
+                        "/system/fonts/NotoSans-Regular.ttf",
+                        "/system/fonts/NotoSans-Bold.ttf",
+                        "/system/fonts/NotoSans-Italic.ttf",
+                        "/system/fonts/NotoSans-BoldItalic.ttf",
+                        "/system/fonts/NotoSansDevanagari-Regular.otf",
+                        "/system/fonts/NotoSansArabic-Regular.ttf",
+                        "/system/fonts/NotoSansHebrew-Regular.ttf",
+                        "/system/fonts/NotoSansThai-Regular.ttf",
+                        "/system/fonts/NotoColorEmojiFlags.ttf",
+                        "/system/fonts/NotoSerif-Regular.ttf",
+                        "/system/fonts/NotoSerif-Bold.ttf",
+                    ];
+                    let mut batch2: Vec<std::borrow::Cow<'static, [u8]>> = Vec::new();
+                    for path in batch2_paths {
+                        if let Ok(bytes) = std::fs::read(path) {
+                            log::info!("loaded bg font batch2: {path} ({} bytes)", bytes.len());
+                            batch2.push(std::borrow::Cow::Owned(bytes));
+                        }
+                    }
+
+                    let system_emoji_path = "/system/fonts/NotoColorEmoji.ttf";
+                    let mut emoji_loaded = false;
+                    if let Ok(system_emoji_bytes) = std::fs::read(system_emoji_path) {
+                        if font_has_cbdt_tables(&system_emoji_bytes) {
+                            log::info!(
+                                "system emoji font has CBDT tables — using it ({} bytes)",
+                                system_emoji_bytes.len()
+                            );
+                            batch2.push(std::borrow::Cow::Owned(system_emoji_bytes));
+                            emoji_loaded = true;
+                        } else {
+                            log::info!("system emoji font is COLR v1 (no CBDT) — will try bundled fallback");
+                        }
+                    }
+                    if !emoji_loaded {
+                        if let Some(app) = crate::android::jni::android_app() {
+                            match load_asset_bytes(&app, "fonts/NotoColorEmoji.ttf") {
+                                Ok(bytes) => {
+                                    log::info!("loaded bundled CBDT emoji font ({} bytes)", bytes.len());
+                                    batch2.push(std::borrow::Cow::Owned(bytes));
+                                    emoji_loaded = true;
+                                }
+                                Err(e) => {
+                                    log::warn!("failed to load bundled emoji font from assets: {e:#}");
+                                }
+                            }
+                        }
+                    }
+                    if !emoji_loaded {
+                        log::warn!("no compatible emoji font loaded — emoji glyphs may not render");
+                    }
+
+                    if !batch2.is_empty() {
+                        if let Err(e) = bg_text_system.add_fonts(batch2) {
+                            log::warn!("failed to add bg fonts batch2: {e:#}");
+                        } else if let Some(p) = crate::android::jni::shared_platform() {
+                            if let Some(w) = p.0.primary_window() {
+                                w.schedule_frame();
+                            }
+                        }
+                    }
+                });
         }
 
         let displays = if headless {
@@ -410,7 +446,7 @@ impl AndroidPlatform {
                 windows: WindowList::default(),
                 displays,
                 text_system,
-                clipboard: AndroidClipboard::default(),
+                clipboard: AndroidClipboard::new(headless),
                 credentials: AndroidCredentialStore::default(),
                 finish_launching: None,
                 quit_callback: None,

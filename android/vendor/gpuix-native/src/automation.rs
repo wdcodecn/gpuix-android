@@ -9,6 +9,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -69,6 +70,47 @@ pub fn track_own_bounds<E: gpui::InteractiveElement>(el: E, id: u64) -> E {
     el.on_painted(move |bounds, _, _| record_bounds(id, bounds))
 }
 
+/// Record a host element's painted box, and its selection-start region, for
+/// automation and text selection.
+///
+/// The element reports its own box through `on_painted`, so tracking it adds
+/// nothing to the tree. The previous `bounds_tracker` child doubled the number
+/// of nodes gpui laid out, prepainted and painted for every `<div>` and
+/// `<text>`.
+///
+/// gpui paints nothing for `visibility: hidden`, not the element and not its
+/// children, so a hidden element reports no box and fires no `onLayout`. A
+/// canvas child cannot work around that: it is never painted either.
+///
+/// The box is the border box, which is what a DOM `getBoundingClientRect`
+/// reports. `bounds_tracker` fills the padding box instead.
+///
+/// `report` sees the painted box right after it is recorded. `on_painted`
+/// takes one listener, so the paint-driven events share this one.
+pub fn track_host_bounds<E>(
+    el: E,
+    id: u64,
+    selection_start: Option<bool>,
+    report: Option<PaintReporter>,
+) -> E
+where
+    E: gpui::InteractiveElement,
+{
+    el.on_painted(move |bounds, _, cx| {
+        record_bounds(id, bounds);
+        if let Some(selectable) = selection_start {
+            crate::text::record_start_region(bounds, selectable);
+        }
+        if let Some(report) = &report {
+            report(bounds, cx);
+        }
+    })
+}
+
+/// Called with an element's painted box on every paint, from inside paint. It
+/// is how `onLayout` and `onScrollChange` see what the frame produced.
+pub type PaintReporter = Rc<dyn Fn(Bounds<Pixels>, &mut App)>;
+
 pub fn record_bounds(id: u64, bounds: Bounds<Pixels>) {
     BOUNDS.with(|cell| {
         cell.borrow_mut()
@@ -94,7 +136,11 @@ pub fn bounds_tracker(id: u64, selection_start: Option<bool>) -> impl IntoElemen
             }
         },
     )
+    // Inset 0, or Taffy places an absolute child at the content box and the
+    // box, click target and selection region all shift by the padding.
     .absolute()
+    .top_0()
+    .left_0()
     .size_full()
 }
 

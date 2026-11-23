@@ -23,7 +23,7 @@ use crate::element_tree::EventPayload;
 use crate::renderer::{
     apply_batch_to_tree, debug_frame_overlay_mode_name, debug_frame_overlay_stats_js,
     parse_debug_frame_overlay_mode, to_element_id, DebugFrameOverlayStats, EventCallback,
-    GpuixView,
+    GpuixView, PathPromptOptions, PromptForPathsTask,
 };
 use crate::retained_tree::RetainedTree;
 
@@ -264,8 +264,13 @@ impl TestGpuixRenderer {
         // Visual tests have no VoiceOver / UIA client, so AccessKit never
         // activates. Pretend one is connected so every flush builds a tree
         // that get_a11y_tree can dump.
-        cx.update_window(window, |_, window, _| {
+        //
+        // The offscreen window is also never key. GPUI reports focus paths
+        // only for an active window, so without this onFocus / onBlur never
+        // fire in tests. Real activation would take the user's keyboard.
+        cx.update_window(window, |_, window, cx| {
             window.set_a11y_active_for_tests(true);
+            window.set_active_for_tests(true, cx);
         })
         .map_err(|e| Error::from_reason(e.to_string()))?;
         cx.run_until_parked();
@@ -450,6 +455,24 @@ impl TestGpuixRenderer {
         })
     }
 
+    /// Simulate the pointer leaving the window, as the platform reports it when
+    /// the cursor crosses the window edge: there is no final mouse move.
+    #[napi]
+    pub fn simulate_mouse_exit(&self, x: f64, y: f64) -> Result<()> {
+        with_test_state(|cx, window, _view| {
+            simulate_event_with_view_lease(
+                cx,
+                window,
+                gpui::MouseExitEvent {
+                    position: gpui::point(gpui::px(x as f32), gpui::px(y as f32)),
+                    pressed_button: None,
+                    modifiers: Default::default(),
+                },
+            );
+            Ok(())
+        })
+    }
+
     /// Focus an element by its numeric ID.
     /// The element must have a FocusHandle (created by sync_focus_handles when
     /// the element has keyDown, keyUp, focus, or blur listeners).
@@ -462,13 +485,10 @@ impl TestGpuixRenderer {
             let view = view.clone();
 
             cx.update_window(window, |_, window, app| {
-                view.update(app, |view, cx| {
-                    view.reveal_virtual_list_ancestor(id);
-                    if let Some(handle) = view.focus_handles.get(&id) {
-                        handle.focus(window, cx);
-                    }
-                    cx.notify();
-                });
+                // Same path as the live renderer: an element whose focus
+                // handle does not exist yet (Solid applies its mutations in
+                // a microtask) takes focus when its handle is created.
+                view.update(app, |view, cx| view.request_focus(id, window, cx));
             })
             .map_err(|e| Error::from_reason(e.to_string()))?;
 
@@ -495,6 +515,17 @@ impl TestGpuixRenderer {
             cx.run_until_parked();
             Ok(())
         })
+    }
+
+    #[napi]
+    pub fn prompt_for_paths(
+        &self,
+        options: Option<PathPromptOptions>,
+    ) -> AsyncTask<PromptForPathsTask> {
+        let receiver = PathPromptOptions::to_gpui(options).and_then(|options| {
+            with_test_state(|cx, _window, _view| Ok(cx.update(|cx| cx.prompt_for_paths(options))))
+        });
+        AsyncTask::new(PromptForPathsTask::new(receiver))
     }
 
     #[napi]
@@ -809,6 +840,82 @@ impl TestGpuixRenderer {
         })
     }
 
+    /// Scroll this element's nearest scroll parent until the element is visible.
+    #[napi]
+    pub fn scroll_into_view(&self, element_id: f64) -> Result<()> {
+        let id = to_element_id(element_id)?;
+        with_test_state(|cx, window, view| {
+            let view = view.clone();
+            cx.update_window(window, |_, window, app| {
+                view.update(app, |view, cx| {
+                    if view.scroll_element_into_view(id) {
+                        cx.notify();
+                        window.refresh();
+                    }
+                });
+            })
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+            Ok(())
+        })
+    }
+
+    /// Packed `"rgba"` (default) or `"bgra"` pixels onto an `<img>` host node.
+    #[napi]
+    pub fn set_image_pixels(
+        &self,
+        element_id: f64,
+        width: f64,
+        height: f64,
+        pixels: Buffer,
+        format: Option<String>,
+    ) -> Result<()> {
+        let id = to_element_id(element_id)?;
+        let width = crate::renderer::dimension_u32(width, "width")?;
+        let height = crate::renderer::dimension_u32(height, "height")?;
+        let format = crate::custom_elements::img::PixelFormat::parse(format.as_deref())
+            .map_err(Error::from_reason)?;
+        let bytes = pixels.to_vec();
+        with_test_state(|cx, window, view| {
+            let view = view.clone();
+            cx.update_window(window, |_, window, app| {
+                view.update(app, |view, cx| {
+                    view.set_image_pixels(id, width, height, bytes, format, window, cx)
+                })
+            })
+            .map_err(|e| Error::from_reason(e.to_string()))?
+            .map_err(Error::from_reason)
+        })
+    }
+
+    /// Encoded image bytes onto an `<img>` host node.
+    #[napi]
+    pub fn set_image(&self, element_id: f64, bytes: Buffer) -> Result<()> {
+        let id = to_element_id(element_id)?;
+        let bytes = bytes.to_vec();
+        with_test_state(|cx, window, view| {
+            let view = view.clone();
+            cx.update_window(window, |_, window, app| {
+                view.update(app, |view, cx| view.set_encoded_image(id, bytes, window, cx))
+            })
+            .map_err(|e| Error::from_reason(e.to_string()))?
+            .map_err(Error::from_reason)
+        })
+    }
+
+    /// Make the fonts in a TrueType or OpenType file usable by `fontFamily`.
+    #[napi]
+    pub fn register_font(&self, data: Buffer) -> Result<()> {
+        let bytes = data.to_vec();
+        with_test_state(|cx, window, view| {
+            let view = view.clone();
+            cx.update_window(window, |_, window, app| {
+                view.update(app, |view, cx| view.register_font(bytes, window, cx))
+            })
+            .map_err(|e| Error::from_reason(e.to_string()))?
+            .map_err(Error::from_reason)
+        })
+    }
+
     /// The logical scroll anchor of a `<virtual-list>`:
     /// `[itemIndex, offsetInItemPx, viewportHeightPx]`, or null for anything
     /// else. `itemIndex == item count` is gpui's at-end sentinel.
@@ -991,7 +1098,7 @@ impl TestGpuixRenderer {
         Ok(tree
             .elements
             .get(&id)
-            .map(|e| e.events.contains(&event_type))
+            .map(|e| e.events().contains(&event_type))
             .unwrap_or(false))
     }
 
@@ -1043,6 +1150,18 @@ impl TestGpuixRenderer {
         let id = to_element_id(id)?;
         self.flush()?;
         Ok(crate::automation::get_bounds(id).map(crate::renderer::ElementBounds::from_painted))
+    }
+
+    /// Ids under the window point, topmost first. See the live renderer.
+    #[napi]
+    pub fn get_elements_at(&self, x: f64, y: f64) -> Result<Vec<f64>> {
+        self.flush()?;
+        let tree = self.tree.lock().unwrap();
+        Ok(tree
+            .elements_at(x, y, &crate::automation::get_bounds)
+            .into_iter()
+            .map(|id| id as f64)
+            .collect())
     }
 
     #[napi]

@@ -49,7 +49,7 @@ target_compile_definitions(gpuix_js PRIVATE NAPI_VERSION=10)
 # Runtime.h is an internal embedding interface; its layout must match the VM.
 get_directory_property(HERMES_VM_DEFINITIONS DIRECTORY "${HERMES_SOURCE}" COMPILE_DEFINITIONS)
 target_compile_definitions(gpuix_js PRIVATE ${HERMES_VM_DEFINITIONS})
-target_compile_options(gpuix_js PRIVATE -fno-rtti -fno-exceptions)
+target_compile_options(gpuix_js PRIVATE -fno-rtti -fno-exceptions -ffunction-sections -fdata-sections)
 # Link NAPI as objects so every ABI entrypoint is exported for napi-rs.
 target_link_libraries(gpuix_js PRIVATE hermesNapi_obj hermesvm_a uv_a log)
-target_link_options(gpuix_js PRIVATE -Wl,-z,max-page-size=16384)
+target_link_options(gpuix_js PRIVATE -Wl,-z,max-page-size=16384 -Wl,--gc-sections)

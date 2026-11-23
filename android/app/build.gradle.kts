@@ -15,7 +15,16 @@ val gpuixVersionCode = gpuixProperties.getProperty("versionCode")?.toIntOrNull()
 
 android {
     namespace = gpuixAppId
-    compileSdk = 35
+    compileSdk {
+        version = release(37) { minorApiLevel = 2 }
+    }
+    buildToolsVersion = "37.0.0"
+    ndkVersion = "30.0.16248370"
+    sourceSets.getByName("main").assets.srcDir(rootProject.projectDir.resolve(".build/assets"))
+    androidResources {
+        // Keep Hermes bytecode uncompressed and page-aligned in the APK for zero-copy mmap.
+        noCompress += listOf("hbc")
+    }
     buildFeatures {
         // AGP 9 disables generated resource values by default. The app label
         // is generated from gpuix.android.json for each consumer project.
@@ -24,7 +33,7 @@ android {
     defaultConfig {
         applicationId = gpuixAppId
         minSdk = 31
-        targetSdk = 35
+        targetSdk = 37
         versionCode = gpuixVersionCode
         versionName = gpuixVersionName
         ndk { abiFilters += "arm64-v8a" }
@@ -36,7 +45,12 @@ android {
         // be installed immediately. Configure a real upload key before store
         // distribution; `gpuix doctor` reports this boundary explicitly.
         release {
-            isMinifyEnabled = false
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro"
+            )
             signingConfig = signingConfigs.getByName("debug")
         }
     }
@@ -46,4 +60,4 @@ android {
     }
 }
 
-dependencies { implementation("androidx.core:core-splashscreen:1.0.1") }
+dependencies { implementation("androidx.core:core-splashscreen:1.2.0") }

@@ -1,8 +1,8 @@
 # Standalone Hermes / Node-API host
 
-This host reuses [Hermes's official napi-runner](https://github.com/facebook/hermes/tree/static_h/tools/napi-runner) runtime and Node-API implementation, and [libuv](https://github.com/libuv/libuv) for cross-thread callbacks, work queues and timers. It uses neither WebView nor React Native UI.
+This host reuses [Hermes's official napi-runner](https://github.com/meta/hermes/tree/d864d3f09d10e8aebe429715eeed5a4d7edf114d/tools/napi-runner) runtime and Node-API implementation, and [libuv 1.53.0](https://github.com/libuv/libuv/releases/tag/v1.53.0) for cross-thread callbacks, work queues and timers. It uses neither WebView nor React Native UI.
 
-Build with `bash android/scripts/build-hermes.sh`. The pinned Hermes revision is `4947871513667919bf2fe225134af3e3a1a3772c`; host compiler and Android runtime always use the same checkout.
+Build with `bash android/scripts/build-hermes.sh`. Hermes is pinned to `d864d3f09d10e8aebe429715eeed5a4d7edf114d` on `static_h`, which includes the standalone Node-API host. The host compiler and Android runtime use the same checkout.
 
 Link Rust against `android/.build/hermes-android/libgpuix_js.so` and ship that file plus the NDK's `libc++_shared.so` in `jniLibs/arm64-v8a`. All Node-API symbols are included in this shared library, so the existing napi-rs addon can link normally.
 

@@ -15,60 +15,9 @@
 //! per-line rendering needs and what makes a code block's height exact before
 //! any highlighting has run.
 
-pub mod cache;
-
-use std::collections::BTreeSet;
-use std::ops::Range;
-use std::path::Path;
-use std::sync::OnceLock;
-
-use syntect::easy::ScopeRangeIterator;
-use syntect::parsing::{ParseState, ScopeStack, SyntaxReference, SyntaxSet};
-
-/// Sources larger than this are rendered plain. Highlighting a megabyte of
-/// minified JS blocks the frame for longer than anyone will tolerate.
-pub const DEFAULT_MAX_SOURCE_BYTES: usize = 512 * 1024;
-pub const DEFAULT_MAX_SPANS: usize = 200_000;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct HighlightLimits {
-    pub max_source_bytes: usize,
-    pub max_spans: usize,
-}
-
-impl Default for HighlightLimits {
-    fn default() -> Self {
-        Self {
-            max_source_bytes: DEFAULT_MAX_SOURCE_BYTES,
-            max_spans: DEFAULT_MAX_SPANS,
-        }
-    }
-}
-
-/// Languages resolved against Syntect's default syntax set. Detection still
-/// uses this closed list so unknown fences stay plain text.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum LanguageId {
-    Rust,
-    JavaScript,
-    Jsx,
-    TypeScript,
-    Tsx,
-    Python,
-    Go,
-    Json,
-    Jsonc,
-    Bash,
-    Toml,
-    Markdown,
-    Html,
-    Css,
-    Yaml,
-    C,
-}
-
 /// A capture class. One per theme colour.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(not(feature = "rich-content"), allow(dead_code))]
 pub enum HighlightKind {
     Comment,
     Keyword,
@@ -97,6 +46,7 @@ pub enum HighlightKind {
     Invalid,
 }
 
+#[cfg(feature = "rich-content")]
 impl HighlightKind {
     /// Stable precedence used to resolve overlapping parser captures.
     /// Without it, nested captures resolve by iteration order and a string
@@ -116,6 +66,63 @@ impl HighlightKind {
         }
     }
 }
+
+#[cfg(feature = "rich-content")]
+mod imp {
+    use super::HighlightKind;
+
+    #[path = "cache.rs"]
+    pub mod cache;
+
+    use std::collections::BTreeSet;
+    use std::ops::Range;
+    use std::path::Path;
+    use std::sync::OnceLock;
+
+    use syntect::easy::ScopeRangeIterator;
+    use syntect::parsing::{ParseState, ScopeStack, SyntaxReference, SyntaxSet};
+
+    /// Sources larger than this are rendered plain. Highlighting a megabyte of
+    /// minified JS blocks the frame for longer than anyone will tolerate.
+    pub const DEFAULT_MAX_SOURCE_BYTES: usize = 512 * 1024;
+    pub const DEFAULT_MAX_SPANS: usize = 200_000;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct HighlightLimits {
+        pub max_source_bytes: usize,
+        pub max_spans: usize,
+    }
+
+    impl Default for HighlightLimits {
+        fn default() -> Self {
+            Self {
+                max_source_bytes: DEFAULT_MAX_SOURCE_BYTES,
+                max_spans: DEFAULT_MAX_SPANS,
+            }
+        }
+    }
+
+    /// Languages resolved against Syntect's default syntax set. Detection still
+    /// uses this closed list so unknown fences stay plain text.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub enum LanguageId {
+        Rust,
+        JavaScript,
+        Jsx,
+        TypeScript,
+        Tsx,
+        Python,
+        Go,
+        Json,
+        Jsonc,
+        Bash,
+        Toml,
+        Markdown,
+        Html,
+        Css,
+        Yaml,
+        C,
+    }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HighlightSpan {
@@ -1096,3 +1103,7 @@ mod tests {
         assert_eq!(result, Err(HighlightError::TooManySpans));
     }
 }
+}
+
+#[cfg(feature = "rich-content")]
+pub use imp::*;

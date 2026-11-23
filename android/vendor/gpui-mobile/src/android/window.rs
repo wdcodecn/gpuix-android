@@ -103,7 +103,7 @@ impl HasDisplayHandle for RawAndroidWindow {
 /// drains the accumulated delta and emits a single `ScrollWheel` event per
 /// frame.  This dramatically reduces the number of layout passes during a
 /// drag and eliminates the "laggy" feeling on complex screens.
-struct MomentumState {
+pub(crate) struct MomentumState {
     velocity_tracker: VelocityTracker,
     scroller: MomentumScroller,
 
@@ -137,6 +137,7 @@ const ONLY_IF_SEAMLESS: i8 = 0;
 // or animation temporarily promotes to the user's selected target. After a
 // longer timeout, `DEEP_IDLE_FRAME_RATE` releases the app's preference too.
 const POWER_BALANCED_FRAME_RATE: f32 = 30.0;
+const DEFAULT_POWER_FRAME_RATE: u32 = 60;
 const DEFAULT_INTERACTION_FRAME_RATE: f32 = 90.0;
 /// A zero request releases the app's preference and lets Android choose the
 /// panel's lowest/default mode while the app has been untouched for a while.
@@ -384,6 +385,9 @@ pub struct AndroidWindow {
     interaction_frame_rate: AtomicU32,
     /// Last refresh rate requested from Android, in Hz.
     requested_frame_rate: AtomicU32,
+    /// Shared momentum scrolling + velocity state so historical touch samples
+    /// from `jni.rs` and per-frame inertia in `AndroidPlatformWindow` share one tracker.
+    pub(crate) momentum: Arc<Mutex<MomentumState>>,
 }
 
 // SAFETY: `WindowState` is protected by a `Mutex`.
@@ -464,12 +468,22 @@ impl AndroidWindow {
             active: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             frame_requested: AtomicBool::new(true),
             interactive: AtomicBool::new(false),
-            power_frame_rate: AtomicU32::new(POWER_BALANCED_FRAME_RATE as u32),
+            power_frame_rate: AtomicU32::new(DEFAULT_POWER_FRAME_RATE),
             interaction_frame_rate: AtomicU32::new(
                 crate::android::jni::query_interaction_frame_rate()
                     .unwrap_or(DEFAULT_INTERACTION_FRAME_RATE) as u32,
             ),
             requested_frame_rate: AtomicU32::new(POWER_BALANCED_FRAME_RATE as u32),
+            momentum: Arc::new(Mutex::new(MomentumState {
+                velocity_tracker: VelocityTracker::new(),
+                scroller: MomentumScroller::new(),
+                pending_scroll_dx: 0.0,
+                pending_scroll_dy: 0.0,
+                pending_scroll_pos_x: 0.0,
+                pending_scroll_pos_y: 0.0,
+                has_pending_scroll: false,
+                pending_scroll_phase: gpui::TouchPhase::Moved,
+            })),
         }))
     }
 
@@ -506,9 +520,19 @@ impl AndroidWindow {
             active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             frame_requested: AtomicBool::new(false),
             interactive: AtomicBool::new(false),
-            power_frame_rate: AtomicU32::new(POWER_BALANCED_FRAME_RATE as u32),
+            power_frame_rate: AtomicU32::new(DEFAULT_POWER_FRAME_RATE),
             interaction_frame_rate: AtomicU32::new(DEFAULT_INTERACTION_FRAME_RATE as u32),
             requested_frame_rate: AtomicU32::new(POWER_BALANCED_FRAME_RATE as u32),
+            momentum: Arc::new(Mutex::new(MomentumState {
+                velocity_tracker: VelocityTracker::new(),
+                scroller: MomentumScroller::new(),
+                pending_scroll_dx: 0.0,
+                pending_scroll_dy: 0.0,
+                pending_scroll_pos_x: 0.0,
+                pending_scroll_pos_y: 0.0,
+                has_pending_scroll: false,
+                pending_scroll_phase: gpui::TouchPhase::Moved,
+            })),
         })
     }
 
@@ -538,7 +562,7 @@ impl AndroidWindow {
             let config = WgpuSurfaceConfig {
                 size: gpui::size(gpui::DevicePixels(width), gpui::DevicePixels(height)),
                 transparent,
-                preferred_present_mode: Some(wgpu::PresentMode::Mailbox),
+                preferred_present_mode: Some(wgpu::PresentMode::Fifo),
             };
             let instance = state
                 .gpu_context
@@ -807,6 +831,21 @@ impl AndroidWindow {
     /// Check whether a frame is waiting without consuming the request.
     pub fn has_frame_request(&self) -> bool {
         self.frame_requested.load(Ordering::Acquire)
+    }
+
+    /// Feed a historical Android `MotionEvent` sample (physical px, `age_nanos`
+    /// earlier than the current event) into the gesture velocity tracker.
+    pub fn record_touch_history(&self, physical_x: f32, physical_y: f32, age_nanos: u64) {
+        let scale = self.scale_factor().max(0.01);
+        let logical_x = physical_x / scale;
+        let logical_y = physical_y / scale;
+        let ts = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_nanos(age_nanos))
+            .unwrap_or_else(std::time::Instant::now);
+        self.momentum
+            .lock()
+            .velocity_tracker
+            .record_at(logical_x, logical_y, ts);
     }
 
     /// Whether high-refresh interaction pacing is active.
@@ -1287,7 +1326,7 @@ impl AndroidWindow {
         let config = WgpuSurfaceConfig {
             size: gpui::size(gpui::DevicePixels(width), gpui::DevicePixels(height)),
             transparent,
-            preferred_present_mode: Some(wgpu::PresentMode::Mailbox),
+            preferred_present_mode: Some(wgpu::PresentMode::Fifo),
         };
 
         WgpuRenderer::new(gpu_context, &raw, config, None)
@@ -1336,21 +1375,13 @@ impl AndroidPlatformWindow {
         // No-op input callback used until on_input is called.
         let noop_input_cb: Box<dyn FnMut(gpui::PlatformInput) -> DispatchEventResult + Send> =
             Box::new(|_| DispatchEventResult::default());
+        let momentum = Arc::clone(&window.momentum);
         Self {
             window,
             display,
             input_handler: None,
             title: String::new(),
-            momentum: Arc::new(Mutex::new(MomentumState {
-                velocity_tracker: VelocityTracker::new(),
-                scroller: MomentumScroller::new(),
-                pending_scroll_dx: 0.0,
-                pending_scroll_dy: 0.0,
-                pending_scroll_pos_x: 0.0,
-                pending_scroll_pos_y: 0.0,
-                has_pending_scroll: false,
-                pending_scroll_phase: gpui::TouchPhase::Moved,
-            })),
+            momentum,
             momentum_input_cb: Arc::new(Mutex::new(noop_input_cb)),
         }
     }

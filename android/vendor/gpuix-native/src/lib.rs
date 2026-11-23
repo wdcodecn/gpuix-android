@@ -17,8 +17,10 @@ mod app_menu;
 mod automation;
 mod color;
 mod custom_elements;
+#[cfg(feature = "rich-content")]
 mod diff;
 mod element_tree;
+#[cfg(feature = "rich-content")]
 mod markdown;
 mod motion;
 mod renderer;
@@ -30,7 +32,10 @@ mod syntax;
 mod text;
 mod theme;
 // Desktop only. HTTP goes through reqwest_client, not crates.io reqwest.
-#[cfg(not(any(target_family = "wasm", target_os = "android")))]
+#[cfg(all(
+    not(any(target_family = "wasm", target_os = "android")),
+    feature = "http-client"
+))]
 mod updater;
 
 #[cfg(all(

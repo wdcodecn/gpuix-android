@@ -5,6 +5,7 @@ import { homedir } from 'node:os'
 import { existsSync } from 'node:fs'
 import { cp, lstat, mkdir } from 'node:fs/promises'
 import { loadGpuixAndroidConfig } from '../android/scripts/config'
+import { runDevServer } from './dev-server'
 
 type ParsedArgs = {
   values: Map<string, string>
@@ -25,6 +26,7 @@ Usage:
   gpuix init [--cwd DIR] [--entry FILE] [--app-id ID] [--name APP_NAME]
   gpuix doctor [--cwd DIR]
   gpuix info [--cwd DIR]
+  gpuix dev [ADB_SERIAL] [--cwd DIR] [--port 8081]
   gpuix build [--cwd DIR] [--release] [--aab]
   gpuix install ADB_SERIAL [--cwd DIR] [--release]
   gpuix run ADB_SERIAL [--cwd DIR] [--release]
@@ -239,7 +241,7 @@ async function doctor(projectRoot: string): Promise<void> {
   const sdkAvailable = await exists(sdkRoot)
   if (!sdkAvailable) failures += 1
   process.stdout.write(`${sdkAvailable ? '✓' : '✗'} ANDROID_HOME: ${sdkRoot}\n`)
-  const ndkRoot = process.env.ANDROID_NDK_ROOT || path.join(sdkRoot, 'ndk/28.2.13676358')
+  const ndkRoot = process.env.ANDROID_NDK_ROOT || path.join(sdkRoot, 'ndk/30.0.16248370')
   const ndkAvailable = await exists(ndkRoot)
   if (!ndkAvailable) failures += 1
   process.stdout.write(`${ndkAvailable ? '✓' : '✗'} Android NDK: ${ndkRoot}\n`)
@@ -345,6 +347,22 @@ async function main(): Promise<void> {
     if (parsed.positional.length !== 1) fail('run needs exactly one ADB serial')
     await build(parsed, projectRoot)
     await install(parsed, projectRoot)
+    return
+  }
+  if (command === 'dev') {
+    assertKnownOptions(parsed, ['cwd', 'port'])
+    if (parsed.positional.length > 1) fail('dev accepts at most one ADB serial')
+    const rawPort = option(parsed, 'port') ?? '8081'
+    const port = Number(rawPort)
+    if (!Number.isSafeInteger(port) || port < 1 || port > 65535) {
+      fail(`invalid --port value: ${rawPort}`)
+    }
+    await requireHost(projectRoot)
+    await runDevServer({
+      projectRoot,
+      serial: parsed.positional[0],
+      port,
+    })
     return
   }
   fail(`unknown command ${command}`)

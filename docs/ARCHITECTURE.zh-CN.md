@@ -57,12 +57,15 @@ Android 不包含 WebView，也不使用 React Native View 层。JS 仍然会产
 
 ## 交互和性能契约
 
-- JS 更新通过 retained tree 合并后再进入 GPUI layout/paint；静态页面不主动重绘。
-- 手势越过滚动阈值时切换到交互刷新率；松手后回到 30Hz 省电档；60 秒无输入后
-  释放应用刷新率请求，交给 Android。
+- JS Bundle 在构建阶段预编译为零压缩 Hermes 字节码（`.hbc`），首帧启动同步加载核心字体并由后台线程分批懒加载 CJK/Emoji 字体。
+- JS UI 突变优先经 `GPX1` 零拷贝二进制突变协议 + 驻留 `StyleTable` 进入锁外预处理与 retained tree 合并，静态页面不主动重绘。
+- 窗口尺寸与安全区 insets 通过 `SharedWindowMetrics` 无锁快照与主动 `windowResize`/`windowInsets` Push 事件同步，避免 JS 轮询。
+- 渲染帧调度直接绑定 Android `AChoreographer` 硬件 VSync（`PresentMode::Fifo`）并采集 `pointer.history()` 历史触控样本；手势越过阈值或原生 Motion Spring 动画运行期间自动联动交互高刷，静止后恢复省电刷新策略。
 - 用户选择的刷新率是交互上限。系统低电量或 OEM 策略可以把 90/120 等请求压到
   实际允许值，App 不要求用户手动改设置。
 - Android 的状态栏、导航栏和 display cutout 通过 native insets 传入 UI；业务页面
   不应把屏幕尺寸硬编码成某一台手机。
 - `gpuix-native` 的“GPU 绘制 FPS”是应用重绘频率，不等同于物理面板刷新率；硬件
   最终状态以 SurfaceFlinger/HWC 和系统策略为准。
+
+完整优化方案与实测体积、耗时及冷启基准见 [PERFORMANCE.zh-CN.md](PERFORMANCE.zh-CN.md)。

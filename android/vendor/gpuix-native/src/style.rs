@@ -17,6 +17,26 @@ pub struct BoxShadowValue {
     pub blur_radius: f64,
     pub spread_radius: f64,
     pub color: String,
+    /// Draws inside the border box instead of around it, like CSS `inset`.
+    #[serde(default)]
+    pub inset: bool,
+}
+
+/// `boxShadow` is one shadow or a list of them, painted in the order given.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum BoxShadowValues {
+    Many(Vec<BoxShadowValue>),
+    One(BoxShadowValue),
+}
+
+impl BoxShadowValues {
+    pub fn as_slice(&self) -> &[BoxShadowValue] {
+        match self {
+            Self::Many(shadows) => shadows,
+            Self::One(shadow) => std::slice::from_ref(shadow),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -197,7 +217,16 @@ pub struct StyleDesc {
     pub border_top_right_radius: Option<f64>,
     pub border_bottom_left_radius: Option<f64>,
     pub border_bottom_right_radius: Option<f64>,
-    pub box_shadow: Option<BoxShadowValue>,
+    pub box_shadow: Option<BoxShadowValues>,
+    /// `"solid"` or `"dashed"`, for every side.
+    pub border_style: Option<String>,
+    /// Width divided by height, applied to whichever axis is not definite.
+    pub aspect_ratio: Option<f64>,
+    /// CSS `outline`: a line outside the border box that takes no layout
+    /// space, so it can appear on focus without moving anything.
+    pub outline_width: Option<f64>,
+    pub outline_color: Option<String>,
+    pub outline_offset: Option<f64>,
 
     // Text
     pub font_size: Option<f64>,
@@ -214,6 +243,11 @@ pub struct StyleDesc {
     pub overflow: Option<String>,
     pub overflow_x: Option<String>,
     pub overflow_y: Option<String>,
+    /// Thumb colour for a container that scrolls (`overflow: "scroll"`). Setting
+    /// it is what turns the native scrollbar on.
+    pub scrollbar_color: Option<String>,
+    /// Thickness of that thumb in px. Defaults to 6.
+    pub scrollbar_width: Option<f64>,
 
     // Cursor
     pub cursor: Option<String>,
@@ -233,6 +267,11 @@ pub struct StyleDesc {
     // Uses Box to avoid infinite-size struct (StyleDesc contains StyleDesc).
     pub hover: Option<Box<StyleDesc>>,
     pub active: Option<Box<StyleDesc>>,
+    /// While focused after keyboard input, like CSS `:focus-visible`.
+    pub focus_visible: Option<Box<StyleDesc>>,
+    /// `false` keeps this element at full opacity while another control has
+    /// keyboard focus. Not inherited.
+    pub keyboard_focus_dim: Option<bool>,
 }
 
 pub use crate::color::{parse_color, parse_color_hex};
@@ -403,6 +442,32 @@ mod tests {
         .unwrap();
 
         assert!(!should_occlude(&style));
+    }
+
+    #[test]
+    fn box_shadow_takes_one_shadow_or_a_list() {
+        let one: StyleDesc = serde_json::from_str(
+            r##"{"boxShadow":{"offsetX":0,"offsetY":4,"blurRadius":12,"spreadRadius":0,"color":"#00000033"}}"##,
+        )
+        .unwrap();
+        let shadows = one.box_shadow.as_ref().unwrap().as_slice();
+        assert_eq!(shadows.len(), 1);
+        assert!(
+            !shadows[0].inset,
+            "a shadow is outside unless it says otherwise"
+        );
+
+        let many: StyleDesc = serde_json::from_str(
+            r##"{"boxShadow":[
+                {"offsetX":0,"offsetY":1,"blurRadius":2,"spreadRadius":0,"color":"#0003"},
+                {"offsetX":0,"offsetY":0,"blurRadius":0,"spreadRadius":1,"color":"#fff1","inset":true}
+            ]}"##,
+        )
+        .unwrap();
+        let shadows = many.box_shadow.as_ref().unwrap().as_slice();
+        assert_eq!(shadows.len(), 2);
+        assert!(shadows[1].inset);
+        assert_eq!(shadows[1].spread_radius, 1.0);
     }
 
     #[test]

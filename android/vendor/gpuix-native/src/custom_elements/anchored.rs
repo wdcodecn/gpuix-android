@@ -122,6 +122,8 @@ pub struct AnchoredElement {
     deferred: bool,
     priority: usize,
     occlude: bool,
+    /// `fill: "window"`: cover the whole viewport, like a dialog portal.
+    fill_window: bool,
 }
 
 impl Default for AnchoredElement {
@@ -138,6 +140,7 @@ impl Default for AnchoredElement {
             deferred: true,
             priority: 1,
             occlude: true,
+            fill_window: false,
         }
     }
 }
@@ -284,7 +287,7 @@ impl CustomElement for AnchoredElement {
     fn render(
         &mut self,
         ctx: CustomRenderContext,
-        _window: &mut gpui::Window,
+        window: &mut gpui::Window,
         _cx: &mut gpui::Context<crate::renderer::GpuixView>,
     ) -> gpui::AnyElement {
         use gpui::prelude::*;
@@ -303,15 +306,26 @@ impl CustomElement for AnchoredElement {
         if let Some(style) = ctx.style {
             content = crate::renderer::apply_interactive_styles(content, style);
         }
+        if self.fill_window {
+            // `anchored()` is absolute and sized by its content, so a percentage
+            // size has nothing to resolve against. A resize runs gpui's
+            // `Window::bounds_changed`, which refreshes the window, so reading
+            // the viewport here tracks it in the same frame, with no JS polling.
+            // Applied after the JS style so it always wins over width/height.
+            let viewport = window.viewport_size();
+            content = content.w(viewport.width).h(viewport.height);
+        }
         content = crate::accessibility::apply_accessibility(content, ctx.props, None);
         content = super::wire_standard_events(content, &ctx);
         // Deferred overlays paint over the window blur. A missing fill lets the
-        // page show through the card. Force an opaque surface when JS omitted one.
-        let has_fill = ctx
+        // page show through the card. Force an opaque surface when JS omitted
+        // one. An explicit transparent fill opts out: gpui paints no quad for it,
+        // and a full-window layer such as a dialog portal must paint nothing.
+        let declares_fill = ctx
             .style
             .and_then(crate::style::StyleDesc::resolved_background)
-            .is_some_and(|background| !background.is_transparent());
-        if !has_fill {
+            .is_some();
+        if !declares_fill {
             content = content.bg(gpui::rgb(0x1A1A1A));
         }
         if self.occlude {
@@ -321,14 +335,22 @@ impl CustomElement for AnchoredElement {
             content = content.child(child);
         }
 
-        let mut anchored = gpui::anchored()
-            .anchor(self.resolved_anchor().as_gpui())
-            .offset(self.resolved_offset());
-        if let Some((x, y)) = self.position {
-            anchored = anchored.position(gpui::point(gpui::px(x), gpui::px(y)));
-        }
-        if matches!(self.fit, FitMode::Snap) {
-            anchored = anchored.snap_to_window_with_margin(gpui::px(self.snap_margin));
+        let mut anchored = gpui::anchored();
+        if self.fill_window {
+            // Already the window: no offset, no snapping.
+            anchored = anchored
+                .anchor(gpui::Anchor::TopLeft)
+                .position(gpui::point(gpui::px(0.0), gpui::px(0.0)));
+        } else {
+            anchored = anchored
+                .anchor(self.resolved_anchor().as_gpui())
+                .offset(self.resolved_offset());
+            if let Some((x, y)) = self.position {
+                anchored = anchored.position(gpui::point(gpui::px(x), gpui::px(y)));
+            }
+            if matches!(self.fit, FitMode::Snap) {
+                anchored = anchored.snap_to_window_with_margin(gpui::px(self.snap_margin));
+            }
         }
 
         let anchored = anchored.child(content);
@@ -340,7 +362,7 @@ impl CustomElement for AnchoredElement {
             anchored.into_any_element()
         };
 
-        if self.position.is_some() {
+        if self.position.is_some() || self.fill_window {
             layer
         } else {
             self.wrap_at_trigger(layer)
@@ -388,6 +410,7 @@ impl CustomElement for AnchoredElement {
                     .unwrap_or(1);
             }
             "occlude" => self.occlude = value.as_bool().unwrap_or(true),
+            "fill" => self.fill_window = value.as_str() == Some("window"),
             _ => {}
         }
     }
@@ -405,6 +428,7 @@ impl CustomElement for AnchoredElement {
             "deferred",
             "priority",
             "occlude",
+            "fill",
         ]
     }
 

@@ -13,17 +13,18 @@ use std::ops::Range;
 use std::time::Duration;
 
 use gpui::{
-    actions, div, fill, point, prelude::*, px, relative, size, App, Bounds, ClipboardItem, Context,
-    CursorStyle, DispatchPhase, ElementInputHandler, Entity, EntityInputHandler, FocusHandle,
-    GlobalElementId, KeyBinding, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, PaintQuad, Pixels, Point, ScrollWheelEvent, SharedString, Style, Task, TextRun,
-    TextStyle, UTF16Selection, UnderlineStyle, Window, WrappedLine,
+    actions, div, fill, point, prelude::*, px, relative, size, App, Bounds, ClipboardEntry,
+    ClipboardItem, Context, CursorStyle, DispatchPhase, ElementInputHandler, Entity,
+    EntityInputHandler, FocusHandle, GlobalElementId, KeyBinding, LayoutId, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point, ScrollWheelEvent,
+    SharedString, Style, Task, TextRun, TextStyle, UTF16Selection, UnderlineStyle, Window,
+    WrappedLine,
 };
 use unicode_segmentation::UnicodeSegmentation;
 use web_time::Instant;
 
 use super::{CustomElement, CustomElementFactory, CustomRenderContext};
-use crate::renderer::{emit_event_full, EventCallback};
+use crate::renderer::{emit_event_full, emit_key_event, EventCallback};
 use crate::theme::Theme;
 
 actions!(
@@ -71,7 +72,6 @@ const TEXTAREA_KEY_CONTEXT: &str = "GpuixTextarea";
 const TEXTAREA_SUBMIT_KEY_CONTEXT: &str = "GpuixTextareaSubmit";
 const CARET_BLINK_MS: u64 = 500;
 const CARET_WIDTH: Pixels = px(2.0);
-const CARET_HEIGHT_RATIO: f32 = 0.75;
 const DRAG_SCROLL_FRAME_MS: u64 = 16;
 const UNDO_COALESCE: Duration = Duration::from_millis(700);
 const UNDO_LIMIT: usize = 200;
@@ -80,16 +80,21 @@ fn caret_visible(ms_since_activity: u64) -> bool {
     (ms_since_activity / CARET_BLINK_MS) % 2 == 0
 }
 
-// Size the bar to cap height, not the line box. Default leading is phi, so a
-// full-height caret sticks out above and below the glyphs. Cap height is about
-// 0.75em; the em square itself still looks taller than the letters.
-fn caret_rect(origin: Point<Pixels>, line_height: Pixels, font_size: Pixels) -> Bounds<Pixels> {
-    let height = (font_size * CARET_HEIGHT_RATIO).min(line_height);
-    let y_offset = (line_height - height) / 2.;
-    Bounds::new(
-        point(origin.x, origin.y + y_offset),
-        size(CARET_WIDTH, height),
-    )
+fn clipboard_text(item: ClipboardItem) -> Option<String> {
+    if item
+        .entries
+        .iter()
+        .any(|entry| matches!(entry, ClipboardEntry::ExternalPaths(_)))
+    {
+        return None;
+    }
+    item.text()
+}
+
+// Chrome paints the caret at line height, not font size. Firefox uses the em
+// square after you type. Match Chrome so a 14/20 composer bar is 20px tall.
+fn caret_rect(origin: Point<Pixels>, line_height: Pixels) -> Bounds<Pixels> {
+    Bounds::new(origin, size(CARET_WIDTH, line_height))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -173,6 +178,15 @@ pub fn init(cx: &mut App) {
         bind_paste_shortcut,
     ));
     cx.bind_keys(bindings);
+}
+
+/// A terminal app quits on ctrl-c. Unbinding the text field's ctrl-c copy lets
+/// the keystroke reach the terminal platform while a field has focus.
+pub fn init_terminal(cx: &mut App) {
+    cx.bind_keys(
+        [INPUT_KEY_CONTEXT, TEXTAREA_KEY_CONTEXT, TEXTAREA_SUBMIT_KEY_CONTEXT]
+            .map(|context| KeyBinding::new("ctrl-c", gpui::NoAction, Some(context))),
+    );
 }
 
 fn text_editor_bindings(
@@ -447,6 +461,12 @@ impl CustomElement for TextEditorElement {
                 editor = editor.overflow_hidden();
             }
         }
+        editor = crate::renderer::apply_focus_visible(
+            editor,
+            ctx.id,
+            ctx.style,
+            ctx.keyboard_focus.as_deref(),
+        );
         if ctx
             .style
             .and_then(|style| style.position.as_deref())
@@ -1086,11 +1106,14 @@ impl TextEditorState {
 
     fn paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
         if self.read_only {
+            cx.propagate();
             return;
         }
-        if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-            self.replace_text_in_range(None, &text, window, cx);
-        }
+        let Some(text) = cx.read_from_clipboard().and_then(clipboard_text) else {
+            cx.propagate();
+            return;
+        };
+        self.replace_text_in_range(None, &text, window, cx);
     }
 
     fn undo(&mut self, _: &Undo, _: &mut Window, cx: &mut Context<Self>) {
@@ -1603,7 +1626,6 @@ impl EntityInputHandler for TextEditorState {
                 bounds.top() + start.y - px(self.scroll_top),
             ),
             self.line_height,
-            self.font_size,
         ))
     }
 
@@ -1693,21 +1715,18 @@ impl gpui::Render for TextEditorState {
             .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
             .when(self.emits_key_down, move |editor| {
                 editor.on_key_down(move |event, _window, _cx| {
-                    emit_event_full(&key_down_callback, element_id, "keyDown", |payload| {
-                        payload.key = Some(event.keystroke.key.clone());
-                        payload.key_char = event.keystroke.key_char.clone();
-                        payload.is_held = Some(event.is_held);
-                        payload.modifiers = Some(event.keystroke.modifiers.into());
-                    });
+                    emit_key_event(
+                        &key_down_callback,
+                        element_id,
+                        "keyDown",
+                        &event.keystroke,
+                        Some(event.is_held),
+                    );
                 })
             })
             .when(self.emits_key_up, move |editor| {
                 editor.on_key_up(move |event, _window, _cx| {
-                    emit_event_full(&key_up_callback, element_id, "keyUp", |payload| {
-                        payload.key = Some(event.keystroke.key.clone());
-                        payload.key_char = event.keystroke.key_char.clone();
-                        payload.modifiers = Some(event.keystroke.modifiers.into());
-                    });
+                    emit_key_event(&key_up_callback, element_id, "keyUp", &event.keystroke, None);
                 })
             })
             .w_full()
@@ -1800,7 +1819,6 @@ impl gpui::Element for EditorTextElement {
                 caret_rect(
                     point(origin.x + caret_point.x, origin.y + caret_point.y),
                     input.line_height,
-                    input.font_size,
                 ),
                 input.caret_color,
             ));
@@ -2027,16 +2045,36 @@ mod tests {
     }
 
     #[test]
-    fn caret_matches_the_font_size_inside_the_line() {
-        let bounds = caret_rect(point(px(10.0), px(4.0)), px(20.0), px(16.0));
-        assert_eq!(bounds.origin, point(px(10.0), px(8.0)));
-        assert_eq!(bounds.size, size(px(2.0), px(12.0)));
-        assert_eq!(
-            caret_rect(point(px(0.0), px(0.0)), px(20.0), px(40.0))
-                .size
-                .height,
-            px(20.0)
-        );
+    fn caret_matches_the_line_height() {
+        let bounds = caret_rect(point(px(10.0), px(4.0)), px(20.0));
+        assert_eq!(bounds.origin, point(px(10.0), px(4.0)));
+        assert_eq!(bounds.size, size(px(2.0), px(20.0)));
+    }
+
+    #[test]
+    fn external_paths_are_not_text_editor_paste() {
+        let item = ClipboardItem {
+            entries: vec![
+                ClipboardEntry::ExternalPaths(gpui::ExternalPaths(
+                    [std::path::PathBuf::from("/tmp/image.png")]
+                        .into_iter()
+                        .collect(),
+                )),
+                ClipboardEntry::String(gpui::ClipboardString::new("/tmp/image.png".to_string())),
+            ],
+        };
+        assert_eq!(clipboard_text(item), None);
+    }
+
+    #[test]
+    fn text_still_pastes_when_the_clipboard_also_has_an_image() {
+        let item = ClipboardItem {
+            entries: vec![
+                ClipboardEntry::String(gpui::ClipboardString::new("caption".to_string())),
+                ClipboardEntry::Image(gpui::Image::empty()),
+            ],
+        };
+        assert_eq!(clipboard_text(item), Some("caption".to_string()));
     }
 
     #[test]

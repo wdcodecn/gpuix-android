@@ -1,5 +1,6 @@
 import path from 'node:path'
-import { mkdir } from 'node:fs/promises'
+import { randomUUID } from 'node:crypto'
+import { mkdir, rename, rm } from 'node:fs/promises'
 
 export type GpuixAndroidConfig = {
   /** Project-relative React entry point compiled for the standalone Hermes host. */
@@ -12,6 +13,8 @@ export type GpuixAndroidConfig = {
   versionName: string
   /** Monotonically increasing Android version code for release artifacts. */
   versionCode: number
+  /** Optional native Cargo features to enable (e.g. `["http-client", "rich-content"]`). */
+  features?: string[]
 }
 
 const legacyDemoDefaults: GpuixAndroidConfig = {
@@ -64,6 +67,24 @@ function projectRelativePath(projectRoot: string, input: string): string {
  * directly; `gpuix-android init` always writes an explicit config for a new
  * project.
  */
+const allowedFeatures = new Set(['http-client', 'rich-content'])
+
+function asFeaturesList(value: unknown): string[] | undefined {
+  if (value === undefined) return undefined
+  if (!Array.isArray(value)) {
+    configError('features must be an array of feature names')
+  }
+  const normalized: string[] = []
+  for (const item of value) {
+    if (typeof item !== 'string' || !allowedFeatures.has(item.trim())) {
+      configError('features entries must be "http-client" or "rich-content"')
+    }
+    const name = item.trim()
+    if (!normalized.includes(name)) normalized.push(name)
+  }
+  return normalized
+}
+
 export async function loadGpuixAndroidConfig(projectRoot: string): Promise<GpuixAndroidConfig> {
   const root = path.resolve(projectRoot)
   const configPath = path.join(root, 'gpuix.android.json')
@@ -83,13 +104,22 @@ export async function loadGpuixAndroidConfig(projectRoot: string): Promise<Gpuix
     }
   }
 
-  const entrypointInput = asNonEmptyString(raw.entrypoint, 'entrypoint', legacyDemoDefaults.entrypoint)
+  const entrypointInput = asNonEmptyString(
+    process.env.GPUIX_ENTRYPOINT ?? raw.entrypoint,
+    'entrypoint',
+    legacyDemoDefaults.entrypoint,
+  )
   const config: GpuixAndroidConfig = {
     entrypoint: projectRelativePath(root, entrypointInput),
-    appId: asNonEmptyString(raw.appId, 'appId', legacyDemoDefaults.appId),
-    appName: asNonEmptyString(raw.appName, 'appName', legacyDemoDefaults.appName),
+    appId: asNonEmptyString(process.env.GPUIX_APP_ID ?? raw.appId, 'appId', legacyDemoDefaults.appId),
+    appName: asNonEmptyString(
+      process.env.GPUIX_APP_NAME ?? raw.appName,
+      'appName',
+      legacyDemoDefaults.appName,
+    ),
     versionName: asNonEmptyString(raw.versionName, 'versionName', legacyDemoDefaults.versionName),
     versionCode: asPositiveInteger(raw.versionCode, 'versionCode', legacyDemoDefaults.versionCode),
+    features: asFeaturesList(raw.features),
   }
 
   if (!appIdPattern.test(config.appId)) {
@@ -114,11 +144,28 @@ function escapeProperty(value: string): string {
     .replace(/([:=#!])/g, '\\$1')
 }
 
-/** Writes the small Gradle-only projection of the canonical JSON config. */
-export async function writeGradleProperties(projectRoot: string, config: GpuixAndroidConfig): Promise<string> {
-  const outputPath = path.join(projectRoot, 'android/.build/gpuix.android.properties')
+export async function writeTextIfChanged(outputPath: string, contents: string): Promise<void> {
+  const data = Buffer.from(contents)
+  const current = Bun.file(outputPath)
+  if (await current.exists() && data.equals(Buffer.from(await current.arrayBuffer()))) return
+
   await mkdir(path.dirname(outputPath), { recursive: true })
-  await Bun.write(
+  const temporaryPath = `${outputPath}.${randomUUID()}.tmp`
+  try {
+    await Bun.write(temporaryPath, data)
+    await rename(temporaryPath, outputPath)
+  } finally {
+    await rm(temporaryPath, { force: true })
+  }
+}
+
+/** Writes the small Gradle-only projection of the canonical JSON config. */
+export async function writeGradleProperties(targetRoot: string, config: GpuixAndroidConfig): Promise<string> {
+  const androidDir = path.basename(targetRoot) === 'android'
+    ? targetRoot
+    : path.join(targetRoot, 'android')
+  const outputPath = path.join(androidDir, '.build/gpuix.android.properties')
+  await writeTextIfChanged(
     outputPath,
     [
       '# Generated from gpuix.android.json. Do not edit.',
@@ -144,9 +191,15 @@ if (import.meta.main) {
   const args = process.argv.slice(2)
   const field = valueAfter('--field', args)
   const projectRoot = valueAfter('--project', args) ?? path.resolve(import.meta.dir, '../..')
-  if (!field || !['entrypoint', 'appId', 'appName', 'versionName', 'versionCode'].includes(field)) {
-    throw new Error('Usage: bun config.ts --field entrypoint|appId|appName|versionName|versionCode [--project PROJECT_ROOT]')
+  if (!field || !['entrypoint', 'appId', 'appName', 'versionName', 'versionCode', 'features'].includes(field)) {
+    throw new Error('Usage: bun config.ts --field entrypoint|appId|appName|versionName|versionCode|features [--project PROJECT_ROOT]')
   }
   const config = await loadGpuixAndroidConfig(projectRoot)
-  process.stdout.write(`${config[field as keyof GpuixAndroidConfig]}\n`)
+  if (field === 'features') {
+    if (config.features !== undefined) {
+      process.stdout.write(`${config.features.join(',')}\n`)
+    }
+  } else {
+    process.stdout.write(`${config[field as keyof GpuixAndroidConfig]}\n`)
+  }
 }

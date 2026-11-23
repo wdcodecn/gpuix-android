@@ -1,6 +1,6 @@
 [package]
 name = "gpuix-native"
-version = "0.9.0"
+version = "0.11.0"
 edition = "2021"
 description = "GPUI bindings for Node.js via napi-rs"
 license = "Apache-2.0"
@@ -16,6 +16,7 @@ anyhow = "1"
 base64 = "0.22"
 csscolorparser = "0.8.3"
 log = "0.4"
+memchr = "2"
 env_logger = "0.11"
 parking_lot = "0.12"
 futures = "0.3"
@@ -28,9 +29,12 @@ rustc-hash = "2"
 # Wasm cannot use the desktop gpui_platform features.
 gpui = { path = "../../.deps/zed/crates/gpui", default-features = false, features = ["profiler"] }
 thiserror = "2"
-pulldown-cmark = { version = "0.12", default-features = false }
+pulldown-cmark = { version = "0.12", default-features = false, optional = true }
 unicode-segmentation = "1"
+unicode-properties = { version = "0.1.4", default-features = false, features = ["general-category"] }
 web-time = "1"
+# Checks fonts handed to `registerFont`; GPUI's text system aborts on malformed ones.
+ttf-parser = { version = "0.25", default-features = false, features = ["std"] }
 
 # Syntect compiles a grammar's TextMate regexes lazily, on the FIRST highlight
 # of that language, on the frame thread, inside a paint. fancy-regex takes
@@ -41,15 +45,15 @@ web-time = "1"
 # again. Syntect also rejects both engines at once, so the two sections below
 # must stay exactly complementary.
 [target.'cfg(not(any(target_family = "wasm", target_os = "android")))'.dependencies]
-syntect = { version = "5.3", default-features = false, features = ["regex-onig"] }
-two-face = { version = "0.5.2", default-features = false, features = ["syntect-onig"] }
-gpui = { path = "../../.deps/zed/crates/gpui", default-features = false, features = ["font-kit", "profiler"] }
+syntect = { version = "5.3", default-features = false, features = ["regex-onig"], optional = true }
+two-face = { version = "0.5.2", default-features = false, features = ["syntect-onig"], optional = true }
+gpui = { path = "../../.deps/zed/crates/gpui", default-features = false, features = ["font-kit", "profiler", "wayland", "x11"] }
 gpui_platform = { path = "../../.deps/zed/crates/gpui_platform", default-features = false, features = ["font-kit", "wayland", "x11"] }
 # Same client GPUI's image examples and Zed use. `img(SharedUri)` fetches
 # through `App::http_client`; without this, GPUI's NullHttpClient fails every URL.
 # The updater uses this too. Do not add crates.io `reqwest`: that is a second
 # HTTP+TLS stack next to Zed's `zed-reqwest` fork.
-reqwest_client = { path = "../../.deps/zed/crates/reqwest_client" }
+reqwest_client = { path = "../../.deps/zed/crates/reqwest_client", optional = true }
 http_client = { path = "../../.deps/zed/crates/http_client" }
 semver = "1"
 minisign-verify = "0.2"
@@ -59,15 +63,15 @@ time = { version = "0.3", features = ["parsing", "formatting"] }
 url = { version = "2", features = ["serde"] }
 
 [target.'cfg(not(all(target_arch = "wasm32", target_os = "unknown")))'.dependencies]
-napi = { version = "3", default-features = false, features = ["napi8", "serde-json"] }
-napi-derive = "3"
+napi = { version = "3.12.7", default-features = false, features = ["napi8", "serde-json"] }
+napi-derive = "3.6.8"
 
 # The slow half of the engine split above. fancy-regex is pure Rust, so it is
 # the only Syntect engine that builds here, and the browser still pays ~133ms on
 # its first TypeScript fence.
 [target.'cfg(any(target_family = "wasm", target_os = "android"))'.dependencies]
-syntect = { version = "5.3", default-features = false, features = ["regex-fancy"] }
-two-face = { version = "0.5.2", default-features = false, features = ["syntect-fancy"] }
+syntect = { version = "5.3", default-features = false, features = ["regex-fancy"], optional = true }
+two-face = { version = "0.5.2", default-features = false, features = ["syntect-fancy"], optional = true }
 
 [target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
 gpui_platform = { path = "../../.deps/zed/crates/gpui_platform", default-features = false }
@@ -88,7 +92,11 @@ gpui_macos = { path = "../../.deps/zed/crates/gpui_macos", default-features = fa
 [target.'cfg(target_os = "android")'.dependencies]
 gpui-mobile = { path = "../gpui-mobile", default-features = false }
 android-activity = { version = "0.6", features = ["native-activity"] }
-reqwest_client = { path = "../../.deps/zed/crates/reqwest_client" }
+reqwest_client = { path = "../../.deps/zed/crates/reqwest_client", optional = true }
+
+# Renders into the current terminal with the kitty graphics protocol (`terminal: true`).
+[target.'cfg(any(target_os = "macos", target_os = "linux", target_os = "freebsd"))'.dependencies]
+gpui_terminal = { path = "gpui-terminal" }
 
 # Same crate GPUI uses. A .node cannot ship an exe manifest, so Windows DPI
 # awareness is set at runtime in renderer.rs instead of via windows-manifest.
@@ -98,11 +106,13 @@ windows = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_HiDpi"] 
 [features]
 # test-support is default so published binaries include TestGpuixRenderer,
 # letting users write GPU-backed tests for their apps.
-default = ["test-support"]
+default = ["test-support", "rich-content", "http-client"]
 test-support = ["gpui/test-support", "gpui_platform/test-support", "gpui_macos/test-support", "gpui_macos/font-kit"]
+rich-content = ["dep:pulldown-cmark", "dep:syntect", "dep:two-face"]
+http-client = ["dep:reqwest_client"]
 
 [build-dependencies]
-napi-build = "2"
+napi-build = "2.4.4"
 
 [patch.crates-io]
 async-task = { git = "https://github.com/smol-rs/async-task.git", rev = "b4486cd71e4e94fbda54ce6302444de14f4d190e" }

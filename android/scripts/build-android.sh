@@ -2,9 +2,10 @@
 set -euo pipefail
 
 android_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-project_root="$(dirname "$android_root")"
+project_root="${GPUIX_PROJECT_ROOT:-$(dirname "$android_root")}"
+out_dir="${GPUIX_OUT_DIR:-$project_root/dist/android}"
 sdk_root="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-$HOME/Library/Android/sdk}}"
-ndk_root="${ANDROID_NDK_ROOT:-$sdk_root/ndk/28.2.13676358}"
+ndk_root="${ANDROID_NDK_ROOT:-$sdk_root/ndk/30.0.16248370}"
 if command -v cygpath >/dev/null 2>&1; then
   sdk_root="$(cygpath -u "$sdk_root")"
   ndk_root="$(cygpath -u "$ndk_root")"
@@ -22,7 +23,7 @@ if ! command -v cmake >/dev/null 2>&1; then
     fi
   done
 fi
-zed_revision=81c99f816b4a5f69d3c014774068034c24d1d7af
+zed_revision=f77e5cfe9dad04288566f00c66ecf3c58d6f84b3
 
 variant="debug"
 bundle=0
@@ -42,6 +43,8 @@ if [[ ! -d "$android_root/.deps/zed/.git" ]]; then
   mkdir -p "$android_root/.deps/zed"
   git -C "$android_root/.deps/zed" init -q
   git -C "$android_root/.deps/zed" remote add origin https://github.com/remorses/zed.git
+fi
+if [[ "$(git -C "$android_root/.deps/zed" rev-parse --verify HEAD 2>/dev/null)" != "$zed_revision" ]]; then
   git -C "$android_root/.deps/zed" fetch --depth 1 origin "$zed_revision"
   git -C "$android_root/.deps/zed" checkout --detach FETCH_HEAD
 fi
@@ -75,28 +78,45 @@ case "$(uname -s)" in
     ;;
 esac
 
-cargo_jni_dir="$android_root/.build/cargo-jniLibs"
 package_jni_dir="$android_root/app/src/main/jniLibs/arm64-v8a"
 
-bun "$android_root/scripts/build-js.ts"
 bash "$android_root/scripts/build-hermes.sh"
-rm -rf "$cargo_jni_dir"
-mkdir -p "$cargo_jni_dir"
+if [[ "$variant" == "release" ]]; then
+  bun "$android_root/scripts/build-js.ts" --release
+else
+  bun "$android_root/scripts/build-js.ts" --debug
+fi
 (
   cd "$android_root/rust"
-  cargo ndk -t arm64-v8a -P 31 -o "$cargo_jni_dir" build --release --lib
+  cargo_features_arg=()
+  if bun_features="$(bun "$android_root/scripts/config.ts" --field features --project "$project_root" 2>/dev/null)"; then
+    if grep -q '"features"' "$project_root/gpuix.android.json" 2>/dev/null; then
+      if [[ -n "$bun_features" ]]; then
+        cargo_features_arg=(--no-default-features --features "$bun_features")
+      else
+        cargo_features_arg=(--no-default-features)
+      fi
+    fi
+  fi
+  cargo ndk -t arm64-v8a -P 31 build --release --locked --lib "${cargo_features_arg[@]}"
 )
 
-rm -rf "$package_jni_dir"
+staging_jni_dir="$(mktemp -d "$android_root/.build/jniLibs.XXXXXX")"
+trap 'rm -rf "$staging_jni_dir"' EXIT
 mkdir -p "$package_jni_dir"
-cp "$cargo_jni_dir/arm64-v8a/libgpuix_android.so" "$package_jni_dir/"
-cp "$android_root/.build/hermes-android/libgpuix_js.so" \
-  "$package_jni_dir/"
-cp "$ndk_root/toolchains/llvm/prebuilt/$ndk_host/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so" \
-  "$package_jni_dir/"
-llvm_strip="$ndk_root/toolchains/llvm/prebuilt/$ndk_host/bin/llvm-strip"
-"$llvm_strip" --strip-debug "$package_jni_dir/libgpuix_js.so"
-"$llvm_strip" --strip-debug "$package_jni_dir/libgpuix_android.so"
+ndk_toolchain="$ndk_root/toolchains/llvm/prebuilt/$ndk_host"
+llvm_strip="$ndk_toolchain/bin/llvm-strip"
+"$llvm_strip" --strip-unneeded -o "$staging_jni_dir/libgpuix_android.so" \
+  "$CARGO_TARGET_DIR/aarch64-linux-android/release/libgpuix_android.so"
+"$llvm_strip" --strip-unneeded -o "$staging_jni_dir/libgpuix_js.so" \
+  "$android_root/.build/hermes-android/libgpuix_js.so"
+cp "$ndk_toolchain/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so" "$staging_jni_dir/"
+for library in "$staging_jni_dir/"*.so; do
+  output="$package_jni_dir/$(basename "$library")"
+  if ! cmp -s "$library" "$output"; then
+    mv -f "$library" "$output"
+  fi
+done
 if (( bundle )); then
   gradle_task=":app:bundleRelease"
 elif [[ "$variant" == "release" ]]; then
@@ -106,17 +126,17 @@ else
 fi
 "$android_root/gradlew" -p "$android_root" "$gradle_task" --console=plain
 
-mkdir -p "$project_root/dist/android"
+mkdir -p "$out_dir"
 artifact_stem="$(basename "$project_root" | tr -cs 'A-Za-z0-9._-' '-')"
 artifact_stem="${artifact_stem#-}"
 artifact_stem="${artifact_stem%-}"
 artifact_stem="${artifact_stem:-gpuix-android}"
 if (( bundle )); then
-  artifact_path="$project_root/dist/android/$artifact_stem-release.aab"
+  artifact_path="$out_dir/$artifact_stem-release.aab"
   cp "$android_root/app/build/outputs/bundle/release/app-release.aab" "$artifact_path"
   echo "AAB: $artifact_path"
 else
-  artifact_path="$project_root/dist/android/$artifact_stem-$variant.apk"
+  artifact_path="$out_dir/$artifact_stem-$variant.apk"
   cp "$android_root/app/build/outputs/apk/$variant/app-$variant.apk" "$artifact_path"
   echo "APK: $artifact_path"
 fi

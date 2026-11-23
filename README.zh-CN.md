@@ -47,20 +47,23 @@ gpuix build
 gpuix install <ADB_SERIAL>
 ```
 
-## 产物
+## 产物与开发热重载
 
 ```sh
+gpuix dev               # 启动调试开发服务器并支持真机热重载与 RedBox
 gpuix build             # dist/android/<project>-debug.apk
 gpuix build --release   # dist/android/<project>-release.apk
 gpuix build --aab       # dist/android/<project>-release.aab
 ```
+
+在项目配置（`android/scripts/config.ts`）中可通过 `features` 字段按需裁剪 `gpuix-native` 可选特性（例如 `rich-content`、`http-client`），进一步压缩 Release 二进制体积。
 
 当前 Android host 支持 arm64-v8a。Windows 桌面端使用已发布的
 `@gpuix/native-win32-x64-msvc` binding；Android 在 Git Bash 中调用 Windows NDK
 工具链。release APK/AAB 默认使用 debug keystore 方便本地
 验收；上传应用商店前必须配置正式 upload key、递增 `versionCode`，并独立完成商店验收。
 
-架构和性能契约见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)，交付边界与
-Tauri/Flutter 对照见 [docs/DELIVERY.md](docs/DELIVERY.md)。示例应用位于
+架构和性能契约见 [docs/ARCHITECTURE.zh-CN.md](docs/ARCHITECTURE.zh-CN.md)，性能优化详单与实测基准见 [docs/PERFORMANCE.zh-CN.md](docs/PERFORMANCE.zh-CN.md)，交付边界与
+Tauri/Flutter 对照见 [docs/DELIVERY.zh-CN.md](docs/DELIVERY.zh-CN.md)。示例应用位于
 [`wdcodecn/gpuix-app-starter`](https://github.com/wdcodecn/gpuix-app-starter)，组件库位于
 [`wdcodecn/gpuix-base-ui`](https://github.com/wdcodecn/gpuix-base-ui)。

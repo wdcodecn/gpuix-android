@@ -11,4 +11,5 @@ android/app/build/
 android/build/
 android/local.properties
 android/app/src/main/jniLibs/
+!android/vendor/
 android/vendor/**/target/

@@ -21,6 +21,19 @@ pub(crate) struct MotionStyle {
 }
 
 impl MotionStyle {
+    fn with_fallback(self, fallback: Self) -> Self {
+        Self {
+            width: self.width.or(fallback.width),
+            height: self.height.or(fallback.height),
+            opacity: self.opacity.or(fallback.opacity),
+            top: self.top.or(fallback.top),
+            right: self.right.or(fallback.right),
+            bottom: self.bottom.or(fallback.bottom),
+            left: self.left.or(fallback.left),
+            border_radius: self.border_radius.or(fallback.border_radius),
+        }
+    }
+
     fn interpolate(self, target: Self, progress: f64) -> Self {
         fn value(from: Option<f64>, to: Option<f64>, progress: f64) -> Option<f64> {
             to.map(|to| from.unwrap_or(to) + (to - from.unwrap_or(to)) * progress)
@@ -83,21 +96,48 @@ enum MotionEase {
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 struct MotionTransition {
+    #[serde(rename = "type", default)]
+    transition_type: Option<String>,
     #[serde(default = "default_duration")]
     duration: f64,
     #[serde(default)]
     delay: f64,
     #[serde(default = "default_ease")]
     ease: MotionEase,
+    #[serde(default)]
+    stiffness: Option<f64>,
+    #[serde(default)]
+    damping: Option<f64>,
+    #[serde(default)]
+    mass: Option<f64>,
+    #[serde(default)]
+    velocity: Option<f64>,
+    #[serde(default)]
+    rest_delta: Option<f64>,
+    #[serde(default)]
+    rest_speed: Option<f64>,
 }
 
 impl Default for MotionTransition {
     fn default() -> Self {
         Self {
+            transition_type: None,
             duration: default_duration(),
             delay: 0.0,
             ease: default_ease(),
+            stiffness: None,
+            damping: None,
+            mass: None,
+            velocity: None,
+            rest_delta: None,
+            rest_speed: None,
         }
+    }
+}
+
+impl MotionTransition {
+    fn is_spring(&self) -> bool {
+        matches!(self.transition_type.as_deref(), Some("spring"))
     }
 }
 
@@ -110,7 +150,12 @@ fn default_ease() -> MotionEase {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
 struct MotionDescription {
+    #[serde(default)]
+    generation: u64,
+    #[serde(default)]
+    is_exit: bool,
     #[serde(default)]
     initial: Option<MotionInitial>,
     animate: MotionStyle,
@@ -120,17 +165,21 @@ struct MotionDescription {
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct MotionFrame {
-    pub style: MotionStyle,
     pub active: bool,
+    pub just_settled: bool,
+    pub generation: u64,
 }
 
 pub(crate) struct MotionState {
     source: serde_json::Value,
     from: MotionStyle,
     target: MotionStyle,
+    velocities: MotionStyle,
     transition: MotionTransition,
     started: Instant,
     valid: bool,
+    needs_settle: bool,
+    generation: u64,
 }
 
 impl MotionState {
@@ -142,13 +191,19 @@ impl MotionState {
             Some(MotionInitial::Disabled(true)) => unreachable!("validated above"),
         };
 
+        let target = description.animate.with_fallback(from);
+        let initial_v = description.transition.velocity.unwrap_or(0.0);
+        let velocities = initial_velocities(from, target, initial_v);
         Ok(Self {
             source: source.clone(),
             from,
-            target: description.animate,
+            target,
+            velocities,
             transition: description.transition,
             started: now,
             valid: true,
+            needs_settle: description.is_exit || from != target,
+            generation: description.generation,
         })
     }
 
@@ -157,14 +212,13 @@ impl MotionState {
             source: source.clone(),
             from: MotionStyle::default(),
             target: MotionStyle::default(),
+            velocities: MotionStyle::default(),
             transition: MotionTransition::default(),
             started: now,
             valid: false,
+            needs_settle: source_is_exit(source),
+            generation: source_generation(source),
         }
-    }
-
-    pub(crate) fn is_valid(&self) -> bool {
-        self.valid
     }
 
     pub(crate) fn sync(&mut self, source: &serde_json::Value, now: Instant) -> Result<(), String> {
@@ -172,16 +226,25 @@ impl MotionState {
             return Ok(());
         }
 
+        let previous_generation = self.generation;
         let description = match parse_description(source) {
             Ok(description) => description,
             Err(error) => {
                 self.source = source.clone();
                 self.valid = false;
+                self.generation = source_generation(source);
+                self.needs_settle =
+                    source_is_exit(source) || self.generation != previous_generation;
                 return Err(error);
             }
         };
-        self.from = if self.valid {
-            self.frame(now).style
+        let prev_sample = if self.valid {
+            Some(self.sample_with_velocities(now))
+        } else {
+            None
+        };
+        self.from = if let Some((style, _, _)) = prev_sample {
+            style
         } else {
             match description.initial {
                 Some(MotionInitial::Style(style)) => style,
@@ -189,33 +252,206 @@ impl MotionState {
                 Some(MotionInitial::Disabled(true)) => unreachable!("validated above"),
             }
         };
-        self.target = description.animate;
+        self.target = description.animate.with_fallback(self.from);
+        self.velocities = if let Some(explicit_v) = description.transition.velocity {
+            initial_velocities(self.from, self.target, explicit_v)
+        } else if let Some((_, vel, _)) = prev_sample {
+            vel
+        } else {
+            MotionStyle::default()
+        };
         self.transition = description.transition;
         self.started = now;
         self.source = source.clone();
         self.valid = true;
+        self.generation = description.generation;
+        self.needs_settle = description.is_exit
+            || self.generation != previous_generation
+            || self.from != self.target
+            || has_nonzero_velocity(self.velocities);
         Ok(())
     }
 
-    pub(crate) fn frame(&self, now: Instant) -> MotionFrame {
+    pub(crate) fn visible_style(&self, now: Instant) -> Option<MotionStyle> {
+        self.valid.then(|| self.sample(now).0)
+    }
+
+    fn sample(&self, now: Instant) -> (MotionStyle, bool) {
+        let (style, _, active) = self.sample_with_velocities(now);
+        (style, active)
+    }
+
+    fn sample_with_velocities(&self, now: Instant) -> (MotionStyle, MotionStyle, bool) {
+        if self.transition.is_spring() {
+            return self.sample_spring(now);
+        }
         let delay = seconds(self.transition.delay);
         let duration = seconds(self.transition.duration);
         let elapsed = now.saturating_duration_since(self.started);
-        let raw = if elapsed <= delay {
+        let raw = if duration.is_zero() {
+            if elapsed < delay {
+                0.0
+            } else {
+                1.0
+            }
+        } else if elapsed <= delay {
             0.0
-        } else if duration.is_zero() {
-            1.0
         } else {
             elapsed.saturating_sub(delay).as_secs_f64() / duration.as_secs_f64()
         };
         let active = self.from != self.target && raw < 1.0;
-        let progress = ease(raw.clamp(0.0, 1.0), &self.transition.ease);
+        let clamped = raw.clamp(0.0, 1.0);
+        let progress = ease(clamped, &self.transition.ease);
+        let style = self.from.interpolate(self.target, progress);
+        let velocities = if active && !duration.is_zero() {
+            let dur_s = duration.as_secs_f64();
+            let dt_raw = 0.001 / dur_s;
+            let p_lo = ease((clamped - dt_raw).clamp(0.0, 1.0), &self.transition.ease);
+            let p_hi = ease((clamped + dt_raw).clamp(0.0, 1.0), &self.transition.ease);
+            let dprogress_dt = (p_hi - p_lo) / ((clamped + dt_raw).min(1.0) - (clamped - dt_raw).max(0.0)).max(1e-9) / dur_s;
+            derive_tween_velocities(self.from, self.target, dprogress_dt)
+        } else {
+            MotionStyle::default()
+        };
+        (style, velocities, active)
+    }
 
+    fn sample_spring(&self, now: Instant) -> (MotionStyle, MotionStyle, bool) {
+        let delay = seconds(self.transition.delay);
+        let elapsed = now.saturating_duration_since(self.started);
+        if elapsed <= delay {
+            let active = self.from != self.target || has_nonzero_velocity(self.velocities);
+            return (self.from, self.velocities, active);
+        }
+        let t = elapsed.saturating_sub(delay).as_secs_f64();
+        let stiffness = self.transition.stiffness.unwrap_or(300.0);
+        let damping = self.transition.damping.unwrap_or(24.0);
+        let mass = self.transition.mass.unwrap_or(1.0);
+        let rest_delta = self.transition.rest_delta.unwrap_or(0.05);
+        let rest_speed = self.transition.rest_speed.unwrap_or(0.5);
+
+        let mut any_active = false;
+
+        let mut step_prop = |from: Option<f64>,
+                             to: Option<f64>,
+                             vel: Option<f64>,
+                             unit_scale: f64,
+                             min_clamp: Option<f64>,
+                             max_clamp: Option<f64>|
+         -> (Option<f64>, Option<f64>) {
+            let Some(target) = to else {
+                return (None, None);
+            };
+            let x0 = from.unwrap_or(target);
+            let v0 = vel.unwrap_or(0.0);
+            let (mut pos, v, active) = solve_spring_prop(
+                x0,
+                v0,
+                target,
+                t,
+                stiffness,
+                damping,
+                mass,
+                rest_delta * unit_scale,
+                rest_speed * unit_scale,
+            );
+            if let Some(lo) = min_clamp {
+                pos = pos.max(lo);
+            }
+            if let Some(hi) = max_clamp {
+                pos = pos.min(hi);
+            }
+            if active {
+                any_active = true;
+            }
+            (Some(pos), Some(v))
+        };
+
+        let (width, v_width) =
+            step_prop(self.from.width, self.target.width, self.velocities.width, 1.0, Some(0.0), None);
+        let (height, v_height) =
+            step_prop(self.from.height, self.target.height, self.velocities.height, 1.0, Some(0.0), None);
+        let (opacity, v_opacity) = step_prop(
+            self.from.opacity,
+            self.target.opacity,
+            self.velocities.opacity,
+            0.02,
+            Some(0.0),
+            Some(1.0),
+        );
+        let (top, v_top) =
+            step_prop(self.from.top, self.target.top, self.velocities.top, 1.0, None, None);
+        let (right, v_right) =
+            step_prop(self.from.right, self.target.right, self.velocities.right, 1.0, None, None);
+        let (bottom, v_bottom) =
+            step_prop(self.from.bottom, self.target.bottom, self.velocities.bottom, 1.0, None, None);
+        let (left, v_left) =
+            step_prop(self.from.left, self.target.left, self.velocities.left, 1.0, None, None);
+        let (border_radius, v_border_radius) = step_prop(
+            self.from.border_radius,
+            self.target.border_radius,
+            self.velocities.border_radius,
+            1.0,
+            Some(0.0),
+            None,
+        );
+
+        let style = MotionStyle {
+            width,
+            height,
+            opacity,
+            top,
+            right,
+            bottom,
+            left,
+            border_radius,
+        };
+        let velocities = MotionStyle {
+            width: v_width,
+            height: v_height,
+            opacity: v_opacity,
+            top: v_top,
+            right: v_right,
+            bottom: v_bottom,
+            left: v_left,
+            border_radius: v_border_radius,
+        };
+        (style, velocities, any_active)
+    }
+
+    pub(crate) fn frame(&mut self, now: Instant) -> MotionFrame {
+        let (_, active) = if self.valid {
+            self.sample(now)
+        } else {
+            (MotionStyle::default(), false)
+        };
+        if active {
+            self.needs_settle = true;
+        }
+        let just_settled = self.needs_settle && !active;
+        if just_settled {
+            self.needs_settle = false;
+        }
         MotionFrame {
-            style: self.from.interpolate(self.target, progress),
             active,
+            just_settled,
+            generation: self.generation,
         }
     }
+}
+
+fn source_generation(source: &serde_json::Value) -> u64 {
+    source
+        .get("generation")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_default()
+}
+
+fn source_is_exit(source: &serde_json::Value) -> bool {
+    source
+        .get("isExit")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or_default()
 }
 
 fn parse_description(source: &serde_json::Value) -> Result<MotionDescription, String> {
@@ -232,7 +468,158 @@ fn parse_description(source: &serde_json::Value) -> Result<MotionDescription, St
     validate_seconds(description.transition.duration, "duration")?;
     validate_seconds(description.transition.delay, "delay")?;
     validate_ease(&description.transition.ease)?;
+    validate_transition(&description.transition)?;
     Ok(description)
+}
+
+fn validate_transition(transition: &MotionTransition) -> Result<(), String> {
+    if let Some(kind) = transition.transition_type.as_deref() {
+        if !matches!(kind, "tween" | "spring") {
+            return Err(format!("unknown motion transition type: {kind}"));
+        }
+    }
+    if let Some(stiffness) = transition.stiffness {
+        if !stiffness.is_finite() || stiffness <= 0.0 {
+            return Err("motion spring stiffness must be > 0".to_string());
+        }
+    }
+    if let Some(damping) = transition.damping {
+        if !damping.is_finite() || damping < 0.0 {
+            return Err("motion spring damping must be >= 0".to_string());
+        }
+    }
+    if let Some(mass) = transition.mass {
+        if !mass.is_finite() || mass <= 0.0 {
+            return Err("motion spring mass must be > 0".to_string());
+        }
+    }
+    if let Some(velocity) = transition.velocity {
+        if !velocity.is_finite() {
+            return Err("motion spring velocity must be finite".to_string());
+        }
+    }
+    if let Some(rest_delta) = transition.rest_delta {
+        if !rest_delta.is_finite() || rest_delta <= 0.0 {
+            return Err("motion spring restDelta must be > 0".to_string());
+        }
+    }
+    if let Some(rest_speed) = transition.rest_speed {
+        if !rest_speed.is_finite() || rest_speed <= 0.0 {
+            return Err("motion spring restSpeed must be > 0".to_string());
+        }
+    }
+    Ok(())
+}
+
+fn initial_velocities(from: MotionStyle, target: MotionStyle, velocity: f64) -> MotionStyle {
+    if velocity == 0.0 {
+        return MotionStyle::default();
+    }
+    let v = |f: Option<f64>, t: Option<f64>| match (f, t) {
+        (Some(f), Some(t)) if (t - f).abs() > f64::EPSILON => Some(velocity),
+        _ => None,
+    };
+    MotionStyle {
+        width: v(from.width, target.width),
+        height: v(from.height, target.height),
+        opacity: v(from.opacity, target.opacity),
+        top: v(from.top, target.top),
+        right: v(from.right, target.right),
+        bottom: v(from.bottom, target.bottom),
+        left: v(from.left, target.left),
+        border_radius: v(from.border_radius, target.border_radius),
+    }
+}
+
+fn has_nonzero_velocity(vel: MotionStyle) -> bool {
+    [
+        vel.width,
+        vel.height,
+        vel.opacity,
+        vel.top,
+        vel.right,
+        vel.bottom,
+        vel.left,
+        vel.border_radius,
+    ]
+    .into_iter()
+    .flatten()
+    .any(|v| v.abs() > f64::EPSILON)
+}
+
+fn derive_tween_velocities(from: MotionStyle, target: MotionStyle, dprogress_dt: f64) -> MotionStyle {
+    let d = |f: Option<f64>, t: Option<f64>| t.map(|t| (t - f.unwrap_or(t)) * dprogress_dt);
+    MotionStyle {
+        width: d(from.width, target.width),
+        height: d(from.height, target.height),
+        opacity: d(from.opacity, target.opacity),
+        top: d(from.top, target.top),
+        right: d(from.right, target.right),
+        bottom: d(from.bottom, target.bottom),
+        left: d(from.left, target.left),
+        border_radius: d(from.border_radius, target.border_radius),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn solve_spring_prop(
+    x0: f64,
+    v0: f64,
+    target: f64,
+    t: f64,
+    stiffness: f64,
+    damping: f64,
+    mass: f64,
+    rest_delta: f64,
+    rest_speed: f64,
+) -> (f64, f64, bool) {
+    let y0 = x0 - target;
+    if (y0.abs() <= rest_delta && v0.abs() <= rest_speed) || t >= 10.0 {
+        return (target, 0.0, false);
+    }
+
+    let omega0 = (stiffness / mass).sqrt();
+    let zeta = damping / (2.0 * (stiffness * mass).sqrt());
+
+    let (y, v) = if zeta < 1.0 - 1e-6 {
+        // Underdamped harmonic oscillator
+        let omega_d = omega0 * (1.0 - zeta * zeta).sqrt();
+        let a = y0;
+        let b = (zeta * omega0 * y0 + v0) / omega_d;
+        let envelope = (-zeta * omega0 * t).exp();
+        let (sin_wt, cos_wt) = (omega_d * t).sin_cos();
+        let pos = envelope * (a * cos_wt + b * sin_wt);
+        let vel = envelope
+            * ((b * omega_d - zeta * omega0 * a) * cos_wt
+                - (a * omega_d + zeta * omega0 * b) * sin_wt);
+        (pos, vel)
+    } else if zeta <= 1.0 + 1e-6 {
+        // Critically damped
+        let a = y0;
+        let b = v0 + omega0 * y0;
+        let envelope = (-omega0 * t).exp();
+        let pos = envelope * (a + b * t);
+        let vel = envelope * (b - omega0 * (a + b * t));
+        (pos, vel)
+    } else {
+        // Overdamped
+        let gamma = omega0 * (zeta * zeta - 1.0).sqrt();
+        let r1 = -omega0 * zeta + gamma;
+        let r2 = -omega0 * zeta - gamma;
+        let c1 = (v0 - r2 * y0) / (2.0 * gamma);
+        let c2 = y0 - c1;
+        let e1 = (r1 * t).exp();
+        let e2 = (r2 * t).exp();
+        let pos = c1 * e1 + c2 * e2;
+        let vel = c1 * r1 * e1 + c2 * r2 * e2;
+        (pos, vel)
+    };
+
+    if t > 0.0 && y.abs() <= rest_delta && v.abs() <= rest_speed {
+        (target, 0.0, false)
+    } else {
+        (target + y, v, true)
+    }
 }
 
 fn validate_style(style: &MotionStyle) -> Result<(), String> {
@@ -351,8 +738,15 @@ mod tests {
         let mut state = MotionState::new(&initial, started).unwrap();
 
         let middle = state.frame(started + Duration::from_millis(500));
-        assert_eq!(middle.style.width, Some(50.0));
+        assert_eq!(
+            state
+                .visible_style(started + Duration::from_millis(500))
+                .unwrap()
+                .width,
+            Some(50.0)
+        );
         assert!(middle.active);
+        assert!(!middle.just_settled);
 
         let reversed = serde_json::json!({
             "initial": false,
@@ -361,11 +755,11 @@ mod tests {
         });
         let reversed_at = started + Duration::from_millis(500);
         state.sync(&reversed, reversed_at).unwrap();
-        assert_eq!(state.frame(reversed_at).style.width, Some(50.0));
+        assert_eq!(state.visible_style(reversed_at).unwrap().width, Some(50.0));
         assert_eq!(
             state
-                .frame(reversed_at + Duration::from_millis(500))
-                .style
+                .visible_style(reversed_at + Duration::from_millis(500))
+                .unwrap()
                 .width,
             Some(25.0)
         );
@@ -379,10 +773,12 @@ mod tests {
             "animate": { "width": 260.0 },
             "transition": { "duration": 0.2 }
         });
-        let frame = MotionState::new(&description, now).unwrap().frame(now);
+        let mut state = MotionState::new(&description, now).unwrap();
+        let frame = state.frame(now);
 
-        assert_eq!(frame.style.width, Some(260.0));
+        assert_eq!(state.visible_style(now).unwrap().width, Some(260.0));
         assert!(!frame.active);
+        assert!(!frame.just_settled);
     }
 
     #[test]
@@ -406,10 +802,196 @@ mod tests {
             "animate": { "width": 100.0 },
             "transition": { "duration": 0.2, "ease": "linear" }
         });
-        let state = MotionState::new(&description, started).unwrap();
+        let mut state = MotionState::new(&description, started).unwrap();
         let frame = state.frame(started + Duration::from_millis(200));
 
-        assert_eq!(frame.style.width, Some(100.0));
+        assert_eq!(
+            state
+                .visible_style(started + Duration::from_millis(200))
+                .unwrap()
+                .width,
+            Some(100.0)
+        );
         assert!(!frame.active);
+        assert!(frame.just_settled);
+        assert!(
+            !state
+                .frame(started + Duration::from_millis(201))
+                .just_settled
+        );
+    }
+
+    #[test]
+    fn retarget_with_zero_duration_settles_on_the_next_frame() {
+        let started = Instant::now();
+        let initial = serde_json::json!({
+            "initial": false,
+            "animate": { "opacity": 1.0 },
+            "transition": { "duration": 0.2, "ease": "linear" }
+        });
+        let mut state = MotionState::new(&initial, started).unwrap();
+        assert!(!state.frame(started).just_settled);
+
+        let exit = serde_json::json!({
+            "initial": false,
+            "animate": { "opacity": 0.0 },
+            "transition": { "duration": 0.0, "ease": "linear" }
+        });
+        state.sync(&exit, started).unwrap();
+        let frame = state.frame(started);
+        assert_eq!(state.visible_style(started).unwrap().opacity, Some(0.0));
+        assert!(!frame.active);
+        assert!(frame.just_settled);
+    }
+
+    #[test]
+    fn a_new_generation_settles_when_the_target_already_matches() {
+        let started = Instant::now();
+        let initial = serde_json::json!({
+            "generation": 1,
+            "initial": false,
+            "animate": { "opacity": 1.0 }
+        });
+        let mut state = MotionState::new(&initial, started).unwrap();
+
+        let exit = serde_json::json!({
+            "generation": 2,
+            "initial": false,
+            "animate": { "opacity": 1.0 }
+        });
+        state.sync(&exit, started).unwrap();
+
+        assert!(state.frame(started).just_settled);
+        assert!(!state.frame(started).just_settled);
+    }
+
+    #[test]
+    fn retarget_keeps_values_omitted_from_the_new_target() {
+        let started = Instant::now();
+        let initial = serde_json::json!({
+            "generation": 1,
+            "initial": false,
+            "animate": { "width": 100.0, "opacity": 1.0 },
+            "transition": { "duration": 1.0, "ease": "linear" }
+        });
+        let mut state = MotionState::new(&initial, started).unwrap();
+
+        let exit = serde_json::json!({
+            "generation": 2,
+            "initial": false,
+            "animate": { "opacity": 0.0 },
+            "transition": { "duration": 1.0, "ease": "linear" }
+        });
+        state.sync(&exit, started).unwrap();
+
+        state.frame(started + Duration::from_millis(500));
+        let style = state
+            .visible_style(started + Duration::from_millis(500))
+            .unwrap();
+        assert_eq!(style.width, Some(100.0));
+        assert_eq!(style.opacity, Some(0.5));
+    }
+
+    #[test]
+    fn spring_underdamped_overshoots_and_settles() {
+        let started = Instant::now();
+        let desc = serde_json::json!({
+            "initial": { "top": 0.0 },
+            "animate": { "top": 100.0 },
+            "transition": { "type": "spring", "stiffness": 300.0, "damping": 12.0, "mass": 1.0 }
+        });
+        let mut state = MotionState::new(&desc, started).unwrap();
+        let mut max_top = 0.0_f64;
+        for step_ms in (16..=600).step_by(16) {
+            let v = state
+                .visible_style(started + Duration::from_millis(step_ms))
+                .unwrap()
+                .top
+                .unwrap();
+            max_top = max_top.max(v);
+        }
+        assert!(max_top > 100.0, "expected underdamped overshoot, got max_top={max_top}");
+        let end_frame = state.frame(started + Duration::from_millis(2500));
+        assert!(!end_frame.active);
+        assert_eq!(
+            state
+                .visible_style(started + Duration::from_millis(2500))
+                .unwrap()
+                .top,
+            Some(100.0)
+        );
+    }
+
+    #[test]
+    fn spring_critical_and_overdamped_converge_monotonically() {
+        let started = Instant::now();
+        let critical = serde_json::json!({
+            "initial": { "left": 0.0 },
+            "animate": { "left": 100.0 },
+            "transition": { "type": "spring", "stiffness": 256.0, "damping": 32.0, "mass": 1.0 }
+        });
+        let mut c_state = MotionState::new(&critical, started).unwrap();
+        let mut prev = 0.0;
+        for step_ms in (16..=1000).step_by(16) {
+            let v = c_state
+                .visible_style(started + Duration::from_millis(step_ms))
+                .unwrap()
+                .left
+                .unwrap();
+            assert!(v >= prev - 1e-6 && v <= 100.001, "critical overshoot {v} from {prev}");
+            prev = v;
+        }
+        assert!(!c_state.frame(started + Duration::from_millis(2000)).active);
+
+        let overdamped = serde_json::json!({
+            "initial": { "left": 0.0 },
+            "animate": { "left": 100.0 },
+            "transition": { "type": "spring", "stiffness": 100.0, "damping": 40.0, "mass": 1.0 }
+        });
+        let mut o_state = MotionState::new(&overdamped, started).unwrap();
+        assert!(!o_state.frame(started + Duration::from_millis(4000)).active);
+        assert_eq!(
+            o_state
+                .visible_style(started + Duration::from_millis(4000))
+                .unwrap()
+                .left,
+            Some(100.0)
+        );
+    }
+
+    #[test]
+    fn spring_retarget_preserves_position_and_momentum() {
+        let started = Instant::now();
+        let initial = serde_json::json!({
+            "generation": 1,
+            "initial": { "left": 0.0 },
+            "animate": { "left": 200.0 },
+            "transition": { "type": "spring", "stiffness": 300.0, "damping": 20.0, "mass": 1.0 }
+        });
+        let mut state = MotionState::new(&initial, started).unwrap();
+        let interrupt_at = started + Duration::from_millis(80);
+        let pos_at_interrupt = state.visible_style(interrupt_at).unwrap().left.unwrap();
+        assert!(pos_at_interrupt > 10.0 && pos_at_interrupt < 180.0);
+
+        let retarget = serde_json::json!({
+            "generation": 2,
+            "initial": false,
+            "animate": { "left": 0.0 },
+            "transition": { "type": "spring", "stiffness": 300.0, "damping": 20.0, "mass": 1.0 }
+        });
+        state.sync(&retarget, interrupt_at).unwrap();
+        assert!((state.visible_style(interrupt_at).unwrap().left.unwrap() - pos_at_interrupt).abs() < 1e-6);
+        // Because velocity was positive (~moving right) toward 200, immediately after retargeting
+        // back to 0 the element keeps carrying positive momentum briefly before turning around!
+        let pos_just_after = state
+            .visible_style(interrupt_at + Duration::from_millis(10))
+            .unwrap()
+            .left
+            .unwrap();
+        assert!(
+            pos_just_after > pos_at_interrupt,
+            "expected inherited positive velocity carry-over: {pos_just_after} vs {pos_at_interrupt}"
+        );
+        assert!(!state.frame(interrupt_at + Duration::from_millis(3000)).active);
     }
 }

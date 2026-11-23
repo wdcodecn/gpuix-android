@@ -79,6 +79,59 @@ static RESUME_PENDING: AtomicBool = AtomicBool::new(false);
 static TERM_WINDOW_PENDING: AtomicBool = AtomicBool::new(false);
 static INIT_WINDOW_PENDING: AtomicBool = AtomicBool::new(false);
 static WINDOW_RESIZED_PENDING: AtomicBool = AtomicBool::new(false);
+static LOW_MEMORY_LISTENER: parking_lot::RwLock<Option<fn()>> = parking_lot::RwLock::new(None);
+
+/// Register a listener invoked when Android delivers `MainEvent::LowMemory`.
+pub fn set_low_memory_listener(cb: fn()) {
+    *LOW_MEMORY_LISTENER.write() = Some(cb);
+}
+
+/// Read plain text from Android's system clipboard via `GpuiActivity.getClipboardText()`.
+pub fn read_system_clipboard() -> Option<String> {
+    with_env(|env| {
+        let cls = find_app_class(env, "dev.gpui.mobile.GpuiActivity")?;
+        let val = env
+            .call_static_method(
+                &cls,
+                jni::jni_str!("getClipboardText"),
+                jni::jni_sig!("()Ljava/lang/String;"),
+                &[],
+            )
+            .and_then(|v| v.l())
+            .map_err(|e| {
+                env.exception_clear();
+                e.to_string()
+            })?;
+        if val.is_null() {
+            return Ok(None);
+        }
+        Ok(Some(get_string(env, &val)))
+    })
+    .ok()
+    .flatten()
+}
+
+/// Write plain text to Android's system clipboard via `GpuiActivity.setClipboardText()`.
+pub fn write_system_clipboard(text: &str) -> bool {
+    with_env(|env| {
+        let cls = find_app_class(env, "dev.gpui.mobile.GpuiActivity")?;
+        let jtext = env.new_string(text).e()?;
+        let ok = env
+            .call_static_method(
+                &cls,
+                jni::jni_str!("setClipboardText"),
+                jni::jni_sig!("(Ljava/lang/String;)Z"),
+                &[JValue::Object(&jtext)],
+            )
+            .and_then(|v| v.z())
+            .map_err(|e| {
+                env.exception_clear();
+                e.to_string()
+            })?;
+        Ok(ok)
+    })
+    .unwrap_or(false)
+}
 static CONFIG_CHANGED_PENDING: AtomicBool = AtomicBool::new(false);
 // Java delivers animation samples; the native UI loop owns all GPUI callbacks.
 static WINDOW_INSETS_PENDING: parking_lot::Mutex<Option<([i32; 4], [i32; 4])>> =
@@ -611,6 +664,17 @@ fn process_input_events(app: &AndroidApp) -> bool {
                                 return android_activity::InputStatus::Unhandled;
                             }
 
+                            if matches!(action, MotionAction::Move) && pointer_count > 0 {
+                                let current_event_time = motion_event.event_time();
+                                let primary = motion_event.pointer_at_index(0);
+                                for hist in primary.history() {
+                                    let age_nanos =
+                                        current_event_time.saturating_sub(hist.event_time()).max(0)
+                                            as u64;
+                                    win.record_touch_history(hist.x(), hist.y(), age_nanos);
+                                }
+                            }
+
                             for i in 0..pointer_count {
                                 let pointer = motion_event.pointer_at_index(i);
 
@@ -732,6 +796,7 @@ pub fn run_event_loop(app: &AndroidApp) {
     let mut iteration: u64 = 0;
     let mut last_heartbeat = std::time::Instant::now();
     let mut last_user_activity = std::time::Instant::now();
+    let loop_started = std::time::Instant::now();
     let mut deep_idle = false;
     let mut app_is_active = false;
 
@@ -783,10 +848,31 @@ pub fn run_event_loop(app: &AndroidApp) {
         let (frame_pending, interactive) = PLATFORM
             .get()
             .and_then(|platform| platform.primary_window())
-            .map(|window| (window.has_frame_request(), window.is_interactive()))
+            .map(|window| {
+                (
+                    window.has_frame_request(),
+                    window.is_active() && window.is_interactive(),
+                )
+            })
             .unwrap_or((false, false));
+        let external_demand = crate::android::vsync::has_external_demand();
+        let vsync_requested = crate::android::vsync::is_requested();
+        let need_vsync = app_is_active
+            && INIT_WINDOW_DONE.load(Ordering::Relaxed)
+            && (frame_pending || interactive || external_demand || vsync_requested);
+        let hw_vsync = if need_vsync {
+            crate::android::vsync::arm_if_needed()
+        } else {
+            false
+        };
+
         let idle_for = now.duration_since(last_user_activity);
-        if !deep_idle && idle_for >= Duration::from_secs(60) && !interactive && !frame_pending {
+        if !deep_idle
+            && idle_for >= Duration::from_secs(60)
+            && !interactive
+            && !frame_pending
+            && !external_demand
+        {
             if let Some(platform) = PLATFORM.get() {
                 if let Some(window) = platform.primary_window() {
                     window.enter_deep_idle();
@@ -795,10 +881,16 @@ pub fn run_event_loop(app: &AndroidApp) {
             }
             deep_idle = true;
         }
-        let poll_timeout = if frame_pending {
+        let poll_timeout = if crate::android::vsync::has_fired() {
             Some(Duration::ZERO)
-        } else if interactive {
-            Some(Duration::from_millis(11))
+        } else if need_vsync && hw_vsync {
+            // Wait for hardware AChoreographer VSync callback (which wakes the
+            // looper immediately), keeping a bounded 50 ms safety watchdog.
+            Some(Duration::from_millis(50))
+        } else if frame_pending {
+            Some(Duration::ZERO)
+        } else if interactive || external_demand {
+            Some(Duration::from_millis(8))
         } else if deep_idle {
             // Keep a finite NativeActivity poll so Android's InputDispatcher
             // can complete its acknowledgement handshake on OEM builds that
@@ -838,6 +930,7 @@ pub fn run_event_loop(app: &AndroidApp) {
         if TERM_WINDOW_PENDING.swap(false, Ordering::Relaxed) {
             log::info!("deferred: TerminateWindow (iter={})", iteration);
             INIT_WINDOW_DONE.store(false, Ordering::Relaxed);
+            crate::android::vsync::reset();
             *LAST_CHROME_STYLE.lock().unwrap() = None;
             if let Some(platform) = PLATFORM.get() {
                 if let Some(win) = platform.primary_window() {
@@ -955,6 +1048,7 @@ pub fn run_event_loop(app: &AndroidApp) {
         if PAUSE_PENDING.swap(false, Ordering::Relaxed) {
             log::info!("deferred: Pause (iter={})", iteration);
             deep_idle = false;
+            crate::android::vsync::reset();
             if let Some(platform) = PLATFORM.get() {
                 platform.did_enter_background();
                 if let Some(win) = platform.primary_window() {
@@ -1031,10 +1125,23 @@ pub fn run_event_loop(app: &AndroidApp) {
         // ── Render ──
         if let Some(platform) = PLATFORM.get() {
             if INIT_WINDOW_DONE.load(Ordering::Relaxed) && app_is_active {
+                let fired_ns = crate::android::vsync::take_fired();
+                let external_now = crate::android::vsync::has_external_demand();
+                if let Some(frame_time_ns) = fired_ns {
+                    crate::android::vsync::notify_frame_listener(frame_time_ns);
+                } else if !hw_vsync && (external_now || vsync_requested) {
+                    let fallback_ns = loop_started.elapsed().as_nanos() as i64;
+                    crate::android::vsync::notify_frame_listener(fallback_ns);
+                }
+
                 platform.flush_main_thread_tasks();
                 if let Some(win) = platform.primary_window() {
-                    if win.take_frame_request() {
-                        win.request_frame();
+                    if fired_ns.is_some() || !hw_vsync || iteration <= 4 {
+                        if win.take_frame_request() {
+                            win.request_frame();
+                        } else if fired_ns.is_some() && win.is_interactive() {
+                            win.request_frame();
+                        }
                     }
                 }
 
@@ -1164,7 +1271,10 @@ fn handle_main_event(_app: &AndroidApp, event: MainEvent<'_>) {
         }
 
         MainEvent::LowMemory => {
-            log::warn!("MainEvent::LowMemory — consider releasing cached resources");
+            log::warn!("MainEvent::LowMemory — triggering memory reclaim");
+            if let Some(cb) = *LOW_MEMORY_LISTENER.read() {
+                cb();
+            }
         }
 
         MainEvent::Destroy => {

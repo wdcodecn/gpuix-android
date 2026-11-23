@@ -108,11 +108,13 @@ impl VelocityTracker {
 
     /// Record a touch position.  Call on every move event.
     pub fn record(&mut self, x: f32, y: f32) {
-        self.samples[self.index] = Some(Sample {
-            x,
-            y,
-            time: Instant::now(),
-        });
+        self.record_at(x, y, Instant::now());
+    }
+
+    /// Record a touch position with an explicit timestamp (used for Android
+    /// historical `MotionEvent` batches).
+    pub fn record_at(&mut self, x: f32, y: f32, time: Instant) {
+        self.samples[self.index] = Some(Sample { x, y, time });
         self.index = (self.index + 1) % MAX_SAMPLES;
         self.count += 1;
     }

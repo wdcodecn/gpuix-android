@@ -75,7 +75,7 @@ block2              = "0.6"
 
 # wgpu renderer (Metal backend on iOS/Android)
 gpui_wgpu = { path = "../../.deps/zed/crates/gpui_wgpu", features = ["font-kit"] }
-wgpu = { git = "https://github.com/zed-industries/wgpu.git", branch = "v29" }
+wgpu = "29.0.4"
 
 # Text / font stack
 pathfinder_geometry = "0.5"

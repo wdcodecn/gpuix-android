@@ -77,6 +77,7 @@ enum ImgSource {
     Path(std::path::PathBuf),
     Uri(gpui::SharedUri),
     Data(std::sync::Arc<gpui::Image>),
+    Render(std::sync::Arc<gpui::RenderImage>),
     Invalid,
 }
 
@@ -85,6 +86,7 @@ pub struct ImgElement {
     source: ImgSource,
     object_fit: ImgObjectFit,
     alt: String,
+    dropped: Option<std::sync::Arc<gpui::RenderImage>>,
 }
 
 impl ImgElement {
@@ -121,14 +123,14 @@ fn http_image_uri(src: &str) -> Option<gpui::SharedUri> {
 /// Web already gets `fetch` from `gpui_platform::single_threaded_web`. Desktop
 /// Application defaults to `NullHttpClient`, which fails every URI load.
 pub fn init(cx: &mut gpui::App) {
-    #[cfg(not(target_family = "wasm"))]
+    #[cfg(all(not(target_family = "wasm"), feature = "http-client"))]
     match reqwest_client::ReqwestClient::user_agent("gpuix") {
         Ok(client) => cx.set_http_client(std::sync::Arc::new(client)),
         Err(error) => log::error!(
             "GPUIX HTTP client failed to start; <img src=\"http…\"> will not load: {error:#}"
         ),
     }
-    #[cfg(target_family = "wasm")]
+    #[cfg(any(target_family = "wasm", not(feature = "http-client")))]
     let _ = cx;
 }
 
@@ -176,15 +178,20 @@ impl CustomElement for ImgElement {
     fn render(
         &mut self,
         ctx: CustomRenderContext,
-        _window: &mut gpui::Window,
+        window: &mut gpui::Window,
         _cx: &mut gpui::Context<crate::renderer::GpuixView>,
     ) -> gpui::AnyElement {
         use gpui::prelude::*;
+
+        if let Some(image) = self.dropped.take() {
+            window.drop_image(image).ok();
+        }
 
         let el = match &self.source {
             ImgSource::Path(path) => gpui::img(path.clone()),
             ImgSource::Uri(uri) => gpui::img(uri.clone()),
             ImgSource::Data(image) => gpui::img(image.clone()),
+            ImgSource::Render(image) => gpui::img(image.clone()),
             ImgSource::Empty => return img_fallback(&ctx, &self.alt, "img: no src"),
             ImgSource::Invalid => return img_fallback(&ctx, &self.alt, "img: load failed"),
         };
@@ -233,7 +240,15 @@ impl CustomElement for ImgElement {
 
     fn set_prop(&mut self, key: &str, value: serde_json::Value) {
         match key {
-            "src" => self.load_src(value.as_str().unwrap_or("")),
+            "src" => {
+                if value.is_null() && matches!(self.source, ImgSource::Render(_)) {
+                    return;
+                }
+                if let ImgSource::Render(image) = &self.source {
+                    self.dropped = Some(image.clone());
+                }
+                self.load_src(value.as_str().unwrap_or(""));
+            }
             "objectFit" => {
                 self.object_fit = value
                     .as_str()
@@ -254,6 +269,132 @@ impl CustomElement for ImgElement {
     }
 
     fn destroy(&mut self) {}
+
+    fn live_image(&self) -> Option<std::sync::Arc<gpui::RenderImage>> {
+        match &self.source {
+            ImgSource::Render(image) => Some(image.clone()),
+            _ => None,
+        }
+    }
+
+    fn take_dropped_image(&mut self) -> Option<std::sync::Arc<gpui::RenderImage>> {
+        self.dropped.take()
+    }
+
+    fn replace_live_image(
+        &mut self,
+        image: std::sync::Arc<gpui::RenderImage>,
+    ) -> Option<std::sync::Arc<gpui::RenderImage>> {
+        let previous = self.live_image();
+        self.source = ImgSource::Render(image);
+        previous
+    }
+}
+
+/// Byte order of a packed `setImagePixels` buffer. Alpha is straight in both.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PixelFormat {
+    Rgba,
+    /// GPUI's own `RenderImage` order, so the upload skips the swizzle pass.
+    Bgra,
+}
+
+impl PixelFormat {
+    pub fn parse(format: Option<&str>) -> std::result::Result<Self, String> {
+        match format {
+            None | Some("rgba") => Ok(Self::Rgba),
+            Some("bgra") => Ok(Self::Bgra),
+            Some(other) => Err(format!(
+                "Unknown pixel format {other:?}, expected \"rgba\" or \"bgra\""
+            )),
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Rgba => "RGBA",
+            Self::Bgra => "BGRA",
+        }
+    }
+}
+
+pub fn render_image_from_pixels(
+    width: u32,
+    height: u32,
+    mut bytes: Vec<u8>,
+    format: PixelFormat,
+) -> std::result::Result<std::sync::Arc<gpui::RenderImage>, String> {
+    let name = format.name();
+    let expected = (width as u64)
+        .checked_mul(height as u64)
+        .and_then(|pixels| pixels.checked_mul(4))
+        .and_then(|bytes| usize::try_from(bytes).ok())
+        .ok_or_else(|| format!("{name} pixel buffer {width}x{height} is too large"))?;
+    if bytes.len() != expected {
+        return Err(format!(
+            "{name} pixel buffer length {} does not match {width}x{height} ({expected} bytes)",
+            bytes.len()
+        ));
+    }
+    if format == PixelFormat::Rgba {
+        for pixel in bytes.chunks_exact_mut(4) {
+            pixel.swap(0, 2);
+        }
+    }
+    gpui::RenderImage::from_bgra(width, height, bytes)
+        .map(std::sync::Arc::new)
+        .ok_or_else(|| format!("{name} pixel buffer is not a valid image"))
+}
+
+pub fn render_image_from_encoded(
+    bytes: Vec<u8>,
+    svg_renderer: gpui::SvgRenderer,
+) -> std::result::Result<std::sync::Arc<gpui::RenderImage>, String> {
+    let format = sniff_image_format(&bytes)
+        .ok_or_else(|| "unrecognized image format".to_string())?;
+    gpui::Image::from_bytes(format, bytes)
+        .to_image_data(svg_renderer)
+        .map_err(|error| error.to_string())
+}
+
+fn sniff_image_format(bytes: &[u8]) -> Option<gpui::ImageFormat> {
+    if bytes.starts_with(&[0x89, b'P', b'N', b'G']) {
+        Some(gpui::ImageFormat::Png)
+    } else if bytes.starts_with(&[0xFF, 0xD8]) {
+        Some(gpui::ImageFormat::Jpeg)
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some(gpui::ImageFormat::Gif)
+    } else if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        Some(gpui::ImageFormat::Webp)
+    } else if bytes.starts_with(b"BM") {
+        Some(gpui::ImageFormat::Bmp)
+    } else if bytes.starts_with(&[0x49, 0x49, 0x2A, 0x00])
+        || bytes.starts_with(&[0x4D, 0x4D, 0x00, 0x2A])
+    {
+        Some(gpui::ImageFormat::Tiff)
+    } else if bytes.starts_with(&[0x00, 0x00, 0x01, 0x00]) {
+        Some(gpui::ImageFormat::Ico)
+    } else if bytes.starts_with(b"P1")
+        || bytes.starts_with(b"P2")
+        || bytes.starts_with(b"P3")
+        || bytes.starts_with(b"P4")
+        || bytes.starts_with(b"P5")
+        || bytes.starts_with(b"P6")
+    {
+        Some(gpui::ImageFormat::Pnm)
+    } else if looks_like_svg(bytes) {
+        Some(gpui::ImageFormat::Svg)
+    } else {
+        None
+    }
+}
+
+fn looks_like_svg(bytes: &[u8]) -> bool {
+    let start = std::str::from_utf8(bytes)
+        .ok()
+        .map(|text| text.trim_start())
+        .unwrap_or("");
+    start.starts_with("<svg") || start.starts_with("<?xml")
 }
 
 #[derive(Debug, Clone, Default)]

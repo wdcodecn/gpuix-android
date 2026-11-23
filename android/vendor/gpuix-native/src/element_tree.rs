@@ -65,6 +65,12 @@ pub struct EventPayload {
     /// Populated for: keyDown.
     pub is_held: Option<bool>,
 
+    /// Id of the GPUI key dispatch that produced this event. Every element
+    /// `keyDown` and the trailing `windowKeyDown` of one keystroke share it, so
+    /// JS can apply `preventDefault` / `stopPropagation` across them.
+    /// Populated for: keyDown, keyUp, windowKeyDown, windowKeyUp.
+    pub keystroke_id: Option<f64>,
+
     // ── Scroll ───────────────────────────────────────────────────────
     /// Scroll delta on the X axis (pixels or lines, see `precise`).
     /// Populated for: scroll.
@@ -107,11 +113,25 @@ pub struct EventPayload {
     /// Exclusive end of the visible logical range. Populated for: visibleRange.
     pub end_index: Option<f64>,
 
+    /// Border-box size of the element, in pixels. With `x` and `y`, its position
+    /// in window coordinates. Populated for: layout.
+    pub width: Option<f64>,
+    pub height: Option<f64>,
+
+    /// Scroll offset of the element, the pair `getScrollOffset` returns: 0 at the
+    /// start and negative as the content moves. Populated for: scrollChange.
+    pub scroll_x: Option<f64>,
+    pub scroll_y: Option<f64>,
+
     /// Matches found by this element's `highlight` prop. Counted once per match
     /// even when it is split across several painted runs, and it counts every
     /// retained match, not only the ones currently on screen.
     /// Populated for: highlight.
     pub match_count: Option<f64>,
+
+    /// Logical native motion target that reached completion.
+    /// Populated for: motionComplete.
+    pub motion_generation: Option<f64>,
 
     /// Absolute filesystem paths from a Finder / OS file drop.
     /// Populated for: fileDrop.
@@ -135,6 +155,7 @@ impl Default for EventPayload {
             key: None,
             key_char: None,
             is_held: None,
+            keystroke_id: None,
             delta_x: None,
             delta_y: None,
             precise: None,
@@ -145,7 +166,12 @@ impl Default for EventPayload {
             new_line: None,
             start_index: None,
             end_index: None,
+            width: None,
+            height: None,
+            scroll_x: None,
+            scroll_y: None,
             match_count: None,
+            motion_generation: None,
             paths: None,
             modifiers: None,
         }

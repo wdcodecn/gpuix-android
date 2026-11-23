@@ -8,9 +8,18 @@
 /// passes them as numbers across napi (no string allocation).
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use crate::style::StyleDesc;
+
+/// What one `elements_at` walk carries along.
+struct HitWalk<'a> {
+    x: f64,
+    y: f64,
+    painted_box: &'a dyn Fn(u64) -> Option<crate::automation::ElementBounds>,
+    /// Deferred `anchored` layers met so far, each with its priority and hits.
+    layers: Vec<(u64, Vec<u64>)>,
+}
 
 pub struct RetainedElement {
     pub id: u64,
@@ -18,7 +27,7 @@ pub struct RetainedElement {
     /// Shared, not owned. `StyleDesc` is ~1.4 KB, and holding it inline made an
     /// unstyled element pay for a style it does not have: `RetainedElement` was
     /// 1624 bytes, and the `HashMap` stores values inline, so the whole table
-    /// was that wide. Behind an `Arc` the record is 248 bytes.
+    /// was that wide. Behind an `Arc` it was 248 bytes; cold metadata makes it 160.
     ///
     /// The pointer is also shared between every element that declared the same
     /// style. A 10k-turn chat has 59 320 `setStyle` ops and 90 distinct styles.
@@ -27,12 +36,10 @@ pub struct RetainedElement {
     /// through it; `Arc` has no `DerefMut`, so the compiler enforces that.
     pub style: Option<Arc<StyleDesc>>,
     pub content: Option<String>,
-    pub events: HashSet<String>,
     pub children: Vec<u64>,
     pub parent: Option<u64>,
-    /// Props for custom elements (input, editor, diff, etc.).
-    /// Keyed by prop name, values are JSON. Ignored for "div" and "text".
-    pub custom_props: HashMap<String, serde_json::Value>,
+    /// Most host nodes have neither listeners nor custom props.
+    extras: Option<Box<ElementExtras>>,
     /// Take keyboard focus the first time this element gets a focus handle.
     /// Without it an `<input>` is dead until the user clicks it.
     pub auto_focus: bool,
@@ -51,21 +58,69 @@ pub struct RetainedElement {
     pub test_id: Option<String>,
 }
 
+#[derive(Default)]
+struct ElementExtras {
+    events: HashSet<String>,
+    custom_props: HashMap<String, serde_json::Value>,
+}
+
+static EMPTY_EXTRAS: LazyLock<ElementExtras> = LazyLock::new(ElementExtras::default);
+
 impl RetainedElement {
+    /// The element's `tabIndex`, when it has a usable one.
+    pub fn tab_index(&self) -> Option<isize> {
+        self.custom_props()
+            .get("tabIndex")
+            .and_then(|value| value.as_i64())
+            .and_then(|index| isize::try_from(index).ok())
+    }
+
+    /// Whether the element must own a gpui focus handle: it takes text, is in the
+    /// tab order, or listens for a key or focus event.
+    pub fn needs_focus(&self) -> bool {
+        matches!(self.element_type.as_str(), "input" | "textarea")
+            || self.tab_index().is_some()
+            || self.events().contains("keyDown")
+            || self.events().contains("keyUp")
+            || self.events().contains("focus")
+            || self.events().contains("blur")
+    }
+
     pub fn new(id: u64, element_type: String, revision: u64) -> Self {
         Self {
             id,
             element_type,
             style: None,
             content: None,
-            events: HashSet::new(),
             children: Vec::new(),
             parent: None,
+            extras: None,
             auto_focus: false,
             subtree_revision: revision,
             search_revision: revision,
             test_id: None,
-            custom_props: HashMap::new(),
+        }
+    }
+
+    pub fn events(&self) -> &HashSet<String> {
+        &self.extras.as_deref().unwrap_or(&EMPTY_EXTRAS).events
+    }
+
+    pub fn custom_props(&self) -> &HashMap<String, serde_json::Value> {
+        &self.extras.as_deref().unwrap_or(&EMPTY_EXTRAS).custom_props
+    }
+
+    fn extras_mut(&mut self) -> &mut ElementExtras {
+        self.extras.get_or_insert_with(Default::default)
+    }
+
+    fn release_empty_extras(&mut self) {
+        if self
+            .extras
+            .as_ref()
+            .is_some_and(|extras| extras.events.is_empty() && extras.custom_props.is_empty())
+        {
+            self.extras = None;
         }
     }
 }
@@ -107,6 +162,10 @@ pub(crate) const STYLE_SWEEP_FLOOR: usize = 64;
 #[derive(Default)]
 pub struct StyleTable {
     entries: rustc_hash::FxHashMap<u64, Vec<InternedStyle>>,
+    /// Client-assigned numeric style handles (`InternStyle` / `SetStyleById` in
+    /// the binary mutation wire protocol), reusing shared `Arc<StyleDesc>`
+    /// across renders without re-sending or hashing style JSON.
+    client_styles: rustc_hash::FxHashMap<u32, Arc<StyleDesc>>,
     /// Entries currently held. Tracked rather than summed, so `maybe_sweep` is
     /// O(1) on the commits that do not sweep.
     count: usize,
@@ -135,6 +194,27 @@ impl StyleTable {
         });
         self.count += 1;
         Ok(shared)
+    }
+
+    /// Parse/intern a style payload and bind it to a JS-chosen `client_id`
+    /// so subsequent `SetStyleById` binary ops can apply it in O(1).
+    pub fn intern_client_style(
+        &mut self,
+        client_id: u32,
+        raw: &[u8],
+    ) -> Result<Arc<StyleDesc>, String> {
+        let shared = self.intern(raw)?;
+        if self.client_styles.len() >= 4096 {
+            self.client_styles
+                .retain(|_, entry| Arc::strong_count(entry) > 2);
+        }
+        self.client_styles.insert(client_id, shared.clone());
+        Ok(shared)
+    }
+
+    /// Look up a style previously registered via `intern_client_style`.
+    pub fn get_client_style(&self, client_id: u32) -> Option<Arc<StyleDesc>> {
+        self.client_styles.get(&client_id).cloned()
     }
 
     /// Drop interned styles no element references any more.
@@ -184,29 +264,93 @@ impl StyleTable {
 
 pub struct RetainedTree {
     pub elements: ElementMap,
+    pub motion_ids: HashSet<u64>,
+    /// Elements that `needs_focus`, in id order. Kept as mutations arrive so the
+    /// per-frame focus sync visits these few instead of every retained element:
+    /// a large tree retains thousands, and nearly none are focusable.
+    pub focusable_ids: std::collections::BTreeSet<u64>,
+    /// How many `anchored` elements exist. Without any, an `elements_at` walk
+    /// can drop a clipped subtree whole.
+    anchored_count: usize,
     pub styles: StyleTable,
     /// The root element ID set by appendChildToContainer.
     pub root_id: Option<u64>,
+    /// Dim other focusables while a control has keyboard focus. Set per root.
+    keyboard_focus_dim: bool,
     next_revision: u64,
+    /// Something a frame would draw changed since the last `take_dirty`. A batch
+    /// of resends, which is what a re-render with unchanged props produces,
+    /// leaves it false, so the window is not asked to rebuild its element tree
+    /// for a frame that would come out identical.
+    dirty: bool,
 }
 
 impl RetainedTree {
     pub fn new() -> Self {
         Self {
             elements: ElementMap::default(),
+            motion_ids: HashSet::new(),
+            focusable_ids: Default::default(),
+            anchored_count: 0,
             styles: StyleTable::default(),
             root_id: None,
+            keyboard_focus_dim: true,
             next_revision: 1,
+            dirty: false,
+        }
+    }
+
+    /// Whether a frame drawn now would differ from the last one, clearing the
+    /// answer. Call once per applied batch.
+    pub fn take_dirty(&mut self) -> bool {
+        std::mem::take(&mut self.dirty)
+    }
+
+    pub fn keyboard_focus_dim(&self) -> bool {
+        self.keyboard_focus_dim
+    }
+
+    pub fn set_keyboard_focus_dim(&mut self, enabled: bool) {
+        if self.keyboard_focus_dim != enabled {
+            self.keyboard_focus_dim = enabled;
+            self.dirty = true;
+        }
+    }
+
+    pub fn set_root(&mut self, id: u64) {
+        if self.root_id != Some(id) {
+            self.root_id = Some(id);
+            self.dirty = true;
         }
     }
 
     pub fn create_element(&mut self, id: u64, element_type: String) {
+        self.anchored_count += usize::from(element_type == "anchored");
+        self.dirty = true;
         let revision = self.take_revision();
         self.elements
             .insert(id, RetainedElement::new(id, element_type, revision));
+        self.track_focusable(id);
+    }
+
+    /// Bring `focusable_ids` in line with `id` after anything `needs_focus`
+    /// reads has changed.
+    fn track_focusable(&mut self, id: u64) {
+        if self
+            .elements
+            .get(&id)
+            .is_some_and(RetainedElement::needs_focus)
+        {
+            self.focusable_ids.insert(id);
+        } else {
+            self.focusable_ids.remove(&id);
+        }
     }
 
     fn take_revision(&mut self) -> u64 {
+        // Every content change takes a revision to invalidate caches, so this is
+        // the one place that covers style, text, structure and custom props.
+        self.dirty = true;
         let revision = self.next_revision;
         self.next_revision = self.next_revision.wrapping_add(1).max(1);
         revision
@@ -253,6 +397,9 @@ impl RetainedTree {
         }
         let mut destroyed = Vec::new();
         self.destroy_element_recursive(id, &mut destroyed);
+        if !destroyed.is_empty() {
+            self.dirty = true;
+        }
         if self.root_id == Some(id) {
             self.root_id = None;
         }
@@ -264,6 +411,9 @@ impl RetainedTree {
 
     fn destroy_element_recursive(&mut self, id: u64, destroyed: &mut Vec<u64>) {
         if let Some(element) = self.elements.remove(&id) {
+            self.motion_ids.remove(&id);
+            self.focusable_ids.remove(&id);
+            self.anchored_count -= usize::from(element.element_type == "anchored");
             destroyed.push(id);
             for child_id in element.children {
                 self.destroy_element_recursive(child_id, destroyed);
@@ -358,10 +508,20 @@ impl RetainedTree {
 
     pub fn set_event_listener(&mut self, id: u64, event_type: String, has_handler: bool) {
         if let Some(element) = self.elements.get_mut(&id) {
-            if has_handler {
-                element.events.insert(event_type);
+            let changed = if has_handler {
+                element.extras_mut().events.insert(event_type)
+            } else if let Some(extras) = element.extras.as_mut() {
+                let changed = extras.events.remove(&event_type);
+                element.release_empty_extras();
+                changed
             } else {
-                element.events.remove(&event_type);
+                false
+            };
+            // Which listeners exist decides how the element is built, though it
+            // does not touch any cached text.
+            self.dirty |= changed;
+            if changed {
+                self.track_focusable(id);
             }
         }
     }
@@ -375,38 +535,60 @@ impl RetainedTree {
     pub fn set_custom_prop(&mut self, id: u64, key: String, value: serde_json::Value) {
         let mut changed = false;
         let is_highlight = key == "highlight";
+        let is_motion = key == "motion";
+        let is_tab_index = key == "tabIndex";
         let was_declaration = self
             .elements
             .get(&id)
-            .is_some_and(|element| element.custom_props.contains_key("highlight"));
+            .is_some_and(|element| element.custom_props().contains_key("highlight"));
         if let Some(element) = self.elements.get_mut(&id) {
             // `autoFocus` applies to every element type, so it is lifted out of
             // the custom-prop map that only custom elements read.
             if key == "autoFocus" {
-                element.auto_focus = value.as_bool().unwrap_or(false);
+                let auto_focus = value.as_bool().unwrap_or(false);
+                self.dirty |= element.auto_focus != auto_focus;
+                element.auto_focus = auto_focus;
                 return;
             }
             if key == "testId" {
-                element.test_id = value.as_str().map(str::to_string);
+                let test_id = value.as_str().map(str::to_string);
+                self.dirty |= element.test_id != test_id;
+                element.test_id = test_id;
                 return;
             }
             if value.is_null() {
-                changed = element.custom_props.remove(&key).is_some();
-            } else {
-                if element.custom_props.get(&key) != Some(&value) {
-                    element.custom_props.insert(key, value);
-                    changed = true;
-                }
+                changed = element
+                    .extras
+                    .as_mut()
+                    .is_some_and(|extras| extras.custom_props.remove(&key).is_some());
+                element.release_empty_extras();
+            } else if element.custom_props().get(&key) != Some(&value) {
+                element.extras_mut().custom_props.insert(key, value);
+                changed = true;
             }
         }
         if !changed {
             return;
         }
+        if is_tab_index {
+            self.track_focusable(id);
+        }
+        if is_motion {
+            if self
+                .elements
+                .get(&id)
+                .is_some_and(|element| element.custom_props().contains_key("motion"))
+            {
+                self.motion_ids.insert(id);
+            } else {
+                self.motion_ids.remove(&id);
+            }
+        }
         self.mark_render_changed(id);
         let is_declaration = self
             .elements
             .get(&id)
-            .is_some_and(|element| element.custom_props.contains_key("highlight"));
+            .is_some_and(|element| element.custom_props().contains_key("highlight"));
         if is_highlight && was_declaration != is_declaration {
             // Only the ancestors: `GroupList::collect` skips a nested
             // declaration's subtree, so which subtrees exist changed for them.
@@ -419,7 +601,7 @@ impl RetainedTree {
 
     /// Read a custom prop value from an element.
     pub fn get_custom_prop(&self, id: u64, key: &str) -> Option<&serde_json::Value> {
-        self.elements.get(&id)?.custom_props.get(key)
+        self.elements.get(&id)?.custom_props().get(key)
     }
 
     pub fn to_json(
@@ -435,6 +617,114 @@ impl RetainedTree {
         bounds: &std::collections::HashMap<u64, crate::automation::ElementBounds>,
     ) -> serde_json::Value {
         self.to_json_detail(bounds, false)
+    }
+
+    /// The elements whose painted box holds the point, topmost first: the DOM's
+    /// `elementsFromPoint`.
+    ///
+    /// There is no z-index, so tree order is paint order. Walking each
+    /// element's children last to first, and the element after them, yields
+    /// the topmost element first. The exception is a deferred `anchored`
+    /// layer, which gpui paints after the tree by `priority` and without the
+    /// clip of the elements around it: its hits come first.
+    ///
+    /// `painted_box` is the last frame's box. An element that was not painted
+    /// (hidden, or outside a virtual list's window) has none and is never hit,
+    /// though its descendants are still visited. What clips matches what is
+    /// drawn: `overflow` of `hidden` or `scroll`, per axis, hides whatever lies
+    /// outside the clipping box. `pointer-events: none` is inherited, like in
+    /// CSS, and `auto` restores it.
+    pub fn elements_at(
+        &self,
+        x: f64,
+        y: f64,
+        painted_box: &dyn Fn(u64) -> Option<crate::automation::ElementBounds>,
+    ) -> Vec<u64> {
+        let mut walk = HitWalk {
+            x,
+            y,
+            painted_box,
+            layers: Vec::new(),
+        };
+        let mut hits = Vec::new();
+        if let Some(root_id) = self.root_id {
+            self.collect_hits(root_id, false, false, &mut walk, &mut hits);
+        }
+        // Stable, so layers of one priority stay topmost first.
+        walk.layers.sort_by(|a, b| b.0.cmp(&a.0));
+        let mut ordered: Vec<u64> = walk.layers.into_iter().flat_map(|(_, layer)| layer).collect();
+        ordered.extend(hits);
+        ordered
+    }
+
+    /// `none` is the inherited `pointer-events: none`. `clipped` means an
+    /// ancestor's clip excludes the point, so only deferred layers below can
+    /// still be hit.
+    fn collect_hits(
+        &self,
+        id: u64,
+        none: bool,
+        clipped: bool,
+        walk: &mut HitWalk,
+        hits: &mut Vec<u64>,
+    ) {
+        let Some(element) = self.elements.get(&id) else {
+            return;
+        };
+        let style = element.style.as_deref();
+        let own_box = (walk.painted_box)(id);
+        let (x, y) = (walk.x, walk.y);
+        let inside = |bounds: &crate::automation::ElementBounds, horizontal: bool, vertical: bool| {
+            (!horizontal || (x >= bounds.x && x < bounds.x + bounds.width))
+                && (!vertical || (y >= bounds.y && y < bounds.y + bounds.height))
+        };
+
+        let mut clipped = clipped;
+        if let (Some(style), Some(bounds)) = (style, &own_box) {
+            let clips = |axis: Option<&str>| matches!(axis, Some("hidden" | "scroll"));
+            let clip_x = clips(style.overflow_x.as_deref().or(style.overflow.as_deref()));
+            let clip_y = clips(style.overflow_y.as_deref().or(style.overflow.as_deref()));
+            if (clip_x || clip_y) && !inside(bounds, clip_x, clip_y) {
+                if self.anchored_count == 0 {
+                    return;
+                }
+                clipped = true;
+            }
+        }
+
+        let none = match style.and_then(|style| style.pointer_events.as_deref()) {
+            Some("none") => true,
+            Some("auto") => false,
+            _ => none,
+        };
+
+        if element.element_type == "anchored" {
+            let deferred = element
+                .custom_props()
+                .get("deferred")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(true);
+            if deferred {
+                let priority = element
+                    .custom_props()
+                    .get("priority")
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(1);
+                let mut layer = Vec::new();
+                for &child in element.children.iter().rev() {
+                    self.collect_hits(child, none, false, walk, &mut layer);
+                }
+                walk.layers.push((priority, layer));
+                return;
+            }
+        }
+
+        for &child in element.children.iter().rev() {
+            self.collect_hits(child, none, clipped, walk, hits);
+        }
+        if !clipped && !none && own_box.is_some_and(|bounds| inside(&bounds, true, true)) {
+            hits.push(id);
+        }
     }
 
     fn to_json_detail(
@@ -511,15 +801,15 @@ fn element_to_json(
             }
         }
 
-        if !element.events.is_empty() {
-            let mut events: Vec<String> = element.events.iter().cloned().collect();
+        if !element.events().is_empty() {
+            let mut events: Vec<String> = element.events().iter().cloned().collect();
             events.sort();
             obj.insert("events".to_string(), serde_json::json!(events));
         }
 
-        if !element.custom_props.is_empty() {
+        if !element.custom_props().is_empty() {
             let custom: serde_json::Map<String, serde_json::Value> = element
-                .custom_props
+                .custom_props()
                 .iter()
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect();
@@ -819,6 +1109,236 @@ mod tests {
         let after = tree.elements[&1].search_revision;
         tree.destroy_element(3);
         assert!(tree.elements[&1].search_revision > after);
+    }
+
+    /// `focusable_ids` stands in for a scan of every element, so it has to
+    /// agree with `needs_focus` after any mutation that can change the answer.
+    #[test]
+    fn focusable_ids_follow_what_needs_focus_reads() {
+        let mut tree = RetainedTree::new();
+        tree.create_element(1, "div".to_string());
+        tree.create_element(2, "input".to_string());
+        tree.create_element(3, "div".to_string());
+        tree.create_element(4, "div".to_string());
+        tree.append_child(1, 2);
+        tree.append_child(1, 3);
+        tree.append_child(1, 4);
+        let focusable =
+            |tree: &RetainedTree| tree.focusable_ids.iter().copied().collect::<Vec<_>>();
+        assert_eq!(focusable(&tree), vec![2], "inputs always take focus");
+
+        tree.set_event_listener(3, "keyDown".to_string(), true);
+        tree.set_custom_prop(4, "tabIndex".to_string(), serde_json::json!(0));
+        assert_eq!(focusable(&tree), vec![2, 3, 4]);
+
+        // A click listener has nothing to do with focus.
+        tree.set_event_listener(1, "click".to_string(), true);
+        assert_eq!(focusable(&tree), vec![2, 3, 4]);
+
+        // Other listeners keep an element in the set until the last one goes.
+        tree.set_event_listener(3, "blur".to_string(), true);
+        tree.set_event_listener(3, "keyDown".to_string(), false);
+        assert_eq!(focusable(&tree), vec![2, 3, 4]);
+        tree.set_event_listener(3, "blur".to_string(), false);
+        assert_eq!(focusable(&tree), vec![2, 4]);
+
+        tree.set_custom_prop(4, "tabIndex".to_string(), serde_json::Value::Null);
+        assert_eq!(focusable(&tree), vec![2]);
+
+        tree.destroy_element(1);
+        assert!(
+            tree.focusable_ids.is_empty(),
+            "destroying a subtree forgets its ids"
+        );
+    }
+
+    /// A page with a clipping scroller, overlapping siblings, and an overlay that
+    /// does not take the pointer:
+    ///
+    /// ```text
+    /// 1 root      0,0   100x100
+    ///   2 scroller  0,0   50x50   overflow: hidden
+    ///     3 row       0,40  50x30   (sticks out of the scroller's bottom)
+    ///   4 sibling   40,0  50x50   (paints over the scroller)
+    ///   5 overlay   0,0   100x100 pointer-events: none
+    ///     6 button    60,60 20x20   pointer-events: auto
+    /// ```
+    fn hit_test_tree() -> (RetainedTree, impl Fn(u64) -> Option<crate::automation::ElementBounds>) {
+        let mut tree = RetainedTree::new();
+        for id in 1..=6 {
+            tree.create_element(id, "div".to_string());
+        }
+        tree.set_root(1);
+        for (parent, child) in [(1, 2), (2, 3), (1, 4), (1, 5), (5, 6)] {
+            tree.append_child(parent, child);
+        }
+        let styled = |overflow: Option<&str>, pointer_events: Option<&str>| {
+            Arc::new(StyleDesc {
+                overflow: overflow.map(str::to_string),
+                pointer_events: pointer_events.map(str::to_string),
+                ..Default::default()
+            })
+        };
+        tree.set_style(2, styled(Some("hidden"), None));
+        tree.set_style(5, styled(None, Some("none")));
+        tree.set_style(6, styled(None, Some("auto")));
+        let boxes = [
+            (1, (0.0, 0.0, 100.0, 100.0)),
+            (2, (0.0, 0.0, 50.0, 50.0)),
+            (3, (0.0, 40.0, 50.0, 30.0)),
+            (4, (40.0, 0.0, 50.0, 50.0)),
+            (5, (0.0, 0.0, 100.0, 100.0)),
+            (6, (60.0, 60.0, 20.0, 20.0)),
+        ];
+        let lookup = move |id: u64| {
+            boxes
+                .iter()
+                .find(|(candidate, _)| *candidate == id)
+                .map(|(_, (x, y, width, height))| crate::automation::ElementBounds {
+                    x: *x,
+                    y: *y,
+                    width: *width,
+                    height: *height,
+                })
+        };
+        (tree, lookup)
+    }
+
+    #[test]
+    fn elements_at_lists_what_is_under_the_point_topmost_first() {
+        let (tree, painted) = hit_test_tree();
+        // The later sibling paints over the scroller, and both sit in the root.
+        assert_eq!(tree.elements_at(45.0, 10.0, &painted), vec![4, 2, 1]);
+        // A descendant is above its ancestor.
+        assert_eq!(tree.elements_at(10.0, 45.0, &painted), vec![3, 2, 1]);
+        assert_eq!(tree.elements_at(500.0, 500.0, &painted), Vec::<u64>::new());
+    }
+
+    #[test]
+    fn elements_at_stops_at_the_clip_edge() {
+        let (tree, painted) = hit_test_tree();
+        // y 60 is inside the row but below the scroller that clips it.
+        assert_eq!(tree.elements_at(10.0, 60.0, &painted), vec![1]);
+    }
+
+    #[test]
+    fn elements_at_skips_what_does_not_take_the_pointer() {
+        let (tree, painted) = hit_test_tree();
+        // The overlay covers everything yet is never hit...
+        assert_eq!(tree.elements_at(10.0, 90.0, &painted), vec![1]);
+        // ...while its child opts back in.
+        assert_eq!(tree.elements_at(70.0, 70.0, &painted), vec![6, 1]);
+    }
+
+    #[test]
+    fn elements_at_never_hits_what_was_not_painted() {
+        let (tree, painted) = hit_test_tree();
+        let without_the_sibling = |id: u64| if id == 4 { None } else { painted(id) };
+        assert_eq!(tree.elements_at(45.0, 10.0, &without_the_sibling), vec![2, 1]);
+    }
+
+    fn boxed(
+        boxes: &[(u64, (f64, f64, f64, f64))],
+    ) -> impl Fn(u64) -> Option<crate::automation::ElementBounds> + '_ {
+        move |id| {
+            boxes
+                .iter()
+                .find(|(candidate, _)| *candidate == id)
+                .map(|(_, (x, y, width, height))| crate::automation::ElementBounds {
+                    x: *x,
+                    y: *y,
+                    width: *width,
+                    height: *height,
+                })
+        }
+    }
+
+    /// A popover lives inside a clipping scroller, early in the tree, yet gpui
+    /// paints it after everything else and outside that clip.
+    #[test]
+    fn elements_at_puts_a_deferred_layer_above_the_tree_and_outside_its_clip() {
+        let mut tree = RetainedTree::new();
+        for (id, kind) in [
+            (1, "div"),
+            (2, "div"),
+            (3, "anchored"),
+            (4, "div"),
+            (5, "div"),
+        ] {
+            tree.create_element(id, kind.to_string());
+        }
+        tree.set_root(1);
+        for (parent, child) in [(1, 2), (2, 3), (3, 4), (1, 5)] {
+            tree.append_child(parent, child);
+        }
+        tree.set_style(
+            2,
+            Arc::new(StyleDesc {
+                overflow: Some("hidden".to_string()),
+                ..Default::default()
+            }),
+        );
+        let boxes = [
+            (1, (0.0, 0.0, 100.0, 100.0)),
+            (2, (0.0, 0.0, 20.0, 20.0)),
+            (4, (50.0, 50.0, 30.0, 30.0)),
+            (5, (40.0, 40.0, 60.0, 60.0)),
+        ];
+        // The popover content is outside its scroller's clip and under a later
+        // sibling, and is still what the point lands on.
+        assert_eq!(tree.elements_at(60.0, 60.0, &boxed(&boxes)), vec![4, 5, 1]);
+
+        // Ordinary clipping is untouched.
+        tree.destroy_element(3);
+        tree.create_element(6, "div".to_string());
+        tree.append_child(2, 6);
+        let with_clipped_child = [(1, (0.0, 0.0, 100.0, 100.0)), (2, (0.0, 0.0, 20.0, 20.0)), (6, (0.0, 0.0, 90.0, 90.0))];
+        assert_eq!(tree.elements_at(60.0, 60.0, &boxed(&with_clipped_child)), vec![1]);
+    }
+
+    #[test]
+    fn elements_at_orders_deferred_layers_by_priority() {
+        let mut tree = RetainedTree::new();
+        for (id, kind) in [(1, "div"), (2, "anchored"), (3, "div"), (4, "anchored"), (5, "div")] {
+            tree.create_element(id, kind.to_string());
+        }
+        tree.set_root(1);
+        for (parent, child) in [(1, 2), (2, 3), (1, 4), (4, 5)] {
+            tree.append_child(parent, child);
+        }
+        let boxes = [
+            (1, (0.0, 0.0, 100.0, 100.0)),
+            (3, (0.0, 0.0, 100.0, 100.0)),
+            (5, (0.0, 0.0, 100.0, 100.0)),
+        ];
+        // Equal priority: the layer later in the tree paints over the earlier.
+        assert_eq!(tree.elements_at(10.0, 10.0, &boxed(&boxes)), vec![5, 3, 1]);
+
+        tree.set_custom_prop(2, "priority".to_string(), serde_json::json!(5));
+        assert_eq!(tree.elements_at(10.0, 10.0, &boxed(&boxes)), vec![3, 5, 1]);
+
+        // Not deferred: painted in place, in tree order, under the clip.
+        tree.set_custom_prop(2, "deferred".to_string(), serde_json::json!(false));
+        assert_eq!(tree.elements_at(10.0, 10.0, &boxed(&boxes)), vec![5, 3, 1]);
+    }
+
+    #[test]
+    fn cold_event_and_prop_storage_is_released_when_empty() {
+        let mut tree = tree_with_child();
+        assert!(tree.elements[&1].extras.is_none());
+
+        tree.set_event_listener(1, "click".to_string(), true);
+        tree.set_custom_prop(1, "aria-label".to_string(), serde_json::json!("button"));
+        assert!(tree.elements[&1].events().contains("click"));
+        assert_eq!(
+            tree.get_custom_prop(1, "aria-label"),
+            Some(&serde_json::json!("button"))
+        );
+
+        tree.set_event_listener(1, "click".to_string(), false);
+        assert!(tree.elements[&1].extras.is_some());
+        tree.set_custom_prop(1, "aria-label".to_string(), serde_json::Value::Null);
+        assert!(tree.elements[&1].extras.is_none());
     }
 
     #[test]

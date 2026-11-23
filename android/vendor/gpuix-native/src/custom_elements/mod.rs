@@ -14,10 +14,13 @@ use std::collections::{HashMap, HashSet};
 use crate::renderer::EventCallback;
 
 pub mod anchored;
+#[cfg(feature = "rich-content")]
 pub mod code;
+#[cfg(feature = "rich-content")]
 pub mod diff;
 pub mod img;
 pub mod input;
+#[cfg(feature = "rich-content")]
 pub mod markdown;
 
 // ── Render context ───────────────────────────────────────────────────
@@ -33,6 +36,9 @@ pub struct CustomRenderContext<'a> {
     pub event_callback: &'a Option<EventCallback>,
     /// Pre-created FocusHandle for this element (if it has keyboard/focus listeners).
     pub focus_handle: Option<&'a gpui::FocusHandle>,
+    /// The control holding keyboard focus and its ancestors. See
+    /// `renderer::apply_focus_visible`.
+    pub keyboard_focus: Option<std::sync::Arc<[u64]>>,
     /// Style object from the retained element for layout and appearance.
     pub style: Option<&'a crate::style::StyleDesc>,
     /// Built child elements from the retained tree for this custom node.
@@ -125,7 +131,7 @@ pub(crate) fn custom_surface(
     {
         el = el.relative();
     }
-    el = el.child(crate::automation::bounds_tracker(ctx.id, None));
+    el = crate::automation::track_host_bounds(el, ctx.id, None, None);
     el = crate::accessibility::apply_accessibility(el, ctx.props, None);
     wire_standard_events(el, ctx)
 }
@@ -223,6 +229,25 @@ pub trait CustomElement: 'static {
 
     /// Clean up resources (GPUI entities, subscriptions, etc.)
     fn destroy(&mut self);
+
+    /// Current live GPU image on `<img>`, if any.
+    fn live_image(&self) -> Option<std::sync::Arc<gpui::RenderImage>> {
+        None
+    }
+
+    /// A live image that `src` replaced, waiting for `drop_image`.
+    fn take_dropped_image(&mut self) -> Option<std::sync::Arc<gpui::RenderImage>> {
+        None
+    }
+
+    /// Replace the live GPU image on `<img>`. Returns the previous image when
+    /// this adapter already had one, so the renderer can upload in place.
+    fn replace_live_image(
+        &mut self,
+        _image: std::sync::Arc<gpui::RenderImage>,
+    ) -> Option<std::sync::Arc<gpui::RenderImage>> {
+        None
+    }
 }
 
 /// Factory for creating CustomElement instances.
@@ -299,9 +324,12 @@ impl CustomElementRegistry {
         registry.register(Box::new(anchored::AnchoredFactory));
         registry.register(Box::new(img::ImgFactory));
         registry.register(Box::new(img::SvgFactory));
-        registry.register(Box::new(code::CodeFactory));
-        registry.register(Box::new(diff::DiffFactory));
-        registry.register(Box::new(markdown::MarkdownFactory));
+        #[cfg(feature = "rich-content")]
+        {
+            registry.register(Box::new(code::CodeFactory));
+            registry.register(Box::new(diff::DiffFactory));
+            registry.register(Box::new(markdown::MarkdownFactory));
+        }
         registry
     }
 
@@ -365,6 +393,18 @@ impl CustomElementRegistry {
         entry.element.render(ctx, window, cx)
     }
 
+    /// Store a decoded image on an `<img>` host node, creating the adapter if needed.
+    pub fn set_live_image(
+        &mut self,
+        id: u64,
+        image: std::sync::Arc<gpui::RenderImage>,
+    ) -> std::result::Result<Option<std::sync::Arc<gpui::RenderImage>>, String> {
+        let entry = self
+            .get_or_create(id, "img")
+            .ok_or_else(|| "img factory is not registered".to_string())?;
+        Ok(entry.element.replace_live_image(image))
+    }
+
     /// Called when React destroys an element.
     pub fn destroy(&mut self, id: u64) {
         if let Some(mut entry) = self.instances.remove(&id) {
@@ -373,7 +413,7 @@ impl CustomElementRegistry {
     }
 
     /// Remove and destroy instances whose IDs no longer exist in the tree.
-    pub fn prune_missing<F>(&mut self, mut is_live: F)
+    pub fn prune_missing<F>(&mut self, mut is_live: F, window: &mut gpui::Window)
     where
         F: FnMut(u64) -> bool,
     {
@@ -385,7 +425,20 @@ impl CustomElementRegistry {
             .collect();
 
         for id in stale_ids {
-            self.destroy(id);
+            self.destroy_live_image(id, window);
+        }
+    }
+
+    fn destroy_live_image(&mut self, id: u64, window: &mut gpui::Window) {
+        if let Some(mut entry) = self.instances.remove(&id) {
+            if let Some(image) = entry
+                .element
+                .live_image()
+                .or_else(|| entry.element.take_dropped_image())
+            {
+                window.drop_image(image).ok();
+            }
+            entry.element.destroy();
         }
     }
 

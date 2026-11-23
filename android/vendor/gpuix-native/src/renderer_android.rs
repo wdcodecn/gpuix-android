@@ -12,6 +12,7 @@ struct AndroidInit {
     tree: Arc<Mutex<RetainedTree>>,
     selection: SharedSelection,
     callback: Option<EventCallback>,
+    window_metrics: SharedWindowMetrics,
     commands: mpsc::UnboundedReceiver<UiCommand>,
     running: Arc<AtomicBool>,
     response: SyncSender<std::result::Result<(), String>>,
@@ -36,6 +37,7 @@ fn attach_android_renderer(
         tree,
         selection,
         callback,
+        window_metrics,
         commands,
         running,
         response,
@@ -52,7 +54,9 @@ fn attach_android_renderer(
         cx,
     );
     let window = match cx.open_window(to_gpui_window_options(&options, bounds), |_window, cx| {
-        cx.new(|_| GpuixView::new(tree, callback, title, selection))
+        cx.new(|_| {
+            GpuixView::new(tree, callback, title, selection).with_window_metrics(window_metrics)
+        })
     }) {
         Ok(window) => window,
         Err(error) => {
@@ -65,6 +69,13 @@ fn attach_android_renderer(
             return;
         }
     };
+    let _ = window.update(cx, |view, window, cx| {
+        view.sync_window_metrics(window);
+        cx.observe_window_bounds(window, |view, window, _cx| {
+            view.sync_window_metrics(window);
+        })
+        .detach();
+    });
     cx.spawn(async move |cx| run_ui_commands(commands, window, cx).await)
         .detach();
     running.store(true, Ordering::Release);
@@ -139,22 +150,9 @@ pub fn run_android(
     // old `cx.spawn` fallback depends on the Android foreground dispatcher to
     // wake a future that is not yet attached to a window.  That left Hermes
     // blocked for the full 60-second N-API timeout and produced a black screen.
-    // Give the JS worker a short, bounded head-start so the common path enters
-    // `Application::run` with the request already queued.  This wait is on the
-    // NativeActivity thread (not Android's Java UI thread), and the fallback
-    // remains non-blocking after the deadline for unusually slow JS startup.
-    let mut early_request = None;
-    let early_deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while std::time::Instant::now() < early_deadline {
-        match requests.try_recv() {
-            Ok(request) => {
-                early_request = Some(request);
-                break;
-            }
-            Err(TryRecvError::Disconnected) => break,
-            Err(TryRecvError::Empty) => std::thread::sleep(Duration::from_millis(4)),
-        }
-    }
+    // Give the JS worker a bounded head-start without busy-polling so the
+    // common path enters `Application::run` with the request already queued.
+    let early_request = requests.recv_timeout(Duration::from_secs(5)).ok();
 
     let active_renderer = Arc::new(Mutex::new(None::<Arc<AtomicBool>>));
     let active_renderer_for_launch = active_renderer.clone();
@@ -203,6 +201,7 @@ impl GpuixRenderer {
                 tree: self.tree.clone(),
                 selection: self.selection.clone(),
                 callback: self.event_callback_for_view(),
+                window_metrics: self.window_metrics.clone(),
                 commands,
                 running: self.ui_running.clone(),
                 response,
