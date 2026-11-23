@@ -1,0 +1,8 @@
+[build]
+target-dir = "target"
+
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = 0

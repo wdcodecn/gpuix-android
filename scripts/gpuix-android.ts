@@ -112,11 +112,12 @@ async function discoverEntrypoint(projectRoot: string): Promise<string | undefin
 
 function excludedTemplatePath(relativePath: string): boolean {
   const normalized = relativePath.split(path.sep).join('/')
+  const segments = normalized.split('/')
+  if (segments.includes('target') || segments.includes('.git')) return true
   return [
     '.deps',
     '.build',
     '.gradle',
-    'target',
     'build',
     'app/build',
     'app/src/main/jniLibs',

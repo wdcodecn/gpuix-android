@@ -1,6 +1,7 @@
 import path from 'node:path'
+import { createHash } from 'node:crypto'
 import { existsSync } from 'node:fs'
-import { rm } from 'node:fs/promises'
+import { rename, rm, stat } from 'node:fs/promises'
 import type { BunPlugin } from 'bun'
 import { loadGpuixAndroidConfig, writeGradleProperties, writeTextIfChanged } from './config'
 
@@ -376,7 +377,6 @@ if (import.meta.main) {
   const rawSource = await output.text()
   const fontNormalized = normalizeAndroidFonts(rawSource)
   const androidSource = isRelease ? fontNormalized : wrapDebugBundle(fontNormalized)
-  await writeTextIfChanged(bundlePath, androidSource)
 
   if (isRelease) {
     await rm(devJsonPath, { force: true })
@@ -387,19 +387,70 @@ if (import.meta.main) {
   let compiledHbc = false
   const hermesc = skipHbc ? null : findHermesc(androidRoot)
   if (hermesc) {
-    const proc = Bun.spawnSync([hermesc, '-emit-binary', '-O', '-out', hbcPath, bundlePath], {
-      stdout: 'pipe',
-      stderr: 'pipe',
-    })
-    if (proc.exitCode === 0 && existsSync(hbcPath)) {
+    const hermescStat = await stat(hermesc)
+    const hbcInputHash = createHash('sha256')
+      .update(androidSource)
+      .update(`\0mode=${isRelease ? 'release' : 'debug'}\0`)
+      .update(`hermesc=${hermescStat.size}:${Math.trunc(hermescStat.mtimeMs)}\0`)
+      .digest('hex')
+    const hbcStampPath = path.join(androidRoot, '.build/.hbc-input.sha256')
+    const prevStamp = (await Bun.file(hbcStampPath).exists())
+      ? (await Bun.file(hbcStampPath).text()).trim()
+      : ''
+
+    if (prevStamp === hbcInputHash && existsSync(hbcPath)) {
       compiledHbc = true
       if (isRelease) {
         await rm(bundlePath, { force: true })
+      } else {
+        await writeTextIfChanged(bundlePath, androidSource)
       }
+      console.log(`Android HBC up to date (${hbcInputHash.slice(0, 12)})`)
     } else {
-      const errText = new TextDecoder().decode(proc.stderr).trim()
-      console.warn(`Warning: hermesc bytecode compilation failed (${errText}); falling back to app.js`)
+      const hermesInputPath = isRelease
+        ? path.join(androidRoot, `.build/.hermes-input.${process.pid}.js`)
+        : bundlePath
+      if (isRelease) {
+        await Bun.write(hermesInputPath, androidSource)
+      } else {
+        await writeTextIfChanged(bundlePath, androidSource)
+      }
+      const tmpHbcPath = `${hbcPath}.${process.pid}.${Date.now()}.tmp`
+      try {
+        const proc = Bun.spawnSync([hermesc, '-emit-binary', '-O', '-out', tmpHbcPath, hermesInputPath], {
+          stdout: 'pipe',
+          stderr: 'pipe',
+        })
+        if (proc.exitCode === 0 && existsSync(tmpHbcPath)) {
+          const nextBytes = Buffer.from(await Bun.file(tmpHbcPath).arrayBuffer())
+          const sameHbc = existsSync(hbcPath) && nextBytes.equals(Buffer.from(await Bun.file(hbcPath).arrayBuffer()))
+          if (!sameHbc) {
+            await rename(tmpHbcPath, hbcPath)
+          } else {
+            await rm(tmpHbcPath, { force: true })
+          }
+          await writeTextIfChanged(hbcStampPath, `${hbcInputHash}\n`)
+          compiledHbc = true
+          if (isRelease) {
+            await rm(bundlePath, { force: true })
+          }
+        } else {
+          await rm(tmpHbcPath, { force: true })
+          await writeTextIfChanged(bundlePath, androidSource)
+          const errText = new TextDecoder().decode(proc.stderr).trim()
+          console.warn(`Warning: hermesc bytecode compilation failed (${errText}); falling back to app.js`)
+        }
+      } catch (error) {
+        await rm(tmpHbcPath, { force: true })
+        throw error
+      } finally {
+        if (isRelease) {
+          await rm(hermesInputPath, { force: true })
+        }
+      }
     }
+  } else {
+    await writeTextIfChanged(bundlePath, androidSource)
   }
 
   const gradleProperties = await writeGradleProperties(androidRoot, config)

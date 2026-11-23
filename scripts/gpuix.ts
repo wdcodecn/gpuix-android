@@ -3,7 +3,7 @@
 import path from 'node:path'
 import { homedir } from 'node:os'
 import { existsSync } from 'node:fs'
-import { cp, lstat, mkdir } from 'node:fs/promises'
+import { cp, lstat, mkdir, readdir, rm, stat } from 'node:fs/promises'
 import { loadGpuixAndroidConfig } from '../android/scripts/config'
 import { runDevServer } from './dev-server'
 
@@ -16,7 +16,7 @@ type ParsedArgs = {
 const packageRoot = path.resolve(import.meta.dir, '..')
 const nativeCli = path.join(packageRoot, 'scripts/gpuix-android.ts')
 const starterRoot = path.join(packageRoot, 'templates/react-gpui')
-const booleanOptions = new Set(['aab', 'help', 'release'])
+const booleanOptions = new Set(['aab', 'all', 'fast', 'help', 'js-only', 'release'])
 
 function usage(): string {
   return `gpuix — React + GPUIX native project toolchain (no WebView)
@@ -27,9 +27,10 @@ Usage:
   gpuix doctor [--cwd DIR]
   gpuix info [--cwd DIR]
   gpuix dev [ADB_SERIAL] [--cwd DIR] [--port 8081]
-  gpuix build [--cwd DIR] [--release] [--aab]
+  gpuix build [--cwd DIR] [--release] [--aab] [--fast] [--js-only]
   gpuix install ADB_SERIAL [--cwd DIR] [--release]
-  gpuix run ADB_SERIAL [--cwd DIR] [--release]
+  gpuix run ADB_SERIAL [--cwd DIR] [--release] [--fast] [--js-only]
+  gpuix cache [status|clean] [--cwd DIR] [--all]
 
 Artifacts:
   debug build  dist/android/<project>-debug.apk
@@ -218,6 +219,53 @@ async function create(parsed: ParsedArgs): Promise<void> {
   process.stdout.write('Next:\n  cd ' + projectRoot + '\n  bun install\n  bun run gpuix:doctor\n  bun run gpuix:run -- ADB_SERIAL\n')
 }
 
+function sharedCacheRoot(): string {
+  const custom = process.env.GPUIX_CACHE_DIR
+  if (custom && custom.trim().length > 0) return path.resolve(custom)
+  const xdg = process.env.XDG_CACHE_HOME
+  const base = xdg && xdg.trim().length > 0 ? xdg : path.join(homedir(), '.cache')
+  return path.join(base, 'gpuix-android')
+}
+
+async function dirSizeBytes(targetPath: string): Promise<number> {
+  try {
+    const st = await lstat(targetPath)
+    if (st.isSymbolicLink()) return 0
+    if (st.isFile()) return st.blocks > 0 ? st.blocks * 512 : st.size
+    if (!st.isDirectory()) return 0
+    let total = 0
+    const entries = await readdir(targetPath, { withFileTypes: true })
+    for (const entry of entries) {
+      total += await dirSizeBytes(path.join(targetPath, entry.name))
+    }
+    return total
+  } catch {
+    return 0
+  }
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`
+  const units = ['KiB', 'MiB', 'GiB', 'TiB']
+  let value = bytes / 1024
+  let idx = 0
+  while (value >= 1024 && idx < units.length - 1) {
+    value /= 1024
+    idx += 1
+  }
+  return `${value.toFixed(value >= 100 ? 0 : value >= 10 ? 1 : 2)} ${units[idx]}`
+}
+
+function redundantLocalTargetDirs(projectRoot: string): string[] {
+  const androidRoot = path.join(projectRoot, 'android')
+  return [
+    path.join(androidRoot, 'rust/target'),
+    path.join(androidRoot, 'vendor/gpuix-native/target'),
+    path.join(androidRoot, 'vendor/gpui-mobile/target'),
+    path.join(androidRoot, 'target/aarch64-linux-android/debug'),
+  ]
+}
+
 async function doctor(projectRoot: string): Promise<void> {
   const checks: Array<[string, string, string[]]> = [
     ['Bun', 'bun', ['--version']],
@@ -245,6 +293,13 @@ async function doctor(projectRoot: string): Promise<void> {
   const ndkAvailable = await exists(ndkRoot)
   if (!ndkAvailable) failures += 1
   process.stdout.write(`${ndkAvailable ? '✓' : '✗'} Android NDK: ${ndkRoot}\n`)
+  const cacheRoot = sharedCacheRoot()
+  if (process.env.GPUIX_SHARED_CACHE === '0') {
+    process.stdout.write('! shared cache: disabled (GPUIX_SHARED_CACHE=0)\n')
+  } else {
+    const cacheBytes = await dirSizeBytes(cacheRoot)
+    process.stdout.write(`✓ shared cache: ${cacheRoot} (${formatBytes(cacheBytes)})\n`)
+  }
   if (await exists(path.join(projectRoot, 'android'))) {
     try {
       const config = await loadGpuixAndroidConfig(projectRoot)
@@ -290,6 +345,8 @@ async function build(parsed: ParsedArgs, projectRoot: string): Promise<void> {
   const args: string[] = []
   if (hasFlag(parsed, 'release')) args.push('--release')
   if (hasFlag(parsed, 'aab')) args.push('--aab')
+  if (hasFlag(parsed, 'fast')) args.push('--fast')
+  if (hasFlag(parsed, 'js-only')) args.push('--js-only')
   await run(shellCommand(), ['android/scripts/build-android.sh', ...args], projectRoot)
 }
 
@@ -299,6 +356,102 @@ async function install(parsed: ParsedArgs, projectRoot: string): Promise<void> {
   if (hasFlag(parsed, 'aab')) fail('an AAB cannot be installed directly; build an APK for adb')
   await requireHost(projectRoot)
   await run(shellCommand(), ['android/scripts/install-android.sh', serial, ...(hasFlag(parsed, 'release') ? ['--release'] : [])], projectRoot)
+}
+
+async function cacheCommand(parsed: ParsedArgs, projectRoot: string): Promise<void> {
+  const action = parsed.positional[0] ?? 'status'
+  if (parsed.positional.length > 1 || (action !== 'status' && action !== 'clean')) {
+    fail('usage: gpuix cache [status|clean] [--cwd DIR] [--all]')
+  }
+  const cacheRoot = sharedCacheRoot()
+  if (action === 'status') {
+    if (hasFlag(parsed, 'all')) fail('--all is only valid with `gpuix cache clean`')
+    const buckets = ['deps', 'hermes', 'cargo-target', 'native'] as const
+    const total = await dirSizeBytes(cacheRoot)
+    process.stdout.write(`Shared cache: ${cacheRoot} (${formatBytes(total)})\n`)
+    for (const bucket of buckets) {
+      const size = await dirSizeBytes(path.join(cacheRoot, bucket))
+      process.stdout.write(`  - ${bucket.padEnd(13)} ${formatBytes(size)}\n`)
+    }
+    const androidRoot = path.join(projectRoot, 'android')
+    if (await exists(androidRoot)) {
+      const redundant: Array<{ label: string; size: number }> = []
+      for (const candidate of redundantLocalTargetDirs(projectRoot)) {
+        const size = await dirSizeBytes(candidate)
+        if (size > 0) {
+          redundant.push({ label: path.relative(projectRoot, candidate), size })
+        }
+      }
+      const localTarget = path.join(androidRoot, 'target')
+      const localTargetSize = await dirSizeBytes(localTarget)
+      if (localTargetSize > 0) {
+        redundant.push({ label: path.relative(projectRoot, localTarget), size: localTargetSize })
+      }
+      if (redundant.length > 0) {
+        process.stdout.write(`Local Android targets in ${projectRoot}:\n`)
+        for (const item of redundant) {
+          process.stdout.write(`  - ${item.label}: ${formatBytes(item.size)}\n`)
+        }
+      } else {
+        process.stdout.write(`Local Android workspace (${projectRoot}): clean (no split targets)\n`)
+      }
+    }
+    return
+  }
+
+  let reclaimed = 0
+  for (const candidate of redundantLocalTargetDirs(projectRoot)) {
+    try {
+      const st = await lstat(candidate)
+      if (!st.isSymbolicLink() && st.isDirectory()) {
+        const size = await dirSizeBytes(candidate)
+        await rm(candidate, { recursive: true, force: true })
+        reclaimed += size
+        process.stdout.write(`Removed ${path.relative(projectRoot, candidate)} (${formatBytes(size)})\n`)
+      }
+    } catch {
+      // Ignore missing directories
+    }
+  }
+
+  if (hasFlag(parsed, 'all')) {
+    const size = await dirSizeBytes(cacheRoot)
+    if (size > 0 || (await exists(cacheRoot))) {
+      await rm(cacheRoot, { recursive: true, force: true })
+      reclaimed += size
+      process.stdout.write(`Removed shared cache ${cacheRoot} (${formatBytes(size)})\n`)
+    }
+  } else {
+    const staleDebug = path.join(cacheRoot, 'cargo-target/aarch64-linux-android/debug')
+    const staleDebugSize = await dirSizeBytes(staleDebug)
+    if (staleDebugSize > 0) {
+      await rm(staleDebug, { recursive: true, force: true })
+      reclaimed += staleDebugSize
+      process.stdout.write(`Removed stale shared debug target (${formatBytes(staleDebugSize)})\n`)
+    }
+    const nativeDir = path.join(cacheRoot, 'native')
+    if (await exists(nativeDir)) {
+      const keepRaw = Number(process.env.GPUIX_NATIVE_CACHE_KEEP ?? '8')
+      const keep = Number.isSafeInteger(keepRaw) && keepRaw >= 0 ? keepRaw : 8
+      const entries = await readdir(nativeDir, { withFileTypes: true })
+      const dirs: Array<{ p: string; mtime: number }> = []
+      for (const entry of entries) {
+        if (!entry.isDirectory()) continue
+        const p = path.join(nativeDir, entry.name)
+        const so = path.join(p, 'libgpuix_android.so')
+        const st = await stat(existsSync(so) ? so : p)
+        dirs.push({ p, mtime: st.mtimeMs })
+      }
+      dirs.sort((a, b) => b.mtime - a.mtime)
+      for (const old of dirs.slice(keep)) {
+        const size = await dirSizeBytes(old.p)
+        await rm(old.p, { recursive: true, force: true })
+        reclaimed += size
+      }
+    }
+  }
+
+  process.stdout.write(`Reclaimed ${formatBytes(reclaimed)}\n`)
 }
 
 async function main(): Promise<void> {
@@ -332,7 +485,7 @@ async function main(): Promise<void> {
     return
   }
   if (command === 'build') {
-    assertKnownOptions(parsed, ['cwd'], ['release', 'aab'])
+    assertKnownOptions(parsed, ['cwd'], ['release', 'aab', 'fast', 'js-only'])
     if (parsed.positional.length > 0) fail('build does not accept positional arguments')
     await build(parsed, projectRoot)
     return
@@ -343,10 +496,15 @@ async function main(): Promise<void> {
     return
   }
   if (command === 'run') {
-    assertKnownOptions(parsed, ['cwd'], ['release'])
+    assertKnownOptions(parsed, ['cwd'], ['release', 'fast', 'js-only'])
     if (parsed.positional.length !== 1) fail('run needs exactly one ADB serial')
     await build(parsed, projectRoot)
     await install(parsed, projectRoot)
+    return
+  }
+  if (command === 'cache') {
+    assertKnownOptions(parsed, ['cwd'], ['all'])
+    await cacheCommand(parsed, projectRoot)
     return
   }
   if (command === 'dev') {

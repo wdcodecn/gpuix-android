@@ -50,13 +50,22 @@ gpuix install <ADB_SERIAL>
 ## 产物与开发热重载
 
 ```sh
-gpuix dev               # 启动调试开发服务器并支持真机热重载与 RedBox
-gpuix build             # dist/android/<project>-debug.apk
-gpuix build --release   # dist/android/<project>-release.apk
-gpuix build --aab       # dist/android/<project>-release.aab
+gpuix dev                 # 启动调试开发服务器并支持真机热重载与 RedBox
+gpuix build               # dist/android/<project>-debug.apk（使用 android-dev 增量配置）
+gpuix build --js-only     # 仅重打 JS/HBC 与 APK（跳过 Rust/Hermes，复用已有 .so）
+gpuix build --release     # dist/android/<project>-release.apk（fat LTO 极限瘦身）
+gpuix build --release --fast # 本地快速发布验收（thin LTO）
+gpuix build --aab         # dist/android/<project>-release.aab
+gpuix cache status        # 查看跨项目共享缓存与本地冗余 target 占用
+gpuix cache clean         # 清理分裂 target 与过期缓存（加 --all 清空全部共享缓存）
 ```
 
 在项目配置（`android/scripts/config.ts`）中可通过 `features` 字段按需裁剪 `gpuix-native` 可选特性（例如 `rich-content`、`http-client`），进一步压缩 Release 二进制体积。
+
+构建并发与共享缓存环境变量（均可选）：
+- `GPUIX_BUILD_JOBS`：覆写编译并发数（默认 `max(2, ncpu - 1)`，Unix 下自动以 `nice -n 10` 低调度优先级运行，兼顾编译速度与前台响应）。
+- `GPUIX_CACHE_DIR`：覆写跨项目共享缓存目录（默认 `${XDG_CACHE_HOME:-$HOME/.cache}/gpuix-android`）。
+- `GPUIX_SHARED_CACHE=0`：关闭跨项目共享缓存，回退至当前项目目录独立构建。
 
 当前 Android host 支持 arm64-v8a。Windows 桌面端使用已发布的
 `@gpuix/native-win32-x64-msvc` binding；Android 在 Git Bash 中调用 Windows NDK

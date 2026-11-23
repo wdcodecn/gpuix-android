@@ -81,3 +81,44 @@
 - **测试设备**：OPPO PKC110（`Mali-G925-Immortalis MC12` Vulkan，120Hz）
 - **冷启动耗时**（`dev.gpuix.baseui`）：首次冷启 `LaunchState: COLD` `TotalTime: 665 ms`，二次冷启 `TotalTime: 425 ms`。
 - **静默功耗表现**：5 秒无操作静默期内仅触发 5 次心跳（1Hz 最低功耗待机），logcat 确认正常命中 `Executing Hermes bundle gpuix/app.hbc (1252018 bytes)`、`loaded core font`、`loaded bg font batch1/batch2` 与 `NATIVE_INITIALIZED = true`。
+
+---
+
+## 三、构建提速、并发调度与跨项目共享缓存
+
+为解决此前每次构建强制全量走 `--release` + `fat LTO` + `CARGO_INCREMENTAL=0`、多目录 `target/` 分裂膨胀近 20 GB、以及纯改 TSX 仍重复执行 Hermes/Strip/Cargo 的耗时与磁盘问题，构建链路实施了以下分层改造：
+
+### 1. Cargo Profile 分层与目录收口
+
+- **新增 `[profile.android-dev]`**（`android/rust/Cargo.toml`）：`--debug` 构建不再强行复用发布级 `fat LTO + codegen-units=1`；改为第三方依赖 `opt-level = 2`（保持真机 120Hz 渲染流畅）、本地核心 crate（`gpuix-android` / `gpuix-native` / `gpui-mobile`）`opt-level = 1` + `lto = false` + `codegen-units = 16` + `incremental = true` + `debug = 0`。同时在 `android-dev` 编译期自动跳过与增量编译冲突的 `sccache`。
+- **新增 `[profile.release-fast]`**：通过 `--release --fast`（或 `--aab --fast`）启用 `thin LTO` + `codegen-units = 4` 用于本地快速发布验收。
+- **保留 `[profile.release]`**：`opt-level = "z"`、`lto = "fat"`、`codegen-units = 1`、`strip = "symbols"` 保持不变，100% 守住商店级极限包体积。
+- **统一收口配置文件**（`android/.cargo/config.toml`）：设置 `[build] target-dir = "target"` 并限制 dev 符号等级（`debug = "line-tables-only"`，第三方依赖 `debug = 0`），防止脱离脚本手跑 `cargo test`/`cargo check` 或 IDE 分析在 `rust/`、`vendor/*` 下各自分裂出 GB 级 `target/`。
+
+### 2. 跨项目全局共享缓存（`GPUIX_CACHE_DIR`）与指纹跳过
+
+默认启用 `GPUIX_SHARED_CACHE=1`，缓存目录位于 `${GPUIX_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/gpuix-android}`（可设 `GPUIX_SHARED_CACHE=0` 切换为本地隔离模式）：
+
+- **`deps/`（源码依赖共享）**：Unix 下通过符号链接将 `.deps/{zed,hermes,hermes-libuv}` 指向共享目录，避免每个项目重复克隆上百 MB 源码。
+- **`hermes/<key>/`（Hermes 产物指纹缓存）**：按操作系统架构、`hermes_commit`、`libuv_tag`、NDK 版本及 `android/hermes/*` 内容 SHA-256 缓存 `hermesc` 与 `libgpuix_js.so`，仅在内容变更时更新本地文件，避免破坏 mtime 触发 `build.rs` 重链接。
+- **`cargo-target/`（共享编译缓存）**：通过 `CARGO_TARGET_DIR` 指向共享位置，并复用 `.deps/zed` 统一路径。
+- **`native/<key>/`（`.so` 内容指纹缓存，LRU 上限 8 份）**：综合 profile、features、NDK、`rustc -vV`、`.deps/zed` 提交与脏状态、`.cargo/config.toml`、`rust/`、`vendor/{gpuix-native,gpui-mobile}` 及 `libgpuix_js.so` 计算 SHA-256。命中后**完全跳过 `cargo ndk` 与 `llvm-strip`**，且对 `jniLibs` 仅在字节变化时替换文件以保住 Gradle `UP-TO-DATE` 增量状态。
+- **`--js-only` 与 `.hbc` 增量跳过**：`build-js.ts` 基于 Bundle 内容与 `hermesc` 状态做 SHA-256（记录于 `.build/.hbc-input.sha256`）避免重复调用 `hermesc`；使用 `--js-only` 可直接复用既有 `.so` 完成毫秒级打包。
+
+### 3. 并发调度与前台防卡顿
+
+- 默认编译并发放开至 `max(2, ncpu - 1)`（8 核机器默认 `GPUIX_BUILD_JOBS=7`，支持环境变量覆写），并通过 `nice -n 10` 低调度优先级执行 `cmake --build`、`cargo ndk` 与 `gradlew`——既充分利用空闲多核缩短等待，又确保前台编辑、调试交互不被抢占卡顿。
+
+### 4. 构建耗时与磁盘占用实测（基于 `gpuix-base-ui` / 8 核 Apple Silicon）
+
+| 场景 / 指标 | 优化前基线 | 优化后实测 | 变化与说明 |
+| :--- | :--- | :--- | :--- |
+| **Debug 二次打包（全缓存命中）** | 每次重新触发 Cargo/Strip | **`1.59 s`** | `Native cache hit` 跳过 `cargo ndk`，Gradle 620ms |
+| **Debug 纯改 JS 打包（`--js-only`）** | 走完整构建脚本 | **`0.69 s`** | 直接跳过 `.deps`/Hermes/Cargo/Strip，Gradle 479ms |
+| **Release 二次打包（全缓存命中）** | 每次重新触发 Cargo/Strip | **`1.44 s`** | Release APK 保持 **`16,571,169 B`**（与优化前 100% 一致） |
+| **Release 首次建缓存（复用 target）** | — | **`4.74 s`** | 写入 `native` 指纹缓存，Gradle 1s |
+| **`gpuix-android` 仓库目录占用** | `16 GB`（含 4 份分裂 `target/`） | **`713 MB`** | 彻底消除分裂 `target/`，回收冗余缓存 ~12.4 GB |
+| **`gpuix-app-starter` 目录占用** | `526 MB`（含重复 `.deps`） | **`109 MB`** | 通过软链接共享 `deps/` |
+| **全局共享缓存（`~/.cache/gpuix-android`）** | — | **`5.20 GiB`** | 含 `deps 308 MiB`、`hermes 69.5 MiB`、`cargo-target 4.81 GiB`、`native 26.8 MiB` |
+
+> 注：`debug-1`（从已编入约半数依赖的 `cargo-target` 续编 `android-dev` 剩余 ~150 个 crate 含 `gpui`/`wgpu` 并首次打 debug APK）耗时 `77.83 s`；`gpuix-base-ui-debug.apk` 体积为 `27,637,125 B`。可使用 `gpuix cache status` 与 `gpuix cache clean [--all]` 随时巡检与回收空间。
