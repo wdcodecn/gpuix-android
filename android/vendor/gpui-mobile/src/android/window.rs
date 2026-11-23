@@ -131,17 +131,9 @@ type SetFrameRateWithChangeStrategyFn =
     unsafe extern "C" fn(*mut ndk_sys::ANativeWindow, f32, i8, i8) -> i32;
 
 const DEFAULT_FRAME_RATE_COMPATIBILITY: i8 = 0;
-const ONLY_IF_SEAMLESS: i8 = 0;
-// Keep Android at a low-power 30 Hz while the app is visible but idle. The
-// renderer is demand-driven, so static screens do not repaint; an active touch
-// or animation temporarily promotes to the user's selected target. After a
-// longer timeout, `DEEP_IDLE_FRAME_RATE` releases the app's preference too.
-const POWER_BALANCED_FRAME_RATE: f32 = 30.0;
-const DEFAULT_POWER_FRAME_RATE: u32 = 60;
-const DEFAULT_INTERACTION_FRAME_RATE: f32 = 90.0;
-/// A zero request releases the app's preference and lets Android choose the
-/// panel's lowest/default mode while the app has been untouched for a while.
-const DEEP_IDLE_FRAME_RATE: f32 = 0.0;
+const CHANGE_FRAME_RATE_ALWAYS: i8 = 1;
+const DEFAULT_POWER_FRAME_RATE: u32 = 120;
+const DEFAULT_INTERACTION_FRAME_RATE: f32 = 120.0;
 
 // Resolve an optional native-window symbol at runtime.
 //
@@ -209,7 +201,7 @@ fn set_native_frame_rate(window: &NativeWindow, frame_rate: f32) {
                 native_window,
                 frame_rate,
                 DEFAULT_FRAME_RATE_COMPATIBILITY,
-                ONLY_IF_SEAMLESS,
+                CHANGE_FRAME_RATE_ALWAYS,
             )
         })
     } else if api_level >= 30 {
@@ -229,10 +221,6 @@ fn set_native_frame_rate(window: &NativeWindow, frame_rate: f32) {
         Some(status) => log::warn!("ANativeWindow_setFrameRate* failed with status {status}"),
         None => log::debug!("Skipping high frame rate request on API {api_level}"),
     }
-}
-
-fn request_power_balanced_frame_rate(window: &NativeWindow) {
-    set_native_frame_rate(window, POWER_BALANCED_FRAME_RATE);
 }
 
 // ── callback type aliases ─────────────────────────────────────────────────────
@@ -416,7 +404,10 @@ impl AndroidWindow {
         scale_factor: f32,
         transparent: bool,
     ) -> Result<Arc<Self>> {
-        request_power_balanced_frame_rate(&native_window);
+        let detected = crate::android::jni::query_interaction_frame_rate()
+            .unwrap_or(DEFAULT_INTERACTION_FRAME_RATE);
+        let target = detected.round().max(60.0) as u32;
+        set_native_frame_rate(&native_window, target as f32);
 
         let width = native_window.width();
         let height = native_window.height();
@@ -468,12 +459,9 @@ impl AndroidWindow {
             active: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             frame_requested: AtomicBool::new(true),
             interactive: AtomicBool::new(false),
-            power_frame_rate: AtomicU32::new(DEFAULT_POWER_FRAME_RATE),
-            interaction_frame_rate: AtomicU32::new(
-                crate::android::jni::query_interaction_frame_rate()
-                    .unwrap_or(DEFAULT_INTERACTION_FRAME_RATE) as u32,
-            ),
-            requested_frame_rate: AtomicU32::new(POWER_BALANCED_FRAME_RATE as u32),
+            power_frame_rate: AtomicU32::new(target),
+            interaction_frame_rate: AtomicU32::new(target),
+            requested_frame_rate: AtomicU32::new(target),
             momentum: Arc::new(Mutex::new(MomentumState {
                 velocity_tracker: VelocityTracker::new(),
                 scroller: MomentumScroller::new(),
@@ -522,7 +510,7 @@ impl AndroidWindow {
             interactive: AtomicBool::new(false),
             power_frame_rate: AtomicU32::new(DEFAULT_POWER_FRAME_RATE),
             interaction_frame_rate: AtomicU32::new(DEFAULT_INTERACTION_FRAME_RATE as u32),
-            requested_frame_rate: AtomicU32::new(POWER_BALANCED_FRAME_RATE as u32),
+            requested_frame_rate: AtomicU32::new(DEFAULT_INTERACTION_FRAME_RATE as u32),
             momentum: Arc::new(Mutex::new(MomentumState {
                 velocity_tracker: VelocityTracker::new(),
                 scroller: MomentumScroller::new(),
@@ -541,12 +529,16 @@ impl AndroidWindow {
     /// Called when `APP_CMD_INIT_WINDOW` fires and a new `NativeWindow` is
     /// available (e.g. after returning from the background).
     pub fn init_window(&self, native_window: NativeWindow, gpu_context: GpuContext) -> Result<()> {
-        request_power_balanced_frame_rate(&native_window);
-        self.interaction_frame_rate.store(
-            crate::android::jni::query_interaction_frame_rate()
-                .unwrap_or(DEFAULT_INTERACTION_FRAME_RATE) as u32,
-            Ordering::Release,
-        );
+        let detected = crate::android::jni::query_interaction_frame_rate()
+            .unwrap_or(DEFAULT_INTERACTION_FRAME_RATE);
+        self.interaction_frame_rate
+            .store(detected.round() as u32, Ordering::Release);
+        let target = (self.power_frame_rate.load(Ordering::Acquire) as f32)
+            .min(detected)
+            .max(60.0);
+        set_native_frame_rate(&native_window, target);
+        self.requested_frame_rate
+            .store(target.round() as u32, Ordering::Release);
 
         let width = native_window.width();
         let height = native_window.height();
@@ -562,7 +554,7 @@ impl AndroidWindow {
             let config = WgpuSurfaceConfig {
                 size: gpui::size(gpui::DevicePixels(width), gpui::DevicePixels(height)),
                 transparent,
-                preferred_present_mode: Some(wgpu::PresentMode::Fifo),
+                preferred_present_mode: Some(wgpu::PresentMode::Mailbox),
             };
             let instance = state
                 .gpu_context
@@ -608,8 +600,6 @@ impl AndroidWindow {
             .store(true, std::sync::atomic::Ordering::Relaxed);
         self.frame_requested.store(true, Ordering::Release);
         self.interactive.store(false, Ordering::Release);
-        self.requested_frame_rate
-            .store(POWER_BALANCED_FRAME_RATE as u32, Ordering::Release);
 
         Ok(())
     }
@@ -857,28 +847,12 @@ impl AndroidWindow {
     /// pacing. The native-window call is issued only when the mode changes.
     pub fn set_interactive(&self, interactive: bool) {
         self.interactive.store(interactive, Ordering::Release);
-        let frame_rate = if interactive {
-            // Re-read the display policy when a gesture starts. Android may
-            // have changed the effective cap since the last gesture (for
-            // example after Battery Saver was enabled). We keep the user's
-            // selected target intact and let SurfaceFlinger clamp the actual
-            // panel rate to whatever the system currently permits.
-            let detected = crate::android::jni::query_interaction_frame_rate()
-                .unwrap_or_else(|| self.interaction_frame_rate.load(Ordering::Acquire) as f32);
-            self.interaction_frame_rate
-                .store(detected.round() as u32, Ordering::Release);
-            let selected = self.power_frame_rate.load(Ordering::Acquire) as f32;
-            selected.min(detected)
-        } else {
-            POWER_BALANCED_FRAME_RATE
-        };
-        self.request_frame_rate(frame_rate);
+        let cap = self.interaction_frame_rate.load(Ordering::Acquire) as f32;
+        let selected = self.power_frame_rate.load(Ordering::Acquire) as f32;
+        self.request_frame_rate(selected.min(cap));
     }
 
-    /// Set the user-selected active interaction ceiling from the app settings.
-    /// Static and idle content keeps the fixed low-power budget below; this
-    /// preference is applied only while touching, scrolling, animating, or
-    /// otherwise actively repainting.
+    /// Set the user-selected active ceiling from the app settings.
     /// Accepted common values are 20/30/40/50/60/90/120/144/165 Hz; the UI
     /// disables values absent from the current display's supported modes.
     pub fn set_power_frame_rate(&self, frame_rate: f32) {
@@ -888,25 +862,14 @@ impl AndroidWindow {
             return;
         }
         self.power_frame_rate.store(rounded, Ordering::Release);
-        if self.is_interactive() {
-            let cap = self.interaction_frame_rate.load(Ordering::Acquire) as f32;
-            self.request_frame_rate((rounded as f32).min(cap));
-        } else {
-            // A preference change while idle must not promote a static page to
-            // the selected high-refresh rate; keep the low-power idle budget.
-            self.request_frame_rate(POWER_BALANCED_FRAME_RATE);
-        }
+        let cap = self.interaction_frame_rate.load(Ordering::Acquire) as f32;
+        self.request_frame_rate((rounded as f32).min(cap));
     }
 
-    /// Enter the deepest app-idle mode after a long period without input.
-    /// This clears the app's refresh-rate preference; Android can then apply
-    /// device-specific battery policy. The next touch promotes to the
-    /// selected target, clamped by the current system policy.
+    /// Clear interactive gesture state after an idle period without lowering
+    /// the display's target refresh rate.
     pub fn enter_deep_idle(&self) {
-        if self.interactive.swap(false, Ordering::AcqRel) {
-            log::info!("interaction pacing: deep idle requested while active");
-        }
-        self.request_frame_rate(DEEP_IDLE_FRAME_RATE);
+        self.interactive.store(false, Ordering::Release);
     }
 
     fn request_frame_rate(&self, frame_rate: f32) {
@@ -1326,7 +1289,7 @@ impl AndroidWindow {
         let config = WgpuSurfaceConfig {
             size: gpui::size(gpui::DevicePixels(width), gpui::DevicePixels(height)),
             transparent,
-            preferred_present_mode: Some(wgpu::PresentMode::Fifo),
+            preferred_present_mode: Some(wgpu::PresentMode::Mailbox),
         };
 
         WgpuRenderer::new(gpu_context, &raw, config, None)
@@ -1348,6 +1311,12 @@ impl Drop for AndroidWindow {
 
 // ── AndroidPlatformWindow (PlatformWindow impl) ──────────────────────────────
 
+struct MainThreadInputHandler(Option<PlatformInputHandler>);
+
+// SAFETY: Android's GPUI PlatformWindow and `on_request_frame` run exclusively
+// on the `android_main` thread; wrapping lets the frame callback drain IME events.
+unsafe impl Send for MainThreadInputHandler {}
+
 /// A wrapper around `Arc<AndroidWindow>` that implements `gpui::PlatformWindow`.
 ///
 /// GPUI expects `Box<dyn PlatformWindow>` from `Platform::open_window`.  This
@@ -1357,7 +1326,8 @@ impl Drop for AndroidWindow {
 pub struct AndroidPlatformWindow {
     window: Arc<AndroidWindow>,
     display: Option<Rc<dyn PlatformDisplay>>,
-    input_handler: Option<PlatformInputHandler>,
+    input_handler: Arc<Mutex<MainThreadInputHandler>>,
+    ime_visible: Arc<AtomicBool>,
     title: String,
     /// Shared momentum scrolling state — used by both the touch callback
     /// (to start/cancel flings) and the frame callback (to pump inertia).
@@ -1379,7 +1349,8 @@ impl AndroidPlatformWindow {
         Self {
             window,
             display,
-            input_handler: None,
+            input_handler: Arc::new(Mutex::new(MainThreadInputHandler(None))),
+            ime_visible: Arc::new(AtomicBool::new(false)),
             title: String::new(),
             momentum,
             momentum_input_cb: Arc::new(Mutex::new(noop_input_cb)),
@@ -1506,11 +1477,16 @@ impl PlatformWindow for AndroidPlatformWindow {
     }
 
     fn set_input_handler(&mut self, input_handler: PlatformInputHandler) {
-        self.input_handler = Some(input_handler);
+        self.input_handler.lock().0 = Some(input_handler);
     }
 
     fn take_input_handler(&mut self) -> Option<PlatformInputHandler> {
-        self.input_handler.take()
+        self.input_handler.lock().0.take()
+    }
+
+    fn request_text_input(&self) {
+        self.ime_visible.store(true, Ordering::Release);
+        crate::android::jni::show_keyboard_android(crate::KeyboardType::Default);
     }
 
     fn prompt(
@@ -1590,6 +1566,8 @@ impl PlatformWindow for AndroidPlatformWindow {
         // on the struct so on_request_frame can capture it.
         let input_cb = Arc::clone(&self.momentum_input_cb);
         let android_window = Arc::clone(&self.window);
+        let shared_input_handler = Arc::clone(&self.input_handler);
+        let ime_visible = Arc::clone(&self.ime_visible);
 
         self.window.on_request_frame(move || {
             // ── Drain coalesced touch-scroll deltas ──────────────────
@@ -1703,6 +1681,62 @@ impl PlatformWindow for AndroidPlatformWindow {
                 }
             }
 
+            let ime_events = crate::android::jni::drain_ime_events();
+            let had_ime = !ime_events.is_empty();
+            if had_ime {
+                let mut taken = shared_input_handler.lock().0.take();
+                if let Some(ref mut handler) = taken {
+                    for ev in ime_events {
+                        match ev {
+                            crate::android::jni::ImeEvent::CommitText(text) => {
+                                handler.replace_text_in_range(None, &text);
+                            }
+                            crate::android::jni::ImeEvent::SetComposingText(text) => {
+                                handler.replace_and_mark_text_in_range(None, &text, None);
+                            }
+                            crate::android::jni::ImeEvent::FinishComposing => {
+                                handler.unmark_text();
+                            }
+                            crate::android::jni::ImeEvent::DeleteSurrounding { before, after } => {
+                                if let Some(sel) = handler.selected_text_range(false) {
+                                    if sel.range.start != sel.range.end {
+                                        handler.replace_text_in_range(None, "");
+                                    } else {
+                                        let b = usize::try_from(before.max(0)).unwrap_or(0);
+                                        let a = usize::try_from(after.max(0)).unwrap_or(0);
+                                        let start = sel.range.start.saturating_sub(b);
+                                        let end = sel.range.end.saturating_add(a);
+                                        if start < end {
+                                            let mut actual = None;
+                                            let _ = handler.text_for_range(start..end, &mut actual);
+                                            let del_range = actual.unwrap_or(start..end);
+                                            handler.replace_text_in_range(Some(del_range), "");
+                                        }
+                                    }
+                                }
+                            }
+                            crate::android::jni::ImeEvent::EditorAction(_code) => {
+                                if let Some(mut guard) = input_cb.try_lock() {
+                                    let _ = guard(gpui::PlatformInput::KeyDown(gpui::KeyDownEvent {
+                                        keystroke: gpui::Keystroke {
+                                            modifiers: gpui::Modifiers::default(),
+                                            key: "enter".to_string(),
+                                            key_char: None,
+                                        },
+                                        is_held: false,
+                                        prefer_character_input: false,
+                                    }));
+                                }
+                            }
+                        }
+                    }
+                }
+                let mut slot = shared_input_handler.lock();
+                if slot.0.is_none() {
+                    slot.0 = taken;
+                }
+            }
+
             // Check if text input arrived since last frame — if so, force a
             // render so drain_pending_text() runs and the UI updates.
             let text_dirty =
@@ -1711,8 +1745,14 @@ impl PlatformWindow for AndroidPlatformWindow {
             let mut cb = send_callback.lock();
             cb(RequestFrameOptions {
                 require_presentation: true,
-                force_render: text_dirty,
+                force_render: text_dirty || had_ime,
             });
+
+            if shared_input_handler.lock().0.is_none()
+                && ime_visible.swap(false, Ordering::AcqRel)
+            {
+                crate::android::jni::hide_keyboard_android();
+            }
 
             // GPUI may decide that the scroll-wheel mutation did not leave a
             // dirty view, but native momentum still needs another tick. Keep
@@ -1811,6 +1851,7 @@ impl PlatformWindow for AndroidPlatformWindow {
                             start_x: logical_x,
                             start_y: logical_y,
                         };
+                        android_window.set_interactive(true);
                         // Do NOT emit MouseDown here — wait until we know
                         // whether this is a tap or a scroll.  Emitting
                         // MouseDown immediately causes accidental navigation
@@ -1880,25 +1921,29 @@ impl PlatformWindow for AndroidPlatformWindow {
                                     ms.pending_scroll_phase = gpui::TouchPhase::Moved;
                                 }
                                 ms.has_pending_scroll = true;
+                                android_window.schedule_frame();
                             }
                             TouchState::Idle => {
                                 // Spurious move without a preceding down — ignore.
                             }
                         }
 
+                        let is_scrolling = matches!(*ts, TouchState::Scrolling { .. });
+
                         // Drop momentum lock before dispatching MouseMove.
                         drop(ms);
 
-                        // Always emit MouseMove so interactive screens can
-                        // track finger position (drag line in Animations,
-                        // gradient control in Shaders).
-                        let position = gpui::point(gpui::px(logical_x), gpui::px(logical_y));
-                        let mut guard = cb.lock();
-                        let _ = guard(gpui::PlatformInput::MouseMove(gpui::MouseMoveEvent {
-                            position,
-                            modifiers,
-                            pressed_button: Some(gpui::MouseButton::Left),
-                        }));
+                        // Skip MouseMove during an active scroll drag to avoid
+                        // redundant per-event hit-testing on high-rate touch screens.
+                        if !is_scrolling {
+                            let position = gpui::point(gpui::px(logical_x), gpui::px(logical_y));
+                            let mut guard = cb.lock();
+                            let _ = guard(gpui::PlatformInput::MouseMove(gpui::MouseMoveEvent {
+                                position,
+                                modifiers,
+                                pressed_button: Some(gpui::MouseButton::Left),
+                            }));
+                        }
                     }
 
                     // ── ACTION_UP / ACTION_CANCEL ────────────────────────
@@ -2158,127 +2203,10 @@ impl PlatformWindow for AndroidPlatformWindow {
     }
 
     fn update_ime_position(&self, bounds: gpui::Bounds<gpui::Pixels>) {
-        // Update the IME candidate window position via JNI.
-        // Calls InputMethodManager.updateCursorAnchorInfo() with a
-        // CursorAnchorInfo built from the given bounds.
-        // Requires API level 21+ (Lollipop).
-
-        use crate::android::jni as jni_helpers;
-        use jni::objects::JValue;
-
         let x: f32 = bounds.origin.x.into();
         let y: f32 = bounds.origin.y.into();
         let h: f32 = bounds.size.height.into();
-
-        let _ = jni_helpers::with_env(|env| {
-            let activity = jni_helpers::activity(env)?;
-
-            // 1. Get InputMethodManager
-            let service_name = env.new_string("input_method").map_err(|e| e.to_string())?;
-            let imm = env
-                .call_method(
-                    &activity,
-                    jni::jni_str!("getSystemService"),
-                    jni::jni_sig!("(Ljava/lang/String;)Ljava/lang/Object;"),
-                    &[JValue::Object(&service_name)],
-                )
-                .and_then(|v| v.l())
-                .map_err(|e| {
-                    env.exception_clear();
-                    e.to_string()
-                })?;
-            if imm.is_null() {
-                return Err("getSystemService returned null".to_string());
-            }
-
-            // 2. Build CursorAnchorInfo
-            let builder = env
-                .new_object(
-                    jni::jni_str!("android/view/inputmethod/CursorAnchorInfo$Builder"),
-                    jni::jni_sig!("()V"),
-                    &[],
-                )
-                .map_err(|e| {
-                    env.exception_clear();
-                    e.to_string()
-                })?;
-
-            let _ = env.call_method(
-                &builder,
-                jni::jni_str!("setInsertionMarkerLocation"),
-                jni::jni_sig!("(FFFFI)Landroid/view/inputmethod/CursorAnchorInfo$Builder;"),
-                &[
-                    JValue::Float(x),
-                    JValue::Float(y),
-                    JValue::Float(y + h * 0.8),
-                    JValue::Float(y + h),
-                    JValue::Int(0),
-                ],
-            );
-            env.exception_clear();
-
-            let anchor_info = env
-                .call_method(
-                    &builder,
-                    jni::jni_str!("build"),
-                    jni::jni_sig!("()Landroid/view/inputmethod/CursorAnchorInfo;"),
-                    &[],
-                )
-                .and_then(|v| v.l())
-                .map_err(|e| {
-                    env.exception_clear();
-                    e.to_string()
-                })?;
-            if anchor_info.is_null() {
-                return Err("CursorAnchorInfo.build() returned null".to_string());
-            }
-
-            // 3. Get decor view: activity.getWindow().getDecorView()
-            let window = env
-                .call_method(
-                    &activity,
-                    jni::jni_str!("getWindow"),
-                    jni::jni_sig!("()Landroid/view/Window;"),
-                    &[],
-                )
-                .and_then(|v| v.l())
-                .map_err(|e| {
-                    env.exception_clear();
-                    e.to_string()
-                })?;
-            if window.is_null() {
-                return Err("getWindow() returned null".to_string());
-            }
-
-            let decor_view = env
-                .call_method(
-                    &window,
-                    jni::jni_str!("getDecorView"),
-                    jni::jni_sig!("()Landroid/view/View;"),
-                    &[],
-                )
-                .and_then(|v| v.l())
-                .map_err(|e| {
-                    env.exception_clear();
-                    e.to_string()
-                })?;
-            if decor_view.is_null() {
-                return Err("getDecorView() returned null".to_string());
-            }
-
-            // 4. imm.updateCursorAnchorInfo(view, info)
-            let _ = env.call_method(
-                &imm,
-                jni::jni_str!("updateCursorAnchorInfo"),
-                jni::jni_sig!("(Landroid/view/View;Landroid/view/inputmethod/CursorAnchorInfo;)V"),
-                &[JValue::Object(&decor_view), JValue::Object(&anchor_info)],
-            );
-            env.exception_clear();
-
-            log::trace!("update_ime_position: x={:.0} y={:.0} h={:.0}", x, y, h);
-
-            Ok(())
-        });
+        crate::android::jni::update_ime_cursor(x, y, h);
     }
 }
 

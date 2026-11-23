@@ -22,6 +22,7 @@ pub mod img;
 pub mod input;
 #[cfg(feature = "rich-content")]
 pub mod markdown;
+pub mod platform_view;
 
 // ── Render context ───────────────────────────────────────────────────
 
@@ -324,6 +325,7 @@ impl CustomElementRegistry {
         registry.register(Box::new(anchored::AnchoredFactory));
         registry.register(Box::new(img::ImgFactory));
         registry.register(Box::new(img::SvgFactory));
+        registry.register(Box::new(platform_view::PlatformViewFactory));
         #[cfg(feature = "rich-content")]
         {
             registry.register(Box::new(code::CodeFactory));

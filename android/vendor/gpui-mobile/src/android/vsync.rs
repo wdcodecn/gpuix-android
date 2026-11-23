@@ -1,12 +1,9 @@
 //! Android hardware VSync integration via `AChoreographer` (`dlsym` loaded).
 //!
-//! Safety & threading invariant:
-//! - `AChoreographer_getInstance()` binds to the calling thread's `ALooper`, so
-//!   `arm_if_needed()` MUST ONLY be called from the `android_main` event loop
-//!   thread.
-//! - Any background thread (Hermes JS / GPUI background worker) may call
-//!   `request_vsync()`, which atomically flags the request and wakes the main
-//!   `ALooper` via `AndroidAppWaker`.
+//! Runs `AChoreographer` on a dedicated `gpuix-vsync` thread with its own
+//! `ALooper` so `android_main`'s `android-activity` looper is never polluted with
+//! unregistered file descriptors (avoiding per-frame `Spurious ALOOPER_POLL_CALLBACK`
+//! warnings) and rendering pauses on the main thread cannot miss a VSync edge.
 
 use std::{
     ffi::c_void,
@@ -23,14 +20,29 @@ type PostFrameCallback64Fn =
 type FrameCallback32Fn = unsafe extern "C" fn(frame_time_nanos: libc::c_long, data: *mut c_void);
 type PostFrameCallback32Fn =
     unsafe extern "C" fn(choreographer: *mut c_void, callback: FrameCallback32Fn, data: *mut c_void);
+type LooperPrepareFn = unsafe extern "C" fn(opts: libc::c_int) -> *mut c_void;
+type LooperPollOnceFn = unsafe extern "C" fn(
+    timeout_millis: libc::c_int,
+    out_fd: *mut libc::c_int,
+    out_events: *mut libc::c_int,
+    out_data: *mut *mut c_void,
+) -> libc::c_int;
+type LooperWakeFn = unsafe extern "C" fn(looper: *mut c_void);
+
+const ALOOPER_PREPARE_ALLOW_NON_CALLBACKS: libc::c_int = 1 << 0;
 
 struct ChoreographerFns {
     get_instance: GetInstanceFn,
     post_64: Option<PostFrameCallback64Fn>,
     post_32: Option<PostFrameCallback32Fn>,
+    looper_prepare: LooperPrepareFn,
+    looper_poll_once: LooperPollOnceFn,
+    looper_wake: LooperWakeFn,
 }
 
 static FNS: OnceLock<Option<ChoreographerFns>> = OnceLock::new();
+static VSYNC_THREAD_LOOPER: OnceLock<Option<usize>> = OnceLock::new();
+static VSYNC_WANT_ARM: AtomicBool = AtomicBool::new(false);
 static VSYNC_REQUESTED: AtomicBool = AtomicBool::new(false);
 static VSYNC_ARMED: AtomicBool = AtomicBool::new(false);
 static VSYNC_FIRED: AtomicBool = AtomicBool::new(false);
@@ -39,23 +51,40 @@ static LAST_FRAME_TIME_NANOS: AtomicI64 = AtomicI64::new(0);
 static FRAME_LISTENER: RwLock<Option<fn(f64)>> = RwLock::new(None);
 static EXTERNAL_DEMAND: RwLock<Option<fn() -> bool>> = RwLock::new(None);
 
+unsafe fn lookup_libandroid_symbol(name: &std::ffi::CStr) -> *mut c_void {
+    let ptr = unsafe { libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr()) };
+    if !ptr.is_null() {
+        return ptr;
+    }
+    static LIBANDROID: OnceLock<usize> = OnceLock::new();
+    let handle = *LIBANDROID.get_or_init(|| unsafe {
+        libc::dlopen(b"libandroid.so\0".as_ptr().cast(), libc::RTLD_NOW) as usize
+    });
+    if handle != 0 {
+        unsafe { libc::dlsym(handle as *mut c_void, name.as_ptr()) }
+    } else {
+        std::ptr::null_mut()
+    }
+}
+
 fn resolve_fns() -> Option<&'static ChoreographerFns> {
     FNS.get_or_init(|| unsafe {
-        let get_ptr = libc::dlsym(libc::RTLD_DEFAULT, c"AChoreographer_getInstance".as_ptr());
+        let get_ptr = lookup_libandroid_symbol(c"AChoreographer_getInstance");
         if get_ptr.is_null() {
             log::warn!("AChoreographer_getInstance not found; falling back to timer pacing");
             return None;
         }
-        let post64_ptr = libc::dlsym(
-            libc::RTLD_DEFAULT,
-            c"AChoreographer_postFrameCallback64".as_ptr(),
-        );
-        let post32_ptr = libc::dlsym(
-            libc::RTLD_DEFAULT,
-            c"AChoreographer_postFrameCallback".as_ptr(),
-        );
+        let post64_ptr = lookup_libandroid_symbol(c"AChoreographer_postFrameCallback64");
+        let post32_ptr = lookup_libandroid_symbol(c"AChoreographer_postFrameCallback");
         if post64_ptr.is_null() && post32_ptr.is_null() {
             log::warn!("AChoreographer_postFrameCallback* not found; falling back to timer pacing");
+            return None;
+        }
+        let prepare_ptr = lookup_libandroid_symbol(c"ALooper_prepare");
+        let poll_ptr = lookup_libandroid_symbol(c"ALooper_pollOnce");
+        let wake_ptr = lookup_libandroid_symbol(c"ALooper_wake");
+        if prepare_ptr.is_null() || poll_ptr.is_null() || wake_ptr.is_null() {
+            log::warn!("ALooper_* entry points not found; falling back to timer pacing");
             return None;
         }
         Some(ChoreographerFns {
@@ -74,9 +103,68 @@ fn resolve_fns() -> Option<&'static ChoreographerFns> {
                     post32_ptr,
                 ))
             },
+            looper_prepare: std::mem::transmute::<*mut c_void, LooperPrepareFn>(prepare_ptr),
+            looper_poll_once: std::mem::transmute::<*mut c_void, LooperPollOnceFn>(poll_ptr),
+            looper_wake: std::mem::transmute::<*mut c_void, LooperWakeFn>(wake_ptr),
         })
     })
     .as_ref()
+}
+
+fn ensure_vsync_thread() -> Option<(usize, &'static ChoreographerFns)> {
+    let fns = resolve_fns()?;
+    let looper_opt = *VSYNC_THREAD_LOOPER.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Option<usize>>(1);
+        let spawn_result = std::thread::Builder::new()
+            .name("gpuix-vsync".to_string())
+            .spawn(move || unsafe {
+                // Boost dedicated VSync thread priority for consistent 120Hz cadence.
+                libc::setpriority(libc::PRIO_PROCESS as _, 0, -8);
+                let looper = (fns.looper_prepare)(ALOOPER_PREPARE_ALLOW_NON_CALLBACKS);
+                if looper.is_null() {
+                    log::warn!("gpuix-vsync: ALooper_prepare returned null");
+                    let _ = tx.send(None);
+                    return;
+                }
+                let choreographer = (fns.get_instance)();
+                if choreographer.is_null() {
+                    log::warn!("gpuix-vsync: AChoreographer_getInstance returned null");
+                    let _ = tx.send(None);
+                    return;
+                }
+                let _ = tx.send(Some(looper as usize));
+                loop {
+                    if VSYNC_WANT_ARM.swap(false, Ordering::AcqRel)
+                        && !VSYNC_ARMED.load(Ordering::Acquire)
+                        && !VSYNC_FIRED.load(Ordering::Acquire)
+                    {
+                        VSYNC_REQUESTED.store(false, Ordering::Release);
+                        VSYNC_ARMED.store(true, Ordering::Release);
+                        if let Some(post64) = fns.post_64 {
+                            post64(choreographer, on_choreographer_frame_64, std::ptr::null_mut());
+                        } else if let Some(post32) = fns.post_32 {
+                            post32(choreographer, on_choreographer_frame_32, std::ptr::null_mut());
+                        } else {
+                            VSYNC_ARMED.store(false, Ordering::Release);
+                        }
+                    }
+                    (fns.looper_poll_once)(
+                        -1,
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                    );
+                }
+            });
+        match spawn_result {
+            Ok(_) => rx.recv().unwrap_or(None),
+            Err(err) => {
+                log::warn!("failed to spawn gpuix-vsync thread: {err}");
+                None
+            }
+        }
+    });
+    looper_opt.map(|looper| (looper, fns))
 }
 
 unsafe extern "C" fn on_choreographer_frame_64(frame_time_nanos: i64, _data: *mut c_void) {
@@ -131,35 +219,21 @@ pub fn notify_frame_listener(frame_time_nanos: i64) {
     }
 }
 
-/// Arm `AChoreographer` for the next hardware VSync on the calling `android_main` thread.
+/// Arm `AChoreographer` on the dedicated `gpuix-vsync` thread for the next hardware VSync.
 ///
-/// Returns `true` when hardware VSync is available (either already armed/fired or
-/// newly posted); returns `false` when `AChoreographer` is unavailable on this thread/ABI.
+/// Safe to call from any thread; returns `true` when hardware VSync is available.
 pub fn arm_if_needed() -> bool {
     if VSYNC_FIRED.load(Ordering::Acquire) || VSYNC_ARMED.load(Ordering::Acquire) {
         return true;
     }
-    let Some(fns) = resolve_fns() else {
+    let Some((looper, fns)) = ensure_vsync_thread() else {
         return false;
     };
+    VSYNC_WANT_ARM.store(true, Ordering::Release);
     unsafe {
-        let choreographer = (fns.get_instance)();
-        if choreographer.is_null() {
-            return false;
-        }
-        VSYNC_REQUESTED.store(false, Ordering::Release);
-        VSYNC_ARMED.store(true, Ordering::Release);
-        if let Some(post64) = fns.post_64 {
-            post64(choreographer, on_choreographer_frame_64, std::ptr::null_mut());
-            return true;
-        }
-        if let Some(post32) = fns.post_32 {
-            post32(choreographer, on_choreographer_frame_32, std::ptr::null_mut());
-            return true;
-        }
-        VSYNC_ARMED.store(false, Ordering::Release);
-        false
+        (fns.looper_wake)(looper as *mut c_void);
     }
+    true
 }
 
 /// Returns `true` if a hardware VSync callback has already fired and awaits processing.
@@ -178,6 +252,7 @@ pub fn take_fired() -> Option<i64> {
 
 /// Clear armed/pending flags (e.g. when the surface is destroyed or app pauses).
 pub fn reset() {
+    VSYNC_WANT_ARM.store(false, Ordering::Release);
     VSYNC_REQUESTED.store(false, Ordering::Release);
     VSYNC_ARMED.store(false, Ordering::Release);
     VSYNC_FIRED.store(false, Ordering::Release);

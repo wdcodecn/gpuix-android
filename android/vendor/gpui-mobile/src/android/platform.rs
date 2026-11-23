@@ -101,26 +101,117 @@ impl AndroidClipboard {
     }
 }
 
-// ── stub: credential store ────────────────────────────────────────────────────
+// ── credential store (Android Keystore AES-256-GCM via JNI) ───────────────────
 
-/// Android credential store backed by the Android Keystore system.
-///
-/// Stubbed with an in-memory map; replace with a real JNI implementation.
-#[derive(Default)]
+/// Minimal standard Base64 encoder/decoder (avoids adding external Cargo deps).
+fn encode_base64(input: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity((input.len() + 2) / 3 * 4);
+    let mut i = 0;
+    while i < input.len() {
+        let b0 = input[i] as u32;
+        let b1 = if i + 1 < input.len() { input[i + 1] as u32 } else { 0 };
+        let b2 = if i + 2 < input.len() { input[i + 2] as u32 } else { 0 };
+        let triple = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[((triple >> 18) & 0x3F) as usize] as char);
+        out.push(TABLE[((triple >> 12) & 0x3F) as usize] as char);
+        out.push(if i + 1 < input.len() {
+            TABLE[((triple >> 6) & 0x3F) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if i + 2 < input.len() {
+            TABLE[(triple & 0x3F) as usize] as char
+        } else {
+            '='
+        });
+        i += 3;
+    }
+    out
+}
+
+fn decode_base64(input: &str) -> Option<Vec<u8>> {
+    fn val(b: u8) -> Option<u32> {
+        match b {
+            b'A'..=b'Z' => Some((b - b'A') as u32),
+            b'a'..=b'z' => Some((b - b'a' + 26) as u32),
+            b'0'..=b'9' => Some((b - b'0' + 52) as u32),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+    let bytes: Vec<u8> = input
+        .bytes()
+        .filter(|b| !b.is_ascii_whitespace())
+        .collect();
+    if bytes.is_empty() {
+        return Some(Vec::new());
+    }
+    if bytes.len() % 4 != 0 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
+    for chunk in bytes.chunks_exact(4) {
+        let a = val(chunk[0])?;
+        let b = val(chunk[1])?;
+        let c = if chunk[2] == b'=' { 0 } else { val(chunk[2])? };
+        let d = if chunk[3] == b'=' { 0 } else { val(chunk[3])? };
+        let triple = (a << 18) | (b << 12) | (c << 6) | d;
+        out.push(((triple >> 16) & 0xFF) as u8);
+        if chunk[2] != b'=' {
+            out.push(((triple >> 8) & 0xFF) as u8);
+        }
+        if chunk[3] != b'=' {
+            out.push((triple & 0xFF) as u8);
+        }
+    }
+    Some(out)
+}
+
+/// Android credential store backed by Android Keystore AES-256-GCM via JNI,
+/// with an in-memory fallback map when running headless or in unit tests.
 pub struct AndroidCredentialStore {
+    headless: bool,
     store: std::collections::HashMap<(String, String), Vec<u8>>,
 }
 
+impl Default for AndroidCredentialStore {
+    fn default() -> Self {
+        Self::new(true)
+    }
+}
+
 impl AndroidCredentialStore {
+    pub fn new(headless: bool) -> Self {
+        Self {
+            headless,
+            store: std::collections::HashMap::new(),
+        }
+    }
+
     pub fn write(&mut self, service: &str, username: &str, password: &[u8]) -> Result<()> {
         self.store.insert(
             (service.to_string(), username.to_string()),
             password.to_vec(),
         );
+        if !self.headless {
+            let encoded = encode_base64(password);
+            if !super::jni::secure_write(service, username, &encoded) {
+                log::warn!("AndroidCredentialStore::write JNI failed for {service}/{username}");
+            }
+        }
         Ok(())
     }
 
     pub fn read(&self, service: &str, username: &str) -> Result<Option<Vec<u8>>> {
+        if !self.headless {
+            if let Some(encoded) = super::jni::secure_read(service, username) {
+                if let Some(decoded) = decode_base64(&encoded) {
+                    return Ok(Some(decoded));
+                }
+            }
+        }
         Ok(self
             .store
             .get(&(service.to_string(), username.to_string()))
@@ -130,6 +221,9 @@ impl AndroidCredentialStore {
     pub fn delete(&mut self, service: &str, username: &str) -> Result<()> {
         self.store
             .remove(&(service.to_string(), username.to_string()));
+        if !self.headless {
+            let _ = super::jni::secure_delete(service, username);
+        }
         Ok(())
     }
 }
@@ -216,6 +310,176 @@ pub struct AndroidPlatform {
     should_quit: AtomicBool,
 }
 
+/// System fonts discovered from `/system/etc/fonts.xml`, grouped by startup priority.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DiscoveredFonts {
+    pub core: Vec<String>,
+    pub locale_priority: Vec<String>,
+    pub extra: Vec<String>,
+    pub emoji: Vec<String>,
+}
+
+fn strip_xml_comments(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some(start) = rest.find("<!--") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 4..];
+        if let Some(end) = after.find("-->") {
+            rest = &after[end + 3..];
+        } else {
+            rest = "";
+            break;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+fn extract_attr<'a>(attrs: &'a str, key: &str) -> Option<&'a str> {
+    let pattern_dq = format!("{key}=\"");
+    if let Some(pos) = attrs.find(&pattern_dq) {
+        let rest = &attrs[pos + pattern_dq.len()..];
+        if let Some(end) = rest.find('"') {
+            return Some(&rest[..end]);
+        }
+    }
+    let pattern_sq = format!("{key}='");
+    if let Some(pos) = attrs.find(&pattern_sq) {
+        let rest = &attrs[pos + pattern_sq.len()..];
+        if let Some(end) = rest.find('\'') {
+            return Some(&rest[..end]);
+        }
+    }
+    None
+}
+
+fn push_unique_font(dst: &mut Vec<String>, seen: &mut std::collections::HashSet<String>, filename: &str) {
+    let clean = filename.trim();
+    if clean.is_empty() || clean.contains('<') || clean.contains('>') {
+        return;
+    }
+    let full = if clean.starts_with('/') {
+        clean.to_string()
+    } else {
+        format!("/system/fonts/{clean}")
+    };
+    if seen.insert(full.clone()) {
+        dst.push(full);
+    }
+}
+
+fn locale_matches_family(family_lang: &str, device_locale: &str) -> bool {
+    if family_lang.is_empty() || device_locale.is_empty() {
+        return false;
+    }
+    let loc_lower = device_locale.to_ascii_lowercase().replace('_', "-");
+    let primary = loc_lower.split('-').next().unwrap_or("");
+    for tag in family_lang.split([',', ' ']) {
+        let tag_lower = tag.trim().to_ascii_lowercase();
+        if tag_lower.is_empty() {
+            continue;
+        }
+        if loc_lower.starts_with(&tag_lower)
+            || (!primary.is_empty() && (tag_lower == primary || tag_lower.starts_with(&format!("{primary}-"))))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Parse Android `/system/etc/fonts.xml` into startup-prioritized font path buckets.
+pub fn parse_android_fonts_xml(xml: &str, locale: &str) -> DiscoveredFonts {
+    let cleaned = strip_xml_comments(xml);
+    let mut out = DiscoveredFonts::default();
+    let mut seen = std::collections::HashSet::new();
+
+    let mut pos = 0;
+    while let Some(fam_rel) = cleaned[pos..].find("<family") {
+        let fam_start = pos + fam_rel;
+        let Some(tag_end_rel) = cleaned[fam_start..].find('>') else {
+            break;
+        };
+        let attrs = &cleaned[fam_start + 7..fam_start + tag_end_rel];
+        let body_start = fam_start + tag_end_rel + 1;
+        let Some(close_rel) = cleaned[body_start..].find("</family>") else {
+            pos = body_start;
+            continue;
+        };
+        let body = &cleaned[body_start..body_start + close_rel];
+        pos = body_start + close_rel + "</family>".len();
+
+        let fam_name = extract_attr(attrs, "name").unwrap_or("");
+        let fam_lang = extract_attr(attrs, "lang").unwrap_or("");
+        let is_sans_core = fam_name == "sans-serif";
+        let is_emoji = fam_lang.contains("Zsye") || fam_lang.contains("Zsym");
+        let is_locale_match = !is_emoji && locale_matches_family(fam_lang, locale);
+        let is_cjk = !is_emoji && (fam_lang.starts_with("zh") || fam_lang.starts_with("ja") || fam_lang.starts_with("ko"));
+
+        let mut fpos = 0;
+        while let Some(font_rel) = body[fpos..].find("<font") {
+            let fstart = fpos + font_rel;
+            let Some(fgt_rel) = body[fstart..].find('>') else {
+                break;
+            };
+            let fattrs = &body[fstart + 5..fstart + fgt_rel];
+            if fattrs.ends_with('/') {
+                fpos = fstart + fgt_rel + 1;
+                continue;
+            }
+            let text_start = fstart + fgt_rel + 1;
+            let next_lt = body[text_start..].find('<').unwrap_or(body.len() - text_start);
+            let filename = body[text_start..text_start + next_lt].trim();
+            fpos = text_start + next_lt;
+
+            if filename.is_empty() {
+                continue;
+            }
+            let weight = extract_attr(fattrs, "weight").unwrap_or("400");
+            let style = extract_attr(fattrs, "style").unwrap_or("normal");
+
+            if is_emoji || filename.contains("Emoji") {
+                push_unique_font(&mut out.emoji, &mut seen, filename);
+            } else if is_sans_core && style == "normal" && matches!(weight, "400" | "700") && out.core.len() < 4 {
+                push_unique_font(&mut out.core, &mut seen, filename);
+            } else if is_locale_match && style == "normal" && matches!(weight, "400" | "500" | "700") {
+                push_unique_font(&mut out.locale_priority, &mut seen, filename);
+            } else if is_cjk && style == "normal" && weight == "400" {
+                push_unique_font(&mut out.extra, &mut seen, filename);
+            } else if (is_sans_core || fam_name == "monospace" || fam_name == "serif") && out.extra.len() < 24 {
+                push_unique_font(&mut out.extra, &mut seen, filename);
+            } else if !fam_lang.is_empty() && style == "normal" && weight == "400" && out.extra.len() < 32 {
+                push_unique_font(&mut out.extra, &mut seen, filename);
+            }
+        }
+    }
+    out
+}
+
+#[cfg(target_os = "android")]
+fn read_android_locale() -> String {
+    extern "C" {
+        fn __system_property_get(name: *const i8, value: *mut i8) -> i32;
+    }
+    for key in [b"persist.sys.locale\0".as_slice(), b"ro.product.locale\0".as_slice()] {
+        let mut buf = [0u8; 92];
+        let len = unsafe { __system_property_get(key.as_ptr().cast(), buf.as_mut_ptr().cast()) };
+        if len > 0 {
+            let s = String::from_utf8_lossy(&buf[..len as usize]).trim().to_string();
+            if !s.is_empty() {
+                return s;
+            }
+        }
+    }
+    "en-US".to_string()
+}
+
+#[cfg(not(target_os = "android"))]
+fn read_android_locale() -> String {
+    "en-US".to_string()
+}
+
 /// Check whether a TrueType/OpenType font file contains CBDT (Color Bitmap
 /// Data Table) tables — the bitmap emoji format that swash can render.
 ///
@@ -294,25 +558,50 @@ impl AndroidPlatform {
         };
 
         let text_system = Arc::new(CosmicTextSystem::new("Roboto"));
+        let locale = if headless {
+            "en-US".to_string()
+        } else {
+            read_android_locale()
+        };
+        let discovered = if headless {
+            DiscoveredFonts::default()
+        } else if let Ok(xml) = std::fs::read_to_string("/system/etc/fonts.xml") {
+            let parsed = parse_android_fonts_xml(&xml, &locale);
+            log::info!(
+                "fonts.xml parsed for locale={}: core={}, locale_priority={}, extra={}, emoji={}",
+                locale,
+                parsed.core.len(),
+                parsed.locale_priority.len(),
+                parsed.extra.len(),
+                parsed.emoji.len()
+            );
+            parsed
+        } else {
+            DiscoveredFonts::default()
+        };
 
         // Two-phase font loading:
-        // Phase 1 (synchronous): load only minimal core Roboto faces needed
+        // Phase 1 (synchronous): load minimal core sans-serif faces needed
         // for the first frame (<5 ms, avoids blocking cold start on CJK/Emoji
         // font I/O and parsing).
         {
-            let core_fonts: &[&str] = &[
+            let mut core_candidates: Vec<String> = discovered.core.iter().take(2).cloned().collect();
+            for fallback in [
                 "/system/fonts/Roboto-Regular.ttf",
                 "/system/fonts/Roboto-Bold.ttf",
-            ];
-            let mut font_data: Vec<std::borrow::Cow<'static, [u8]>> = Vec::new();
-            for path in core_fonts {
-                if let Ok(bytes) = std::fs::read(path) {
-                    log::info!("loaded core font: {path} ({} bytes)", bytes.len());
-                    font_data.push(std::borrow::Cow::Owned(bytes));
+                "/system/fonts/DroidSans.ttf",
+            ] {
+                if !core_candidates.iter().any(|p| p == fallback) {
+                    core_candidates.push(fallback.to_string());
                 }
             }
-            if font_data.is_empty() {
-                if let Ok(bytes) = std::fs::read("/system/fonts/DroidSans.ttf") {
+            let mut font_data: Vec<std::borrow::Cow<'static, [u8]>> = Vec::new();
+            for path in &core_candidates {
+                if font_data.len() >= 2 {
+                    break;
+                }
+                if let Ok(bytes) = std::fs::read(path) {
+                    log::info!("loaded core font: {path} ({} bytes)", bytes.len());
                     font_data.push(std::borrow::Cow::Owned(bytes));
                 }
             }
@@ -325,77 +614,101 @@ impl AndroidPlatform {
             }
         }
 
-        // Phase 2 (background thread, non-headless): lazily load CJK, extended
-        // scripts, monospace variants, and CBDT emoji fonts, then schedule a
-        // repaint after each batch so fallback glyphs appear cleanly.
+        // Phase 2 (background thread, non-headless):
+        // Batch 0: locale-priority font (e.g. zh-Hans CJK/OEM Sans) loaded first and painted immediately.
+        // Batch 1 & 2: remaining weights, monospace, extended scripts, and CBDT emoji.
         if !headless {
             let bg_text_system = Arc::clone(&text_system);
-            let _ = std::thread::Builder::new()
+            std::thread::Builder::new()
                 .name("gpuix-fonts".into())
                 .spawn(move || {
-                    let batch1_paths: &[&str] = &[
-                        "/system/fonts/Roboto-Italic.ttf",
-                        "/system/fonts/Roboto-BoldItalic.ttf",
-                        "/system/fonts/Roboto-Medium.ttf",
-                        "/system/fonts/Roboto-Light.ttf",
-                        "/system/fonts/Roboto-Thin.ttf",
-                        "/system/fonts/RobotoFlex-Regular.ttf",
-                        "/system/fonts/DroidSans.ttf",
-                        "/system/fonts/DroidSans-Bold.ttf",
-                        "/system/fonts/DroidSansMono.ttf",
-                        "/system/fonts/RobotoMono-Regular.ttf",
-                        "/system/fonts/NotoSansCJK-Regular.ttc",
-                    ];
-                    let mut batch1: Vec<std::borrow::Cow<'static, [u8]>> = Vec::new();
-                    for path in batch1_paths {
-                        if let Ok(bytes) = std::fs::read(path) {
-                            log::info!("loaded bg font batch1: {path} ({} bytes)", bytes.len());
-                            batch1.push(std::borrow::Cow::Owned(bytes));
-                        }
-                    }
-                    if !batch1.is_empty() {
-                        if let Err(e) = bg_text_system.add_fonts(batch1) {
-                            log::warn!("failed to add bg fonts batch1: {e:#}");
-                        } else if let Some(p) = crate::android::jni::shared_platform() {
-                            if let Some(w) = p.0.primary_window() {
-                                w.schedule_frame();
+                    let load_paths = |paths: &[String], tag: &str| {
+                        let mut data: Vec<std::borrow::Cow<'static, [u8]>> = Vec::new();
+                        for path in paths {
+                            if let Ok(bytes) = std::fs::read(path) {
+                                log::info!("loaded bg font {tag}: {path} ({} bytes)", bytes.len());
+                                data.push(std::borrow::Cow::Owned(bytes));
                             }
                         }
-                    }
+                        if !data.is_empty() {
+                            if let Err(e) = bg_text_system.add_fonts(data) {
+                                log::warn!("failed to add bg fonts {tag}: {e:#}");
+                            } else if let Some(p) = crate::android::jni::shared_platform() {
+                                if let Some(w) = p.0.primary_window() {
+                                    w.schedule_frame();
+                                }
+                            }
+                        }
+                    };
 
-                    let batch2_paths: &[&str] = &[
+                    // Batch 0: immediate locale-priority CJK/script font
+                    let mut batch0 = discovered.locale_priority;
+                    if batch0.is_empty() {
+                        batch0.push("/system/fonts/NotoSansCJK-Regular.ttc".to_string());
+                    }
+                    load_paths(&batch0, "batch0");
+
+                    // Batch 1: core extras, monospace, Roboto weights
+                    let mut batch1: Vec<String> = vec![
+                        "/system/fonts/Roboto-Italic.ttf".to_string(),
+                        "/system/fonts/Roboto-BoldItalic.ttf".to_string(),
+                        "/system/fonts/Roboto-Medium.ttf".to_string(),
+                        "/system/fonts/Roboto-Light.ttf".to_string(),
+                        "/system/fonts/DroidSansMono.ttf".to_string(),
+                        "/system/fonts/RobotoMono-Regular.ttf".to_string(),
+                        "/system/fonts/NotoSansCJK-Regular.ttc".to_string(),
+                    ];
+                    for p in discovered.core.into_iter().skip(2) {
+                        if !batch1.contains(&p) {
+                            batch1.push(p);
+                        }
+                    }
+                    for p in discovered.extra.iter().take(12) {
+                        if !batch1.contains(p) {
+                            batch1.push(p.clone());
+                        }
+                    }
+                    load_paths(&batch1, "batch1");
+
+                    // Batch 2: remaining extended scripts + CBDT emoji
+                    let mut batch2_paths: Vec<String> = discovered.extra.into_iter().skip(12).collect();
+                    for fallback in [
                         "/system/fonts/NotoSans-Regular.ttf",
                         "/system/fonts/NotoSans-Bold.ttf",
-                        "/system/fonts/NotoSans-Italic.ttf",
-                        "/system/fonts/NotoSans-BoldItalic.ttf",
-                        "/system/fonts/NotoSansDevanagari-Regular.otf",
                         "/system/fonts/NotoSansArabic-Regular.ttf",
+                        "/system/fonts/NotoSansDevanagari-Regular.otf",
                         "/system/fonts/NotoSansHebrew-Regular.ttf",
                         "/system/fonts/NotoSansThai-Regular.ttf",
                         "/system/fonts/NotoColorEmojiFlags.ttf",
                         "/system/fonts/NotoSerif-Regular.ttf",
-                        "/system/fonts/NotoSerif-Bold.ttf",
-                    ];
+                    ] {
+                        let s = fallback.to_string();
+                        if !batch2_paths.contains(&s) {
+                            batch2_paths.push(s);
+                        }
+                    }
                     let mut batch2: Vec<std::borrow::Cow<'static, [u8]>> = Vec::new();
-                    for path in batch2_paths {
+                    for path in &batch2_paths {
                         if let Ok(bytes) = std::fs::read(path) {
                             log::info!("loaded bg font batch2: {path} ({} bytes)", bytes.len());
                             batch2.push(std::borrow::Cow::Owned(bytes));
                         }
                     }
 
-                    let system_emoji_path = "/system/fonts/NotoColorEmoji.ttf";
+                    let mut emoji_candidates = discovered.emoji;
+                    let default_emoji = "/system/fonts/NotoColorEmoji.ttf".to_string();
+                    if !emoji_candidates.contains(&default_emoji) {
+                        emoji_candidates.push(default_emoji);
+                    }
                     let mut emoji_loaded = false;
-                    if let Ok(system_emoji_bytes) = std::fs::read(system_emoji_path) {
-                        if font_has_cbdt_tables(&system_emoji_bytes) {
-                            log::info!(
-                                "system emoji font has CBDT tables — using it ({} bytes)",
-                                system_emoji_bytes.len()
-                            );
-                            batch2.push(std::borrow::Cow::Owned(system_emoji_bytes));
-                            emoji_loaded = true;
-                        } else {
-                            log::info!("system emoji font is COLR v1 (no CBDT) — will try bundled fallback");
+                    for emoji_path in &emoji_candidates {
+                        if let Ok(bytes) = std::fs::read(emoji_path) {
+                            if font_has_cbdt_tables(&bytes) {
+                                log::info!("system emoji font has CBDT tables — using {emoji_path} ({} bytes)", bytes.len());
+                                batch2.push(std::borrow::Cow::Owned(bytes));
+                                emoji_loaded = true;
+                                break;
+                            }
                         }
                     }
                     if !emoji_loaded {
@@ -425,7 +738,8 @@ impl AndroidPlatform {
                             }
                         }
                     }
-                });
+                })
+                .ok();
         }
 
         let displays = if headless {
@@ -447,7 +761,7 @@ impl AndroidPlatform {
                 displays,
                 text_system,
                 clipboard: AndroidClipboard::new(headless),
-                credentials: AndroidCredentialStore::default(),
+                credentials: AndroidCredentialStore::new(headless),
                 finish_launching: None,
                 quit_callback: None,
                 system_wake_callback: None,
@@ -1711,5 +2025,54 @@ mod tests {
     #[test]
     fn tick_no_panic() {
         headless().tick();
+    }
+
+    #[test]
+    fn fonts_xml_prioritizes_zh_hans_and_strips_comments() {
+        let xml = r#"
+            <familyset version="23">
+              <family name="sans-serif">
+                <font weight="400" style="normal">SysFont-Regular.ttf
+                  <axis tag="wght" stylevalue="400" />
+                </font>
+                <font weight="700" style="normal">SysFont-Bold.ttf</font>
+              </family>
+              <!-- <family lang="zh-Hans"><font weight="400">CommentedOut.ttf</font></family> -->
+              <family lang="zh-Hans">
+                <font weight="400" style="normal">SysSans-Hans-Regular.ttf</font>
+              </family>
+              <family lang="und-Zsye">
+                <font weight="400" style="normal">NotoColorEmoji.ttf</font>
+              </family>
+            </familyset>
+        "#;
+        let parsed = parse_android_fonts_xml(xml, "zh-Hans-CN");
+        assert_eq!(parsed.core, vec!["/system/fonts/SysFont-Regular.ttf", "/system/fonts/SysFont-Bold.ttf"]);
+        assert_eq!(parsed.locale_priority, vec!["/system/fonts/SysSans-Hans-Regular.ttf"]);
+        assert_eq!(parsed.emoji, vec!["/system/fonts/NotoColorEmoji.ttf"]);
+    }
+
+    #[test]
+    fn fonts_xml_handles_japanese_locale_and_malformed_input() {
+        let xml = r#"
+            <familyset>
+              <family lang="zh-Hans"><font weight="400">SC.ttf</font></family>
+              <family lang="ja"><font weight="400">JP.ttc</font></family>
+            </familyset>
+        "#;
+        let parsed = parse_android_fonts_xml(xml, "ja-JP");
+        assert_eq!(parsed.locale_priority, vec!["/system/fonts/JP.ttc"]);
+        assert_eq!(parsed.extra, vec!["/system/fonts/SC.ttf"]);
+
+        let empty = parse_android_fonts_xml("<<<not xml>>>", "en-US");
+        assert!(empty.core.is_empty());
+        assert!(empty.locale_priority.is_empty());
+    }
+
+    #[test]
+    fn credential_base64_round_trip() {
+        let raw = b"hello-gpuix-keystore!\x00\xff";
+        let b64 = encode_base64(raw);
+        assert_eq!(decode_base64(&b64).as_deref(), Some(raw.as_slice()));
     }
 }

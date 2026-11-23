@@ -64,13 +64,8 @@ impl AndroidPlatformView {
             let height = bounds.height;
             drop(bounds);
 
-            // Serialize creation_params as "key1=value1|key2=value2"
-            let creation_params_str: String = params
-                .creation_params
-                .iter()
-                .map(|(k, v)| format!("{}={}", k, v))
-                .collect::<Vec<_>>()
-                .join("|");
+            // Serialize creation_params as a JSON object string (fallback-safe for HTML/URLs with '|', '=', '&').
+            let creation_params_str = serialize_creation_params_json(&params.creation_params);
             let creation_params_jstr = env.new_string(&creation_params_str).e()?;
 
             let act = activity(env)?;
@@ -274,5 +269,61 @@ impl PlatformViewFactory for AndroidPlatformViewFactory {
 
     fn view_type(&self) -> &str {
         &self.view_type
+    }
+}
+
+fn push_json_escaped(out: &mut String, s: &str) {
+    use std::fmt::Write as _;
+    out.push('"');
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => {
+                let _ = write!(out, "\\u{:04x}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+}
+
+fn serialize_creation_params_json(params: &std::collections::HashMap<String, String>) -> String {
+    let mut out = String::from("{");
+    let mut keys: Vec<&String> = params.keys().collect();
+    keys.sort();
+    for (idx, key) in keys.iter().enumerate() {
+        if idx > 0 {
+            out.push(',');
+        }
+        push_json_escaped(&mut out, key);
+        out.push(':');
+        if let Some(val) = params.get(*key) {
+            push_json_escaped(&mut out, val);
+        } else {
+            out.push_str("\"\"");
+        }
+    }
+    out.push('}');
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::serialize_creation_params_json;
+
+    #[test]
+    fn serializes_creation_params_with_special_chars_as_valid_json() {
+        let mut params = std::collections::HashMap::new();
+        params.insert("html".to_string(), "<h1>Hi | \"GPUIX\"</h1>\n<p>a&b=1</p>".to_string());
+        params.insert("url".to_string(), "https://example.com/?a=1|2&b=3".to_string());
+        let json = serialize_creation_params_json(&params);
+        assert!(json.starts_with('{') && json.ends_with('}'));
+        assert!(json.contains("\\\"GPUIX\\\""));
+        assert!(json.contains("\\n"));
+        assert!(json.contains("a=1|2&b=3"));
     }
 }

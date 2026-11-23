@@ -26,6 +26,104 @@ struct AndroidInit {
 /// callback prevents the system from delivering its Focus event and causes an
 /// input-dispatch ANR.
 static ANDROID_INIT: OnceLock<Mutex<Option<Sender<AndroidInit>>>> = OnceLock::new();
+static ANDROID_EVENT_CALLBACK: OnceLock<Mutex<Option<EventCallback>>> = OnceLock::new();
+
+fn shared_android_callback() -> Option<EventCallback> {
+    ANDROID_EVENT_CALLBACK
+        .get()
+        .and_then(|slot| slot.lock().unwrap().clone())
+}
+
+fn on_android_back_pressed() {
+    if let Some(cb) = shared_android_callback() {
+        emit_event_full(&Some(cb), 0, "backPressed", |_| {});
+    }
+}
+
+fn on_android_deep_link(url: String) {
+    if let Some(cb) = shared_android_callback() {
+        emit_event_full(&Some(cb), 0, "deepLink", |payload| {
+            payload.value = Some(url);
+        });
+    }
+}
+
+fn on_android_bridge_result(request_id: u64, ok: bool, payload_json: String) {
+    if let Some(cb) = shared_android_callback() {
+        let encoded = serde_json::json!({
+            "requestId": request_id,
+            "ok": ok,
+            "payloadJson": payload_json,
+        })
+        .to_string();
+        emit_event_full(&Some(cb), 0, "nativeBridgeResult", |payload| {
+            payload.value = Some(encoded);
+        });
+    }
+}
+
+fn on_android_bridge_event(channel: String, payload_json: String) {
+    if let Some(cb) = shared_android_callback() {
+        let encoded = serde_json::json!({
+            "channel": channel,
+            "payloadJson": payload_json,
+        })
+        .to_string();
+        emit_event_full(&Some(cb), 0, "nativeBridgeEvent", |payload| {
+            payload.value = Some(encoded);
+        });
+    }
+}
+
+fn on_android_ws_event(
+    socket_id: u64,
+    event_type: String,
+    text: Option<String>,
+    binary: Option<Vec<u8>>,
+    code: i32,
+    reason: Option<String>,
+) {
+    use base64::Engine as _;
+    if let Some(cb) = shared_android_callback() {
+        let binary_base64 = binary
+            .as_deref()
+            .map(|bytes| base64::engine::general_purpose::STANDARD.encode(bytes));
+        let encoded = serde_json::json!({
+            "socketId": socket_id,
+            "type": event_type,
+            "text": text,
+            "binaryBase64": binary_base64,
+            "code": code,
+            "reason": reason,
+        })
+        .to_string();
+        emit_event_full(&Some(cb), 0, "wsEvent", |payload| {
+            payload.value = Some(encoded);
+        });
+    }
+}
+
+fn on_android_a11y_action(node_id: u64, action: String, arg: Option<String>) {
+    if let Some(cb) = shared_android_callback() {
+        if action == "click" {
+            emit_event_full(&Some(cb), node_id, "click", |payload| {
+                payload.button = Some(0);
+                payload.click_count = Some(1);
+                payload.is_right_click = Some(false);
+            });
+        } else {
+            let encoded = serde_json::json!({
+                "nodeId": node_id,
+                "action": action,
+                "arg": arg,
+            })
+            .to_string();
+            emit_event_full(&Some(cb), 0, "a11yAction", |payload| {
+                payload.value = Some(encoded);
+            });
+        }
+    }
+}
 
 fn attach_android_renderer(
     cx: &mut gpui::App,
@@ -42,6 +140,14 @@ fn attach_android_renderer(
         running,
         response,
     } = request;
+    let slot = ANDROID_EVENT_CALLBACK.get_or_init(|| Mutex::new(None));
+    *slot.lock().unwrap() = callback.clone();
+    android_jni::set_back_pressed_listener(on_android_back_pressed);
+    android_jni::set_deep_link_listener(on_android_deep_link);
+    android_jni::set_bridge_result_listener(on_android_bridge_result);
+    android_jni::set_bridge_event_listener(on_android_bridge_event);
+    android_jni::set_ws_event_listener(on_android_ws_event);
+    android_jni::set_a11y_action_listener(on_android_a11y_action);
     crate::custom_elements::input::init(cx);
     crate::custom_elements::img::init(cx);
     let title = options.title.clone().unwrap_or_else(|| "GPUIX".into());
@@ -176,6 +282,9 @@ pub fn run_android(
         }
     });
     slot.lock().unwrap().take();
+    if let Some(cb_slot) = ANDROID_EVENT_CALLBACK.get() {
+        cb_slot.lock().unwrap().take();
+    }
     if let Some(running) = active_renderer.lock().unwrap().take() {
         running.store(false, Ordering::Release);
     }

@@ -18,6 +18,9 @@ pub(crate) struct MotionStyle {
     pub bottom: Option<f64>,
     pub left: Option<f64>,
     pub border_radius: Option<f64>,
+    pub translate_x: Option<f64>,
+    pub translate_y: Option<f64>,
+    pub scale: Option<f64>,
 }
 
 impl MotionStyle {
@@ -31,6 +34,9 @@ impl MotionStyle {
             bottom: self.bottom.or(fallback.bottom),
             left: self.left.or(fallback.left),
             border_radius: self.border_radius.or(fallback.border_radius),
+            translate_x: self.translate_x.or(fallback.translate_x),
+            translate_y: self.translate_y.or(fallback.translate_y),
+            scale: self.scale.or(fallback.scale),
         }
     }
 
@@ -48,7 +54,18 @@ impl MotionStyle {
             bottom: value(self.bottom, target.bottom, progress),
             left: value(self.left, target.left, progress),
             border_radius: value(self.border_radius, target.border_radius, progress),
+            translate_x: value(self.translate_x, target.translate_x, progress),
+            translate_y: value(self.translate_y, target.translate_y, progress),
+            scale: value(self.scale, target.scale, progress),
         }
+    }
+
+    /// Layout-neutral GPU offset (`translateX`, `translateY`) applied during
+    /// prepaint without mutating `StyleDesc.left`/`top` or triggering Taffy relayout.
+    pub(crate) fn gpu_offset(self) -> Option<(f32, f32)> {
+        let dx = self.translate_x.unwrap_or(0.0) as f32;
+        let dy = self.translate_y.unwrap_or(0.0) as f32;
+        (dx.abs() > 1e-4 || dy.abs() > 1e-4).then_some((dx, dy))
     }
 
     pub(crate) fn apply_to(self, style: &mut StyleDesc) {
@@ -395,6 +412,30 @@ impl MotionState {
             Some(0.0),
             None,
         );
+        let (translate_x, v_translate_x) = step_prop(
+            self.from.translate_x,
+            self.target.translate_x,
+            self.velocities.translate_x,
+            1.0,
+            None,
+            None,
+        );
+        let (translate_y, v_translate_y) = step_prop(
+            self.from.translate_y,
+            self.target.translate_y,
+            self.velocities.translate_y,
+            1.0,
+            None,
+            None,
+        );
+        let (scale, v_scale) = step_prop(
+            self.from.scale,
+            self.target.scale,
+            self.velocities.scale,
+            0.02,
+            Some(0.0),
+            None,
+        );
 
         let style = MotionStyle {
             width,
@@ -405,6 +446,9 @@ impl MotionState {
             bottom,
             left,
             border_radius,
+            translate_x,
+            translate_y,
+            scale,
         };
         let velocities = MotionStyle {
             width: v_width,
@@ -415,6 +459,9 @@ impl MotionState {
             bottom: v_bottom,
             left: v_left,
             border_radius: v_border_radius,
+            translate_x: v_translate_x,
+            translate_y: v_translate_y,
+            scale: v_scale,
         };
         (style, velocities, any_active)
     }
@@ -528,6 +575,9 @@ fn initial_velocities(from: MotionStyle, target: MotionStyle, velocity: f64) -> 
         bottom: v(from.bottom, target.bottom),
         left: v(from.left, target.left),
         border_radius: v(from.border_radius, target.border_radius),
+        translate_x: v(from.translate_x, target.translate_x),
+        translate_y: v(from.translate_y, target.translate_y),
+        scale: v(from.scale, target.scale),
     }
 }
 
@@ -541,6 +591,9 @@ fn has_nonzero_velocity(vel: MotionStyle) -> bool {
         vel.bottom,
         vel.left,
         vel.border_radius,
+        vel.translate_x,
+        vel.translate_y,
+        vel.scale,
     ]
     .into_iter()
     .flatten()
@@ -558,6 +611,9 @@ fn derive_tween_velocities(from: MotionStyle, target: MotionStyle, dprogress_dt:
         bottom: d(from.bottom, target.bottom),
         left: d(from.left, target.left),
         border_radius: d(from.border_radius, target.border_radius),
+        translate_x: d(from.translate_x, target.translate_x),
+        translate_y: d(from.translate_y, target.translate_y),
+        scale: d(from.scale, target.scale),
     }
 }
 
@@ -632,6 +688,9 @@ fn validate_style(style: &MotionStyle) -> Result<(), String> {
         ("bottom", style.bottom),
         ("left", style.left),
         ("borderRadius", style.border_radius),
+        ("translateX", style.translate_x),
+        ("translateY", style.translate_y),
+        ("scale", style.scale),
     ] {
         if value.is_some_and(|value| !value.is_finite() || value.abs() > f32::MAX as f64) {
             return Err(format!("motion {name} must fit a finite 32-bit float"));
@@ -640,8 +699,9 @@ fn validate_style(style: &MotionStyle) -> Result<(), String> {
     if style.width.is_some_and(|value| value < 0.0)
         || style.height.is_some_and(|value| value < 0.0)
         || style.border_radius.is_some_and(|value| value < 0.0)
+        || style.scale.is_some_and(|value| value < 0.0)
     {
-        return Err("motion sizes and borderRadius must be non-negative".to_string());
+        return Err("motion sizes, borderRadius, and scale must be non-negative".to_string());
     }
     if style
         .opacity
@@ -993,5 +1053,32 @@ mod tests {
             "expected inherited positive velocity carry-over: {pos_just_after} vs {pos_at_interrupt}"
         );
         assert!(!state.frame(interrupt_at + Duration::from_millis(3000)).active);
+    }
+
+    #[test]
+    fn spring_translate_converges_without_mutating_layout_offsets() {
+        let started = Instant::now();
+        let desc = serde_json::json!({
+            "initial": { "translateX": 0.0, "translateY": 0.0 },
+            "animate": { "translateX": 140.0, "translateY": -36.0 },
+            "transition": { "type": "spring", "stiffness": 280.0, "damping": 22.0, "mass": 1.0 }
+        });
+        let mut state = MotionState::new(&desc, started).unwrap();
+        let mid = state
+            .visible_style(started + Duration::from_millis(80))
+            .unwrap();
+        assert!(mid.gpu_offset().is_some());
+
+        let mut layout = StyleDesc::default();
+        mid.apply_to(&mut layout);
+        assert!(layout.left.is_none());
+        assert!(layout.top.is_none());
+
+        assert!(!state.frame(started + Duration::from_millis(3000)).active);
+        let settled = state
+            .visible_style(started + Duration::from_millis(3000))
+            .unwrap();
+        assert_eq!(settled.translate_x, Some(140.0));
+        assert_eq!(settled.translate_y, Some(-36.0));
     }
 }

@@ -176,10 +176,12 @@ sync_file_if_changed() {
 }
 
 compute_native_fingerprint() {
-  local features_key="$1"
-  local rustc_ver="$2"
-  local zed_dirty="$3"
+  local abi="$1"
+  local features_key="$2"
+  local rustc_ver="$3"
+  local zed_dirty="$4"
   GPUIX_HASH_ROOT="$android_root" \
+  GPUIX_HASH_ABI="$abi" \
   GPUIX_HASH_PROFILE="$rust_profile" \
   GPUIX_HASH_FEATURES="$features_key" \
   GPUIX_HASH_NDK="$(basename "$ndk_root")" \
@@ -192,8 +194,9 @@ compute_native_fingerprint() {
     const path = require("node:path");
     const root = process.env.GPUIX_HASH_ROOT;
     const h = createHash("sha256");
-    h.update("native-cache-v1\n");
+    h.update("native-cache-v2-api26\n");
     for (const k of [
+      "GPUIX_HASH_ABI",
       "GPUIX_HASH_PROFILE",
       "GPUIX_HASH_FEATURES",
       "GPUIX_HASH_NDK",
@@ -292,7 +295,20 @@ else
     echo "Android GPUI dependency is not at the pinned revision" >&2; exit 1;
   }
 
-  bash "$android_root/scripts/build-hermes.sh"
+  abis_csv="${GPUIX_ABIS:-$(bun "$android_root/scripts/config.ts" --field abis --project "$project_root" 2>/dev/null || echo "arm64-v8a")}"
+  abis_csv="${abis_csv// /}"
+  [[ -n "$abis_csv" ]] || abis_csv="arm64-v8a"
+  IFS=',' read -r -a target_abis <<< "$abis_csv"
+
+  for existing_abi_dir in "$android_root/app/src/main/jniLibs"/*; do
+    [[ -d "$existing_abi_dir" ]] || continue
+    existing_abi="$(basename "$existing_abi_dir")"
+    if [[ ",$abis_csv," != *",$existing_abi,"* ]]; then
+      rm -rf "$existing_abi_dir"
+    fi
+  done
+
+  GPUIX_HERMES_ABI="${target_abis[0]}" bash "$android_root/scripts/build-hermes.sh"
   if [[ "$variant" == "release" ]]; then
     bun "$android_root/scripts/build-js.ts" --release
   else
@@ -315,64 +331,89 @@ else
 
   ndk_toolchain="$ndk_root/toolchains/llvm/prebuilt/$ndk_host"
   llvm_strip="$ndk_toolchain/bin/llvm-strip"
-  mkdir -p "$package_jni_dir"
-
   rustc_ver="$(cd "$android_root/rust" && rustc -vV | tr '\n' ' ')"
   zed_dirty="$({ git -C "$android_root/.deps/zed" status --porcelain; git -C "$android_root/.deps/zed" diff; } | sha256_stream)"
-  native_key="$(compute_native_fingerprint "$features_key" "$rustc_ver" "$zed_dirty")"
-  native_cache_dir="$cache_root/native/$native_key"
-  cached_so="$native_cache_dir/libgpuix_android.so"
 
-  if [[ "$shared_cache" == "1" ]] && [[ "${GPUIX_FORCE_NATIVE_REBUILD:-0}" != "1" ]] && [[ -f "$cached_so" ]]; then
-    echo "Native cache hit (${native_key:0:12}, profile=$rust_profile); skipping cargo ndk"
-    touch "$cached_so"
-    sync_file_if_changed "$cached_so" "$package_jni_dir/libgpuix_android.so"
-  else
-    echo "Building native Android library (profile=$rust_profile, jobs=$CARGO_BUILD_JOBS)..."
-    (
-      cd "$android_root/rust"
-      if [[ "$rust_profile" == "android-dev" ]]; then
-        case "$(basename "${RUSTC_WRAPPER:-}")" in
-          sccache*) unset RUSTC_WRAPPER ;;
-        esac
-      fi
-      if [[ "$rust_profile" == "release" ]]; then
-        profile_flag=(--release)
-      else
-        profile_flag=(--profile "$rust_profile")
-      fi
-      run_low_prio cargo ndk -t arm64-v8a -P 31 build "${profile_flag[@]}" --locked --lib "${cargo_features_arg[@]}"
-    )
+  for abi in "${target_abis[@]}"; do
+    case "$abi" in
+      arm64-v8a)
+        rust_triple="aarch64-linux-android"
+        cxx_triple="aarch64-linux-android"
+        ;;
+      armeabi-v7a)
+        rust_triple="armv7-linux-androideabi"
+        cxx_triple="arm-linux-androideabi"
+        ;;
+      x86_64)
+        rust_triple="x86_64-linux-android"
+        cxx_triple="x86_64-linux-android"
+        ;;
+      *)
+        echo "Unsupported Android ABI: $abi (expected arm64-v8a, armeabi-v7a, x86_64)" >&2
+        exit 1
+        ;;
+    esac
 
-    built_so="$CARGO_TARGET_DIR/aarch64-linux-android/${rust_profile}/libgpuix_android.so"
-    staging_so="$android_root/.build/libgpuix_android.stripped.tmp.$$"
-    trap 'rm -f "$staging_so"' EXIT
-    "$llvm_strip" --strip-unneeded -o "$staging_so" "$built_so"
-    if [[ "$shared_cache" == "1" ]]; then
-      mkdir -p "$native_cache_dir"
-      cp "$staging_so" "$cached_so.tmp.$$"
-      chmod +x "$cached_so.tmp.$$" 2>/dev/null || true
-      mv -f "$cached_so.tmp.$$" "$cached_so"
-      prune_native_cache "$cache_root/native"
+    GPUIX_HERMES_ABI="$abi" bash "$android_root/scripts/build-hermes.sh"
+
+    abi_jni_dir="$android_root/app/src/main/jniLibs/$abi"
+    mkdir -p "$abi_jni_dir"
+
+    native_key="$(compute_native_fingerprint "$abi" "$features_key" "$rustc_ver" "$zed_dirty")"
+    native_cache_dir="$cache_root/native/${native_key}_${abi}"
+    cached_so="$native_cache_dir/libgpuix_android.so"
+
+    if [[ "$shared_cache" == "1" ]] && [[ "${GPUIX_FORCE_NATIVE_REBUILD:-0}" != "1" ]] && [[ -f "$cached_so" ]]; then
+      echo "Native cache hit ($abi ${native_key:0:12}, profile=$rust_profile); skipping cargo ndk"
+      touch "$cached_so"
+      sync_file_if_changed "$cached_so" "$abi_jni_dir/libgpuix_android.so"
+    else
+      echo "Building native Android library ($abi, API 26+, profile=$rust_profile, jobs=$CARGO_BUILD_JOBS)..."
+      (
+        cd "$android_root/rust"
+        if [[ "$rust_profile" == "android-dev" ]]; then
+          case "$(basename "${RUSTC_WRAPPER:-}")" in
+            sccache*) unset RUSTC_WRAPPER ;;
+          esac
+        fi
+        if [[ "$rust_profile" == "release" ]]; then
+          profile_flag=(--release)
+        else
+          profile_flag=(--profile "$rust_profile")
+        fi
+        run_low_prio cargo ndk -t "$abi" -P 26 build "${profile_flag[@]}" --locked --lib "${cargo_features_arg[@]}"
+      )
+
+      built_so="$CARGO_TARGET_DIR/${rust_triple}/${rust_profile}/libgpuix_android.so"
+      staging_so="$android_root/.build/libgpuix_android.${abi}.stripped.tmp.$$"
+      trap 'rm -f "$staging_so"' EXIT
+      "$llvm_strip" --strip-unneeded -o "$staging_so" "$built_so"
+      if [[ "$shared_cache" == "1" ]]; then
+        mkdir -p "$native_cache_dir"
+        cp "$staging_so" "$cached_so.tmp.$$"
+        chmod +x "$cached_so.tmp.$$" 2>/dev/null || true
+        mv -f "$cached_so.tmp.$$" "$cached_so"
+        prune_native_cache "$cache_root/native"
+      fi
+      sync_file_if_changed "$staging_so" "$abi_jni_dir/libgpuix_android.so"
+      rm -f "$staging_so"
+      trap - EXIT
     fi
-    sync_file_if_changed "$staging_so" "$package_jni_dir/libgpuix_android.so"
-    rm -f "$staging_so"
-    trap - EXIT
-  fi
 
-  src_js_so="$android_root/.build/hermes-android/libgpuix_js.so"
-  js_so_hash="$(sha256_stream < "$src_js_so")"
-  js_strip_stamp="$android_root/.build/.stripped-js.sha256"
-  if [[ ! -f "$package_jni_dir/libgpuix_js.so" ]] || [[ ! -f "$js_strip_stamp" ]] || [[ "$(cat "$js_strip_stamp" 2>/dev/null || true)" != "$js_so_hash" ]]; then
-    staging_js="$android_root/.build/libgpuix_js.stripped.tmp.$$"
-    "$llvm_strip" --strip-unneeded -o "$staging_js" "$src_js_so"
-    sync_file_if_changed "$staging_js" "$package_jni_dir/libgpuix_js.so"
-    rm -f "$staging_js"
-    printf '%s\n' "$js_so_hash" > "$js_strip_stamp"
-  fi
+    src_js_so="$android_root/.build/hermes-android/libgpuix_js.so"
+    js_so_hash="$(sha256_stream < "$src_js_so")"
+    js_strip_stamp="$android_root/.build/.stripped-js.${abi}.sha256"
+    if [[ ! -f "$abi_jni_dir/libgpuix_js.so" ]] || [[ ! -f "$js_strip_stamp" ]] || [[ "$(cat "$js_strip_stamp" 2>/dev/null || true)" != "$js_so_hash" ]]; then
+      staging_js="$android_root/.build/libgpuix_js.${abi}.stripped.tmp.$$"
+      "$llvm_strip" --strip-unneeded -o "$staging_js" "$src_js_so"
+      sync_file_if_changed "$staging_js" "$abi_jni_dir/libgpuix_js.so"
+      rm -f "$staging_js"
+      printf '%s\n' "$js_so_hash" > "$js_strip_stamp"
+    fi
 
-  src_libcxx="$ndk_toolchain/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so"
-  sync_file_if_changed "$src_libcxx" "$package_jni_dir/libc++_shared.so"
+    src_libcxx="$ndk_toolchain/sysroot/usr/lib/${cxx_triple}/libc++_shared.so"
+    sync_file_if_changed "$src_libcxx" "$abi_jni_dir/libc++_shared.so"
+  done
 fi
 
 if (( bundle )); then

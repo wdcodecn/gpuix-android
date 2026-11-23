@@ -8,10 +8,12 @@ val gpuixProperties = Properties().apply {
         configFile.reader(Charsets.UTF_8).use(::load)
     }
 }
-val gpuixAppId = gpuixProperties.getProperty("appId") ?: "dev.gpuix.app"
+val gpuixAppId = gpuixProperties.getProperty("appId") ?: "dev.gpui.app"
 val gpuixAppName = gpuixProperties.getProperty("appName") ?: "GPUIX App"
 val gpuixVersionName = gpuixProperties.getProperty("versionName") ?: "0.1.0"
 val gpuixVersionCode = gpuixProperties.getProperty("versionCode")?.toIntOrNull() ?: 1
+val gpuixAbisRaw = gpuixProperties.getProperty("abis") ?: System.getenv("GPUIX_ABIS") ?: "arm64-v8a"
+val gpuixAbis = gpuixAbisRaw.split(",").map { it.trim() }.filter { it.isNotEmpty() }.ifEmpty { listOf("arm64-v8a") }
 
 android {
     namespace = gpuixAppId
@@ -32,11 +34,12 @@ android {
     }
     defaultConfig {
         applicationId = gpuixAppId
-        minSdk = 31
+        // Support Android 8.0+ (API 26) while keeping API 30+ capabilities runtime-gated.
+        minSdk = 26
         targetSdk = 37
         versionCode = gpuixVersionCode
         versionName = gpuixVersionName
-        ndk { abiFilters += "arm64-v8a" }
+        ndk { abiFilters += gpuixAbis }
         resValue("string", "gpuix_app_name", gpuixAppName)
     }
     buildTypes {

@@ -15,6 +15,8 @@ export type GpuixAndroidConfig = {
   versionCode: number
   /** Optional native Cargo features to enable (e.g. `["http-client", "rich-content"]`). */
   features?: string[]
+  /** Optional Android ABIs to package (e.g. `["arm64-v8a"]` or `["arm64-v8a", "armeabi-v7a"]`). */
+  abis?: string[]
 }
 
 const legacyDemoDefaults: GpuixAndroidConfig = {
@@ -68,6 +70,23 @@ function projectRelativePath(projectRoot: string, input: string): string {
  * project.
  */
 const allowedFeatures = new Set(['http-client', 'rich-content'])
+const allowedAbis = new Set(['arm64-v8a', 'armeabi-v7a'])
+
+function asAbisList(value: unknown): string[] | undefined {
+  if (value === undefined) return undefined
+  if (!Array.isArray(value)) {
+    configError('abis must be an array of Android ABI strings')
+  }
+  const normalized: string[] = []
+  for (const item of value) {
+    if (typeof item !== 'string' || !allowedAbis.has(item.trim())) {
+      configError('abis entries must be "arm64-v8a" or "armeabi-v7a"')
+    }
+    const name = item.trim()
+    if (!normalized.includes(name)) normalized.push(name)
+  }
+  return normalized.length > 0 ? normalized : undefined
+}
 
 function asFeaturesList(value: unknown): string[] | undefined {
   if (value === undefined) return undefined
@@ -120,6 +139,7 @@ export async function loadGpuixAndroidConfig(projectRoot: string): Promise<Gpuix
     versionName: asNonEmptyString(raw.versionName, 'versionName', legacyDemoDefaults.versionName),
     versionCode: asPositiveInteger(raw.versionCode, 'versionCode', legacyDemoDefaults.versionCode),
     features: asFeaturesList(raw.features),
+    abis: asAbisList(process.env.GPUIX_ABIS ? process.env.GPUIX_ABIS.split(',') : raw.abis),
   }
 
   if (!appIdPattern.test(config.appId)) {
@@ -165,6 +185,7 @@ export async function writeGradleProperties(targetRoot: string, config: GpuixAnd
     ? targetRoot
     : path.join(targetRoot, 'android')
   const outputPath = path.join(androidDir, '.build/gpuix.android.properties')
+  const abisValue = process.env.GPUIX_ABIS?.trim() || config.abis?.join(',') || 'arm64-v8a'
   await writeTextIfChanged(
     outputPath,
     [
@@ -173,6 +194,7 @@ export async function writeGradleProperties(targetRoot: string, config: GpuixAnd
       `appName=${escapeProperty(config.appName)}`,
       `versionName=${escapeProperty(config.versionName)}`,
       `versionCode=${config.versionCode}`,
+      `abis=${escapeProperty(abisValue)}`,
       '',
     ].join('\n'),
   )
@@ -191,14 +213,16 @@ if (import.meta.main) {
   const args = process.argv.slice(2)
   const field = valueAfter('--field', args)
   const projectRoot = valueAfter('--project', args) ?? path.resolve(import.meta.dir, '../..')
-  if (!field || !['entrypoint', 'appId', 'appName', 'versionName', 'versionCode', 'features'].includes(field)) {
-    throw new Error('Usage: bun config.ts --field entrypoint|appId|appName|versionName|versionCode|features [--project PROJECT_ROOT]')
+  if (!field || !['entrypoint', 'appId', 'appName', 'versionName', 'versionCode', 'features', 'abis'].includes(field)) {
+    throw new Error('Usage: bun config.ts --field entrypoint|appId|appName|versionName|versionCode|features|abis [--project PROJECT_ROOT]')
   }
   const config = await loadGpuixAndroidConfig(projectRoot)
   if (field === 'features') {
     if (config.features !== undefined) {
       process.stdout.write(`${config.features.join(',')}\n`)
     }
+  } else if (field === 'abis') {
+    process.stdout.write(`${config.abis?.join(',') ?? 'arm64-v8a'}\n`)
   } else {
     process.stdout.write(`${config[field as keyof GpuixAndroidConfig]}\n`)
   }

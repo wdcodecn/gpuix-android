@@ -1030,6 +1030,167 @@ pub fn is_terminal() -> bool {
     TERMINAL_MODE.load(std::sync::atomic::Ordering::Acquire)
 }
 
+#[cfg(all(not(all(target_arch = "wasm32", target_os = "unknown")), not(target_os = "android")))]
+static DESKTOP_KV_STORE: std::sync::OnceLock<Mutex<HashMap<String, String>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(all(not(all(target_arch = "wasm32", target_os = "unknown")), not(target_os = "android")))]
+fn desktop_kv_store() -> &'static Mutex<HashMap<String, String>> {
+    DESKTOP_KV_STORE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+#[napi]
+pub fn native_fetch(request_json: String) -> AsyncTask<crate::net::FetchTask> {
+    crate::net::spawn_fetch_task(request_json)
+}
+
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+#[napi]
+pub fn kv_get(key: String) -> Option<String> {
+    #[cfg(target_os = "android")]
+    {
+        gpui_mobile::android::jni::kv_get(&key)
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        desktop_kv_store().lock().unwrap().get(&key).cloned()
+    }
+}
+
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+#[napi]
+pub fn kv_set(key: String, value: String) -> bool {
+    #[cfg(target_os = "android")]
+    {
+        gpui_mobile::android::jni::kv_set(&key, &value)
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        desktop_kv_store().lock().unwrap().insert(key, value);
+        true
+    }
+}
+
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+#[napi]
+pub fn kv_remove(key: String) -> bool {
+    #[cfg(target_os = "android")]
+    {
+        gpui_mobile::android::jni::kv_remove(&key)
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        desktop_kv_store().lock().unwrap().remove(&key).is_some()
+    }
+}
+
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+#[napi]
+pub fn kv_clear() -> bool {
+    #[cfg(target_os = "android")]
+    {
+        gpui_mobile::android::jni::kv_clear()
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        desktop_kv_store().lock().unwrap().clear();
+        true
+    }
+}
+
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+#[napi]
+pub fn kv_keys() -> Vec<String> {
+    #[cfg(target_os = "android")]
+    {
+        let raw = gpui_mobile::android::jni::kv_keys_json();
+        serde_json::from_str(&raw).unwrap_or_default()
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        desktop_kv_store().lock().unwrap().keys().cloned().collect()
+    }
+}
+
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+#[napi]
+pub fn native_invoke(request_id: f64, module: String, method: String, args_json: String) -> bool {
+    #[cfg(target_os = "android")]
+    {
+        let id = request_id.max(0.0) as u64;
+        gpui_mobile::android::jni::invoke_native_bridge_async(id, &module, &method, &args_json)
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = (request_id, module, method, args_json);
+        false
+    }
+}
+
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+#[napi]
+pub fn ws_connect(socket_id: f64, url: String, headers_json: Option<String>) -> bool {
+    #[cfg(target_os = "android")]
+    {
+        let id = socket_id.max(0.0) as u64;
+        gpui_mobile::android::jni::ws_connect(id, &url, headers_json.as_deref().unwrap_or("{}"))
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = (socket_id, url, headers_json);
+        false
+    }
+}
+
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+#[napi]
+pub fn ws_send(socket_id: f64, text: Option<String>, binary_base64: Option<String>) -> bool {
+    #[cfg(target_os = "android")]
+    {
+        use base64::Engine as _;
+        let id = socket_id.max(0.0) as u64;
+        if let Some(b64) = binary_base64 {
+            match base64::engine::general_purpose::STANDARD.decode(&b64) {
+                Ok(bytes) => gpui_mobile::android::jni::ws_send_binary(id, &bytes),
+                Err(_) => false,
+            }
+        } else if let Some(msg) = text {
+            gpui_mobile::android::jni::ws_send_text(id, &msg)
+        } else {
+            false
+        }
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = (socket_id, text, binary_base64);
+        false
+    }
+}
+
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+#[napi]
+pub fn ws_close(socket_id: f64, code: Option<i32>, reason: Option<String>) {
+    #[cfg(target_os = "android")]
+    {
+        let id = socket_id.max(0.0) as u64;
+        gpui_mobile::android::jni::ws_close(id, code.unwrap_or(1000), reason.as_deref().unwrap_or(""));
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = (socket_id, code, reason);
+    }
+}
+
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+#[napi]
+pub fn move_app_to_back() {
+    #[cfg(target_os = "android")]
+    {
+        gpui_mobile::android::jni::move_app_to_back();
+    }
+}
+
 /// The main GPUI renderer exposed to Node.js.
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub(crate) type SharedWindowMetrics =
@@ -4165,6 +4326,9 @@ pub(crate) struct GpuixView {
     /// Tracks whether native motion was active on the previous frame (Android high-refresh toggle).
     #[cfg_attr(not(target_os = "android"), allow(dead_code))]
     motion_was_active: bool,
+    /// Tracks last Android TalkBack tree push `(subtree_revision, timestamp)` for throttling.
+    #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+    a11y_last_push: Rc<std::cell::Cell<Option<(u64, web_time::Instant)>>>,
 }
 
 #[derive(Default)]
@@ -4469,6 +4633,7 @@ impl GpuixView {
             last_reported_size: None,
             last_reported_insets: None,
             motion_was_active: false,
+            a11y_last_push: Rc::new(std::cell::Cell::new(None)),
         }
     }
 
@@ -5703,6 +5868,22 @@ impl gpui::Render for GpuixView {
         emit_motion_settled(&callback, &tree, &motion_settled);
         self.emit_selection_change(&callback);
 
+        let focused_element_id = window.focused(cx).and_then(|focused| {
+            self.focus_handles
+                .iter()
+                .find(|(_, handle)| handle.id() == focused.id())
+                .map(|(&id, _)| id)
+        });
+        let root_revision = tree
+            .root_id
+            .and_then(|root_id| tree.elements.get(&root_id))
+            .map(|el| el.subtree_revision)
+            .unwrap_or(0);
+        // Clone Arc so paint closure doesn't borrow `self.tree`.
+        let tree_arc_for_a11y = tree_arc.clone();
+        let a11y_last_push = self.a11y_last_push.clone();
+        let _ = (focused_element_id, root_revision, &tree_arc_for_a11y, &a11y_last_push);
+
         // The frame reset must paint BEFORE any text, so it is the first child of
         // the root wrapper. Without it the selection registry accumulates stale
         // entries across frames and a drag resolves against elements that are no
@@ -5712,7 +5893,7 @@ impl gpui::Render for GpuixView {
             let drag_move_view = cx.weak_entity();
             let drag_end_view = drag_move_view.clone();
             let root = gpui::div().size_full();
-            with_window_menu_actions(root)
+            let container = with_window_menu_actions(root)
                 .child(window_key_events(
                     callback.clone(),
                     self.window_key_down,
@@ -5741,8 +5922,15 @@ impl gpui::Render for GpuixView {
                     },
                 ))
                 .child(crate::automation::bounds_frame_reset())
-                .child(result)
-                .into_any_element()
+                .child(result);
+            #[cfg(target_os = "android")]
+            let container = container.child(android_a11y_sync(
+                tree_arc_for_a11y,
+                root_revision,
+                focused_element_id,
+                a11y_last_push,
+            ));
+            container.into_any_element()
         };
 
         // Sync scroll handles to thread_local so napi methods (scrollTo,
@@ -5801,21 +5989,22 @@ pub(crate) fn build_element(
         return gpui::Empty.into_any_element();
     };
 
-    let animated_style = if element.custom_props().contains_key("motion") {
+    let visible_motion = if element.custom_props().contains_key("motion") {
         ctx.motion_states
             .get(&id)
             .and_then(|state| state.visible_style(ctx.now))
-            .map(|style| {
-                // `Arc<StyleDesc>` is shared, so the animated frame is applied to a
-                // copy. Mutating through the pointer would restyle every element
-                // that declared the same style.
-                let mut resolved = element.style.as_deref().cloned().unwrap_or_default();
-                style.apply_to(&mut resolved);
-                resolved
-            })
     } else {
         None
     };
+    let animated_style = visible_motion.map(|style| {
+        // `Arc<StyleDesc>` is shared, so the animated frame is applied to a
+        // copy. Mutating through the pointer would restyle every element
+        // that declared the same style.
+        let mut resolved = element.style.as_deref().cloned().unwrap_or_default();
+        style.apply_to(&mut resolved);
+        resolved
+    });
+    let gpu_offset = visible_motion.and_then(|style| style.gpu_offset());
     let style = animated_style.as_ref().or(element.style.as_deref());
 
     // Inheritable style resolves once here so both built-ins and custom
@@ -5886,7 +6075,121 @@ pub(crate) fn build_element(
     };
 
     ctx.inherited = parent_inherited;
-    built
+    if let Some((dx, dy)) = gpu_offset {
+        MotionOffsetElement {
+            child: built,
+            offset: gpui::point(gpui::px(dx), gpui::px(dy)),
+        }
+        .into_any_element()
+    } else {
+        built
+    }
+}
+
+/// Zero-relayout GPU offset wrapper applied for `translateX` / `translateY`
+/// motion tracks via GPUI's prepaint `element_offset_stack`.
+struct MotionOffsetElement {
+    child: gpui::AnyElement,
+    offset: gpui::Point<gpui::Pixels>,
+}
+
+impl gpui::IntoElement for MotionOffsetElement {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+impl gpui::Element for MotionOffsetElement {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<gpui::ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _: Option<&gpui::GlobalElementId>,
+        _: Option<&gpui::InspectorElementId>,
+        window: &mut gpui::Window,
+        cx: &mut gpui::App,
+    ) -> (gpui::LayoutId, ()) {
+        (self.child.request_layout(window, cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _: Option<&gpui::GlobalElementId>,
+        _: Option<&gpui::InspectorElementId>,
+        _: gpui::Bounds<gpui::Pixels>,
+        _: &mut (),
+        window: &mut gpui::Window,
+        cx: &mut gpui::App,
+    ) {
+        window.with_element_offset(self.offset, |window| {
+            self.child.prepaint(window, cx);
+        });
+    }
+
+    fn paint(
+        &mut self,
+        _: Option<&gpui::GlobalElementId>,
+        _: Option<&gpui::InspectorElementId>,
+        _: gpui::Bounds<gpui::Pixels>,
+        _: &mut (),
+        _: &mut (),
+        window: &mut gpui::Window,
+        cx: &mut gpui::App,
+    ) {
+        self.child.paint(window, cx);
+    }
+}
+
+#[cfg(target_os = "android")]
+fn android_a11y_sync(
+    tree_arc: Arc<Mutex<RetainedTree>>,
+    revision: u64,
+    focused_id: Option<u64>,
+    last_push: Rc<std::cell::Cell<Option<(u64, web_time::Instant)>>>,
+) -> impl gpui::IntoElement {
+    use gpui::prelude::*;
+
+    gpui::canvas(
+        |_, _, _| (),
+        move |_, _, _, _| {
+            if !gpui_mobile::android::jni::is_a11y_enabled() {
+                return;
+            }
+            let now = web_time::Instant::now();
+            if let Some((prev_rev, prev_at)) = last_push.get() {
+                let elapsed = now.saturating_duration_since(prev_at);
+                if (prev_rev == revision && elapsed < Duration::from_millis(250))
+                    || elapsed < Duration::from_millis(80)
+                {
+                    return;
+                }
+            }
+            let Ok(tree) = tree_arc.try_lock() else {
+                return;
+            };
+            let bounds = crate::automation::all_bounds();
+            let nodes = crate::accessibility::collect_android_a11y_tree(&tree, &bounds, focused_id);
+            drop(tree);
+            if let Ok(json) = serde_json::to_string(&nodes) {
+                gpui_mobile::android::jni::update_a11y_tree_json(&json);
+                last_push.set(Some((revision, now)));
+            }
+        },
+    )
+    .absolute()
+    .w(gpui::px(0.0))
+    .h(gpui::px(0.0))
 }
 
 fn build_virtual_list(

@@ -122,6 +122,7 @@ if [[ "$(git -C "$libuv_source" rev-parse HEAD)" != "$(git -C "$libuv_source" re
   git -C "$libuv_source" checkout --detach "refs/tags/$libuv_tag"
 fi
 
+hermes_abi="${GPUIX_HERMES_ABI:-arm64-v8a}"
 hermesc_bin="$android_root/.build/hermes-host/bin/hermesc"
 if [[ -x "$android_root/.build/hermes-host/bin/hermesc.exe" ]]; then
   hermesc_bin="$android_root/.build/hermes-host/bin/hermesc.exe"
@@ -130,9 +131,9 @@ libgpuix_js="$android_root/.build/hermes-android/libgpuix_js.so"
 key_file="$android_root/.build/.hermes-key"
 
 hermes_cache_key="$({
-  printf 'v1\nuname=%s %s\nhermes=%s\nlibuv=%s\nndk=%s\n' \
-    "$(uname -s)" "$(uname -m)" "$hermes_commit" "$libuv_tag" "$(basename "$ndk_root")"
-  for f in "$android_root/hermes/CMakeLists.txt" "$android_root/hermes/gpuix_js.h" "$android_root/hermes/runner.cpp"; do
+  printf 'v2-api26\nuname=%s %s\nabi=%s\napi=26\nhermes=%s\nlibuv=%s\nndk=%s\n' \
+    "$(uname -s)" "$(uname -m)" "$hermes_abi" "$hermes_commit" "$libuv_tag" "$(basename "$ndk_root")"
+  for f in "$android_root/hermes/CMakeLists.txt" "$android_root/hermes/gpuix_js.h" "$android_root/hermes/runner.cpp" "$android_root/hermes/libuv_android_compat.h"; do
     printf 'file=%s sha256=%s\n' "$(basename "$f")" "$(sha256_stream < "$f")"
   done
 } | sha256_stream)"
@@ -183,6 +184,7 @@ if [[ "${GPUIX_FORCE_HERMES_REBUILD:-0}" != "1" ]] \
   && [[ "$libgpuix_js" -nt "$android_root/hermes/runner.cpp" ]] \
   && [[ "$libgpuix_js" -nt "$android_root/hermes/gpuix_js.h" ]] \
   && [[ "$libgpuix_js" -nt "$android_root/hermes/CMakeLists.txt" ]] \
+  && [[ "$libgpuix_js" -nt "$android_root/hermes/libuv_android_compat.h" ]] \
   && grep -qF "CMAKE_TOOLCHAIN_FILE:FILEPATH=$ndk_root/build/cmake/android.toolchain.cmake" "$android_root/.build/hermes-android/CMakeCache.txt" 2>/dev/null; then
   if [[ "$shared_cache" == "1" ]]; then
     mkdir -p "$shared_hermes_dir"
@@ -209,9 +211,16 @@ if [[ ! -x "$hermesc_bin" ]] || [[ "${GPUIX_FORCE_HERMES_REBUILD:-0}" == "1" ]];
     "${host_args[@]}"
   run_low_prio cmake --build "$android_root/.build/hermes-host" --target hermesc -j "$build_jobs"
 fi
+cmake_cache="$android_root/.build/hermes-android/CMakeCache.txt"
+if [[ -f "$cmake_cache" ]] && {
+  ! grep -qF "ANDROID_PLATFORM:STRING=android-26" "$cmake_cache" 2>/dev/null \
+  || ! grep -qF "ANDROID_ABI:STRING=${hermes_abi}" "$cmake_cache" 2>/dev/null
+}; then
+  rm -rf "$android_root/.build/hermes-android"
+fi
 cmake -S "$android_root/hermes" -B "$android_root/.build/hermes-android" -G Ninja \
   -DCMAKE_TOOLCHAIN_FILE="$ndk_root/build/cmake/android.toolchain.cmake" \
-  -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-28 -DANDROID_STL=c++_shared \
+  -DANDROID_ABI="$hermes_abi" -DANDROID_PLATFORM=android-26 -DANDROID_STL=c++_shared \
   -DCMAKE_BUILD_TYPE=MinSizeRel \
   -DIMPORT_HOST_COMPILERS="$android_root/.build/hermes-host/ImportHostCompilers.cmake"
 run_low_prio cmake --build "$android_root/.build/hermes-android" --target gpuix_js -j "$build_jobs"

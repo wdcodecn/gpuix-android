@@ -39,7 +39,9 @@
 #![allow(non_snake_case)]
 
 use std::{
+    collections::VecDeque,
     ffi::c_void,
+    mem::ManuallyDrop,
     sync::{
         atomic::{AtomicBool, AtomicU32, Ordering},
         Arc, OnceLock,
@@ -80,10 +82,95 @@ static TERM_WINDOW_PENDING: AtomicBool = AtomicBool::new(false);
 static INIT_WINDOW_PENDING: AtomicBool = AtomicBool::new(false);
 static WINDOW_RESIZED_PENDING: AtomicBool = AtomicBool::new(false);
 static LOW_MEMORY_LISTENER: parking_lot::RwLock<Option<fn()>> = parking_lot::RwLock::new(None);
+static BACK_PRESSED_LISTENER: parking_lot::RwLock<Option<fn()>> = parking_lot::RwLock::new(None);
+static DEEP_LINK_LISTENER: parking_lot::RwLock<Option<fn(String)>> = parking_lot::RwLock::new(None);
+static BRIDGE_RESULT_LISTENER: parking_lot::RwLock<Option<fn(u64, bool, String)>> =
+    parking_lot::RwLock::new(None);
+static BRIDGE_EVENT_LISTENER: parking_lot::RwLock<Option<fn(String, String)>> =
+    parking_lot::RwLock::new(None);
+#[allow(clippy::type_complexity)]
+static WS_EVENT_LISTENER: parking_lot::RwLock<
+    Option<fn(u64, String, Option<String>, Option<Vec<u8>>, i32, Option<String>)>,
+> = parking_lot::RwLock::new(None);
+static A11Y_ACTION_LISTENER: parking_lot::RwLock<Option<fn(u64, String, Option<String>)>> =
+    parking_lot::RwLock::new(None);
+static A11Y_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Software keyboard IME events delivered by `GpuiActivity.GpuiInputConnection`.
+#[derive(Debug, Clone)]
+pub enum ImeEvent {
+    CommitText(String),
+    SetComposingText(String),
+    FinishComposing,
+    DeleteSurrounding { before: i32, after: i32 },
+    EditorAction(i32),
+}
+
+static IME_EVENTS: parking_lot::Mutex<VecDeque<ImeEvent>> =
+    parking_lot::Mutex::new(VecDeque::new());
+
+fn wake_for_ime() {
+    if let Some(platform) = PLATFORM.get() {
+        if let Some(win) = platform.primary_window() {
+            win.schedule_frame();
+        }
+    }
+    if let Some(app) = ANDROID_APP.get() {
+        app.create_waker().wake();
+    }
+}
+
+/// Drain all queued IME events on the UI thread before building the frame.
+pub fn drain_ime_events() -> Vec<ImeEvent> {
+    let mut queue = IME_EVENTS.lock();
+    queue.drain(..).collect()
+}
+
+/// Returns `true` when at least one IME event awaits processing.
+pub fn has_pending_ime_events() -> bool {
+    !IME_EVENTS.lock().is_empty()
+}
 
 /// Register a listener invoked when Android delivers `MainEvent::LowMemory`.
 pub fn set_low_memory_listener(cb: fn()) {
     *LOW_MEMORY_LISTENER.write() = Some(cb);
+}
+
+/// Register a listener invoked when Android triggers system back / predictive back.
+pub fn set_back_pressed_listener(cb: fn()) {
+    *BACK_PRESSED_LISTENER.write() = Some(cb);
+}
+
+/// Register a listener invoked when an incoming deep link URL arrives.
+pub fn set_deep_link_listener(cb: fn(String)) {
+    *DEEP_LINK_LISTENER.write() = Some(cb);
+}
+
+/// Register a listener invoked when `GpuiNativeBridge` resolves an async call.
+pub fn set_bridge_result_listener(cb: fn(u64, bool, String)) {
+    *BRIDGE_RESULT_LISTENER.write() = Some(cb);
+}
+
+/// Register a listener invoked when `GpuiNativeBridge` emits a background event.
+pub fn set_bridge_event_listener(cb: fn(String, String)) {
+    *BRIDGE_EVENT_LISTENER.write() = Some(cb);
+}
+
+/// Register a listener invoked when `GpuiWebSocket` emits a socket event.
+pub fn set_ws_event_listener(
+    cb: fn(u64, String, Option<String>, Option<Vec<u8>>, i32, Option<String>),
+) {
+    *WS_EVENT_LISTENER.write() = Some(cb);
+}
+
+/// Register a listener invoked when TalkBack triggers an action on a node.
+pub fn set_a11y_action_listener(cb: fn(u64, String, Option<String>)) {
+    *A11Y_ACTION_LISTENER.write() = Some(cb);
+}
+
+/// Returns `true` when Android Accessibility / TalkBack is active.
+pub fn is_a11y_enabled() -> bool {
+    A11Y_ENABLED.load(Ordering::Acquire)
 }
 
 /// Read plain text from Android's system clipboard via `GpuiActivity.getClipboardText()`.
@@ -795,9 +882,7 @@ pub fn run_event_loop(app: &AndroidApp) {
     INIT_WINDOW_DONE.store(false, Ordering::Relaxed);
     let mut iteration: u64 = 0;
     let mut last_heartbeat = std::time::Instant::now();
-    let mut last_user_activity = std::time::Instant::now();
     let loop_started = std::time::Instant::now();
-    let mut deep_idle = false;
     let mut app_is_active = false;
 
     loop {
@@ -832,8 +917,6 @@ pub fn run_event_loop(app: &AndroidApp) {
             if let Some(platform) = PLATFORM.get() {
                 if let Some(window) = platform.primary_window() {
                     window.set_power_frame_rate(frame_rate);
-                    last_user_activity = now;
-                    deep_idle = false;
                 }
             }
         }
@@ -850,38 +933,27 @@ pub fn run_event_loop(app: &AndroidApp) {
             .and_then(|platform| platform.primary_window())
             .map(|window| {
                 (
-                    window.has_frame_request(),
+                    window.has_frame_request() || has_pending_ime_events(),
                     window.is_active() && window.is_interactive(),
                 )
             })
-            .unwrap_or((false, false));
+            .unwrap_or((has_pending_ime_events(), false));
         let external_demand = crate::android::vsync::has_external_demand();
         let vsync_requested = crate::android::vsync::is_requested();
-        let need_vsync = app_is_active
-            && INIT_WINDOW_DONE.load(Ordering::Relaxed)
-            && (frame_pending || interactive || external_demand || vsync_requested);
+        let can_render = app_is_active && INIT_WINDOW_DONE.load(Ordering::Relaxed);
+        let need_vsync =
+            can_render && (frame_pending || interactive || external_demand || vsync_requested);
         let hw_vsync = if need_vsync {
             crate::android::vsync::arm_if_needed()
         } else {
             false
         };
 
-        let idle_for = now.duration_since(last_user_activity);
-        if !deep_idle
-            && idle_for >= Duration::from_secs(60)
-            && !interactive
-            && !frame_pending
-            && !external_demand
-        {
-            if let Some(platform) = PLATFORM.get() {
-                if let Some(window) = platform.primary_window() {
-                    window.enter_deep_idle();
-                    log::info!("run_event_loop: deep idle after 60s without input");
-                }
-            }
-            deep_idle = true;
-        }
-        let poll_timeout = if crate::android::vsync::has_fired() {
+        let poll_timeout = if !can_render {
+            // Never busy-spin while backgrounded/unfocused/uninitialized:
+            // frame_pending or a late VSync is not consumed until active again.
+            Some(Duration::from_secs(1))
+        } else if crate::android::vsync::has_fired() {
             Some(Duration::ZERO)
         } else if need_vsync && hw_vsync {
             // Wait for hardware AChoreographer VSync callback (which wakes the
@@ -891,14 +963,10 @@ pub fn run_event_loop(app: &AndroidApp) {
             Some(Duration::ZERO)
         } else if interactive || external_demand {
             Some(Duration::from_millis(8))
-        } else if deep_idle {
+        } else {
             // Keep a finite NativeActivity poll so Android's InputDispatcher
             // can complete its acknowledgement handshake on OEM builds that
-            // do not wake a `None` timeout reliably. No frame is submitted in
-            // this watchdog path, so the extra wake is tiny compared with a
-            // continuously repainting surface.
-            Some(Duration::from_secs(1))
-        } else {
+            // do not wake a `None` timeout reliably.
             Some(Duration::from_secs(1))
         };
         app.poll_events(poll_timeout, |event| match event {
@@ -1047,7 +1115,6 @@ pub fn run_event_loop(app: &AndroidApp) {
         // 5. Pause / background
         if PAUSE_PENDING.swap(false, Ordering::Relaxed) {
             log::info!("deferred: Pause (iter={})", iteration);
-            deep_idle = false;
             crate::android::vsync::reset();
             if let Some(platform) = PLATFORM.get() {
                 platform.did_enter_background();
@@ -1062,8 +1129,6 @@ pub fn run_event_loop(app: &AndroidApp) {
         // 6. Resume / foreground
         if RESUME_PENDING.swap(false, Ordering::Relaxed) {
             log::info!("deferred: Resume (iter={})", iteration);
-            last_user_activity = std::time::Instant::now();
-            deep_idle = false;
             if let Some(platform) = PLATFORM.get() {
                 platform.did_become_active();
                 if let Some(win) = platform.primary_window() {
@@ -1137,9 +1202,15 @@ pub fn run_event_loop(app: &AndroidApp) {
                 platform.flush_main_thread_tasks();
                 if let Some(win) = platform.primary_window() {
                     if fired_ns.is_some() || !hw_vsync || iteration <= 4 {
-                        if win.take_frame_request() {
-                            win.request_frame();
-                        } else if fired_ns.is_some() && win.is_interactive() {
+                        let had_request = win.take_frame_request();
+                        let should_render =
+                            had_request || (fired_ns.is_some() && win.is_interactive());
+                        if should_render {
+                            // Arm next VSync on the dedicated VSync thread before rendering
+                            // so 120Hz (8.33ms) edges are never missed.
+                            if win.is_interactive() || crate::android::vsync::has_external_demand() {
+                                crate::android::vsync::arm_if_needed();
+                            }
                             win.request_frame();
                         }
                     }
@@ -1149,10 +1220,7 @@ pub fn run_event_loop(app: &AndroidApp) {
                 // (e.g. rotation triggers TerminateWindow while we were
                 // in get_current_texture / present).
                 drain_events(app);
-                if process_input_events(app) {
-                    last_user_activity = std::time::Instant::now();
-                    deep_idle = false;
-                }
+                process_input_events(app);
             }
         }
 
@@ -1562,31 +1630,422 @@ pub fn set_system_chrome(style: &crate::SystemChromeStyle) {
 
 // ── software keyboard (IME) control ───────────────────────────────────────────
 
-/// Show the software keyboard on Android with a specific keyboard type.
-/// Show the software keyboard on Android.
-///
-/// Uses the NDK `ANativeActivity_showSoftInput` via `android-activity`.
-/// The previous EditText/JNI approach silently failed with
-/// `CalledFromWrongThreadException` because all JNI View operations
-/// must run on the Android UI thread, not the native Rust thread.
-/// The NDK function handles the UI-thread dispatch internally.
-///
-/// Text input arrives via `KeyEvent`s through `process_input_events()`.
-pub fn show_keyboard_android(_keyboard_type: crate::KeyboardType) {
-    if let Some(app) = android_app() {
-        log::info!("show_keyboard_android: using NDK show_soft_input");
-        app.show_soft_input(false);
+/// Safely borrow a JVM-passed `jstring` parameter without letting `jni::objects::JString`
+/// drop or delete the JVM-owned local reference.
+pub(crate) unsafe fn borrow_jstring(env: &mut jni::Env<'_>, raw: *mut c_void) -> Option<String> {
+    if raw.is_null() {
+        return None;
+    }
+    let jstr = ManuallyDrop::new(unsafe { JString::from_raw(env, raw as _) });
+    Some(jstr.to_string())
+}
+
+/// Safely borrow a JVM-passed `jbyteArray` parameter and copy its contents into a `Vec<u8>`.
+pub(crate) unsafe fn borrow_jbyte_array(
+    env: &mut jni::Env<'_>,
+    raw: *mut c_void,
+) -> Option<Vec<u8>> {
+    if raw.is_null() {
+        return None;
+    }
+    let arr = ManuallyDrop::new(unsafe { jni::objects::JByteArray::from_raw(env, raw as _) });
+    env.convert_byte_array(&*arr).ok()
+}
+
+/// Show the software keyboard on Android via `GpuiActivity.showIme(keyboardType)`.
+/// Falls back to NDK `show_soft_input` if JNI invocation is unavailable.
+pub fn show_keyboard_android(keyboard_type: crate::KeyboardType) {
+    let type_code: i32 = match keyboard_type {
+        crate::KeyboardType::Default => 0,
+        crate::KeyboardType::EmailAddress => 1,
+        crate::KeyboardType::Phone => 2,
+        crate::KeyboardType::NumberPad => 3,
+        crate::KeyboardType::URL => 4,
+        crate::KeyboardType::Decimal => 5,
+    };
+    let ok = with_env(|env| {
+        let cls = find_app_class(env, "dev.gpui.mobile.GpuiActivity")?;
+        env.call_static_method(
+            &cls,
+            jni::jni_str!("showIme"),
+            jni::jni_sig!("(I)V"),
+            &[JValue::Int(type_code)],
+        )
+        .map_err(|e| {
+            env.exception_clear();
+            e.to_string()
+        })?;
+        Ok(())
+    })
+    .is_ok();
+    if !ok {
+        if let Some(app) = android_app() {
+            log::info!("show_keyboard_android: fallback to NDK show_soft_input");
+            app.show_soft_input(false);
+        }
     }
 }
 
-/// Hide the software keyboard on Android.
-///
-/// Uses the NDK `ANativeActivity_hideSoftInput` via `android-activity`.
+/// Hide the software keyboard on Android via `GpuiActivity.hideIme()`.
 pub fn hide_keyboard_android() {
-    if let Some(app) = android_app() {
-        log::info!("hide_keyboard_android: using NDK hide_soft_input");
-        app.hide_soft_input(false);
+    let ok = with_env(|env| {
+        let cls = find_app_class(env, "dev.gpui.mobile.GpuiActivity")?;
+        env.call_static_method(&cls, jni::jni_str!("hideIme"), jni::jni_sig!("()V"), &[])
+            .map_err(|e| {
+                env.exception_clear();
+                e.to_string()
+            })?;
+        Ok(())
+    })
+    .is_ok();
+    if !ok {
+        if let Some(app) = android_app() {
+            log::info!("hide_keyboard_android: fallback to NDK hide_soft_input");
+            app.hide_soft_input(false);
+        }
     }
+}
+
+/// Update the IME insertion cursor / candidate anchor on Android via `GpuiActivity.updateImeCursor`.
+pub fn update_ime_cursor(x: f32, y: f32, height: f32) {
+    let _ = with_env(|env| {
+        let cls = find_app_class(env, "dev.gpui.mobile.GpuiActivity")?;
+        env.call_static_method(
+            &cls,
+            jni::jni_str!("updateImeCursor"),
+            jni::jni_sig!("(FFF)V"),
+            &[JValue::Float(x), JValue::Float(y), JValue::Float(height)],
+        )
+        .map_err(|e| {
+            env.exception_clear();
+            e.to_string()
+        })?;
+        Ok(())
+    });
+}
+
+/// Move task to background via `GpuiActivity.moveAppToBack()`.
+pub fn move_app_to_back() {
+    let _ = with_env(|env| {
+        let cls = find_app_class(env, "dev.gpui.mobile.GpuiActivity")?;
+        env.call_static_method(
+            &cls,
+            jni::jni_str!("moveAppToBack"),
+            jni::jni_sig!("()V"),
+            &[],
+        )
+        .map_err(|e| {
+            env.exception_clear();
+            e.to_string()
+        })?;
+        Ok(())
+    });
+}
+
+/// Invoke an async native module method on `GpuiNativeBridge`.
+pub fn invoke_native_bridge_async(
+    request_id: u64,
+    module: &str,
+    method: &str,
+    args_json: &str,
+) -> bool {
+    with_env(|env| {
+        let cls = find_app_class(env, "dev.gpui.mobile.GpuiNativeBridge")?;
+        let jmodule = env.new_string(module).e()?;
+        let jmethod = env.new_string(method).e()?;
+        let jargs = env.new_string(args_json).e()?;
+        env.call_static_method(
+            &cls,
+            jni::jni_str!("invokeAsync"),
+            jni::jni_sig!("(JLjava/lang/String;Ljava/lang/String;Ljava/lang/String;)V"),
+            &[
+                JValue::Long(request_id as i64),
+                JValue::Object(&jmodule),
+                JValue::Object(&jmethod),
+                JValue::Object(&jargs),
+            ],
+        )
+        .map_err(|e| {
+            env.exception_clear();
+            e.to_string()
+        })?;
+        Ok(())
+    })
+    .is_ok()
+}
+
+pub fn kv_get(key: &str) -> Option<String> {
+    with_env(|env| {
+        let cls = find_app_class(env, "dev.gpui.mobile.GpuiNativeBridge")?;
+        let jkey = env.new_string(key).e()?;
+        let val = env
+            .call_static_method(
+                &cls,
+                jni::jni_str!("kvGet"),
+                jni::jni_sig!("(Ljava/lang/String;)Ljava/lang/String;"),
+                &[JValue::Object(&jkey)],
+            )
+            .and_then(|v| v.l())
+            .map_err(|e| {
+                env.exception_clear();
+                e.to_string()
+            })?;
+        if val.is_null() {
+            return Ok(None);
+        }
+        Ok(Some(get_string(env, &val)))
+    })
+    .ok()
+    .flatten()
+}
+
+pub fn kv_set(key: &str, value: &str) -> bool {
+    with_env(|env| {
+        let cls = find_app_class(env, "dev.gpui.mobile.GpuiNativeBridge")?;
+        let jkey = env.new_string(key).e()?;
+        let jval = env.new_string(value).e()?;
+        env.call_static_method(
+            &cls,
+            jni::jni_str!("kvSet"),
+            jni::jni_sig!("(Ljava/lang/String;Ljava/lang/String;)Z"),
+            &[JValue::Object(&jkey), JValue::Object(&jval)],
+        )
+        .and_then(|v| v.z())
+        .map_err(|e| {
+            env.exception_clear();
+            e.to_string()
+        })
+    })
+    .unwrap_or(false)
+}
+
+pub fn kv_remove(key: &str) -> bool {
+    with_env(|env| {
+        let cls = find_app_class(env, "dev.gpui.mobile.GpuiNativeBridge")?;
+        let jkey = env.new_string(key).e()?;
+        env.call_static_method(
+            &cls,
+            jni::jni_str!("kvRemove"),
+            jni::jni_sig!("(Ljava/lang/String;)Z"),
+            &[JValue::Object(&jkey)],
+        )
+        .and_then(|v| v.z())
+        .map_err(|e| {
+            env.exception_clear();
+            e.to_string()
+        })
+    })
+    .unwrap_or(false)
+}
+
+pub fn kv_clear() -> bool {
+    with_env(|env| {
+        let cls = find_app_class(env, "dev.gpui.mobile.GpuiNativeBridge")?;
+        env.call_static_method(&cls, jni::jni_str!("kvClear"), jni::jni_sig!("()Z"), &[])
+            .and_then(|v| v.z())
+            .map_err(|e| {
+                env.exception_clear();
+                e.to_string()
+            })
+    })
+    .unwrap_or(false)
+}
+
+pub fn kv_keys_json() -> String {
+    with_env(|env| {
+        let cls = find_app_class(env, "dev.gpui.mobile.GpuiNativeBridge")?;
+        let val = env
+            .call_static_method(
+                &cls,
+                jni::jni_str!("kvKeysJson"),
+                jni::jni_sig!("()Ljava/lang/String;"),
+                &[],
+            )
+            .and_then(|v| v.l())
+            .map_err(|e| {
+                env.exception_clear();
+                e.to_string()
+            })?;
+        if val.is_null() {
+            return Ok("[]".to_string());
+        }
+        Ok(get_string(env, &val))
+    })
+    .unwrap_or_else(|_| "[]".to_string())
+}
+
+pub fn secure_write(service: &str, account: &str, base64_value: &str) -> bool {
+    with_env(|env| {
+        let cls = find_app_class(env, "dev.gpui.mobile.GpuiNativeBridge")?;
+        let jservice = env.new_string(service).e()?;
+        let jaccount = env.new_string(account).e()?;
+        let jval = env.new_string(base64_value).e()?;
+        env.call_static_method(
+            &cls,
+            jni::jni_str!("secureWrite"),
+            jni::jni_sig!("(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)Z"),
+            &[
+                JValue::Object(&jservice),
+                JValue::Object(&jaccount),
+                JValue::Object(&jval),
+            ],
+        )
+        .and_then(|v| v.z())
+        .map_err(|e| {
+            env.exception_clear();
+            e.to_string()
+        })
+    })
+    .unwrap_or(false)
+}
+
+pub fn secure_read(service: &str, account: &str) -> Option<String> {
+    with_env(|env| {
+        let cls = find_app_class(env, "dev.gpui.mobile.GpuiNativeBridge")?;
+        let jservice = env.new_string(service).e()?;
+        let jaccount = env.new_string(account).e()?;
+        let val = env
+            .call_static_method(
+                &cls,
+                jni::jni_str!("secureRead"),
+                jni::jni_sig!("(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;"),
+                &[JValue::Object(&jservice), JValue::Object(&jaccount)],
+            )
+            .and_then(|v| v.l())
+            .map_err(|e| {
+                env.exception_clear();
+                e.to_string()
+            })?;
+        if val.is_null() {
+            return Ok(None);
+        }
+        Ok(Some(get_string(env, &val)))
+    })
+    .ok()
+    .flatten()
+}
+
+pub fn secure_delete(service: &str, account: &str) -> bool {
+    with_env(|env| {
+        let cls = find_app_class(env, "dev.gpui.mobile.GpuiNativeBridge")?;
+        let jservice = env.new_string(service).e()?;
+        let jaccount = env.new_string(account).e()?;
+        env.call_static_method(
+            &cls,
+            jni::jni_str!("secureDelete"),
+            jni::jni_sig!("(Ljava/lang/String;Ljava/lang/String;)Z"),
+            &[JValue::Object(&jservice), JValue::Object(&jaccount)],
+        )
+        .and_then(|v| v.z())
+        .map_err(|e| {
+            env.exception_clear();
+            e.to_string()
+        })
+    })
+    .unwrap_or(false)
+}
+
+pub fn ws_connect(socket_id: u64, url: &str, headers_json: &str) -> bool {
+    with_env(|env| {
+        let cls = find_app_class(env, "dev.gpui.mobile.GpuiWebSocket")?;
+        let jurl = env.new_string(url).e()?;
+        let jheaders = env.new_string(headers_json).e()?;
+        env.call_static_method(
+            &cls,
+            jni::jni_str!("connect"),
+            jni::jni_sig!("(JLjava/lang/String;Ljava/lang/String;)Z"),
+            &[
+                JValue::Long(socket_id as i64),
+                JValue::Object(&jurl),
+                JValue::Object(&jheaders),
+            ],
+        )
+        .and_then(|v| v.z())
+        .map_err(|e| {
+            env.exception_clear();
+            e.to_string()
+        })
+    })
+    .unwrap_or(false)
+}
+
+pub fn ws_send_text(socket_id: u64, text: &str) -> bool {
+    with_env(|env| {
+        let cls = find_app_class(env, "dev.gpui.mobile.GpuiWebSocket")?;
+        let jtext = env.new_string(text).e()?;
+        env.call_static_method(
+            &cls,
+            jni::jni_str!("sendText"),
+            jni::jni_sig!("(JLjava/lang/String;)Z"),
+            &[JValue::Long(socket_id as i64), JValue::Object(&jtext)],
+        )
+        .and_then(|v| v.z())
+        .map_err(|e| {
+            env.exception_clear();
+            e.to_string()
+        })
+    })
+    .unwrap_or(false)
+}
+
+pub fn ws_send_binary(socket_id: u64, data: &[u8]) -> bool {
+    with_env(|env| {
+        let cls = find_app_class(env, "dev.gpui.mobile.GpuiWebSocket")?;
+        let jbytes = env.byte_array_from_slice(data).e()?;
+        let jobj: JObject = jbytes.into();
+        env.call_static_method(
+            &cls,
+            jni::jni_str!("sendBinary"),
+            jni::jni_sig!("(J[B)Z"),
+            &[JValue::Long(socket_id as i64), JValue::Object(&jobj)],
+        )
+        .and_then(|v| v.z())
+        .map_err(|e| {
+            env.exception_clear();
+            e.to_string()
+        })
+    })
+    .unwrap_or(false)
+}
+
+pub fn ws_close(socket_id: u64, code: i32, reason: &str) {
+    let _ = with_env(|env| {
+        let cls = find_app_class(env, "dev.gpui.mobile.GpuiWebSocket")?;
+        let jreason = env.new_string(reason).e()?;
+        env.call_static_method(
+            &cls,
+            jni::jni_str!("close"),
+            jni::jni_sig!("(JILjava/lang/String;)V"),
+            &[
+                JValue::Long(socket_id as i64),
+                JValue::Int(code),
+                JValue::Object(&jreason),
+            ],
+        )
+        .map_err(|e| {
+            env.exception_clear();
+            e.to_string()
+        })?;
+        Ok(())
+    });
+}
+
+pub fn update_a11y_tree_json(json: &str) {
+    let _ = with_env(|env| {
+        let cls = find_app_class(env, "dev.gpui.mobile.GpuiAccessibilityBridge")?;
+        let jjson = env.new_string(json).e()?;
+        env.call_static_method(
+            &cls,
+            jni::jni_str!("updateTreeJson"),
+            jni::jni_sig!("(Ljava/lang/String;)V"),
+            &[JValue::Object(&jjson)],
+        )
+        .map_err(|e| {
+            env.exception_clear();
+            e.to_string()
+        })?;
+        Ok(())
+    });
 }
 
 // ── tests ─────────────────────────────────────────────────────────────────────
@@ -1651,21 +2110,192 @@ pub unsafe extern "C" fn Java_dev_gpui_mobile_GpuiActivity_nativeOnDeepLink(
     _class: *mut std::ffi::c_void,
     url: *mut std::ffi::c_void,
 ) {
-    // We already have a JVM attached on this thread (UI thread).
-    // Use with_env to get a properly wrapped Env handle.
-    let url_raw = url as jni::sys::jobject;
     let _ = with_env(|env| {
-        let url_obj = unsafe { JObject::from_raw(env, url_raw) };
-        let url_string = get_string(env, &url_obj);
-        // Don't let the JObject be dropped (it's owned by the JNI call frame).
+        let Some(url_string) = (unsafe { borrow_jstring(env, url) }) else {
+            return Ok(());
+        };
         if url_string.is_empty() {
             return Ok(());
         }
         log::info!("nativeOnDeepLink: {}", url_string);
 
+        if let Some(cb) = *DEEP_LINK_LISTENER.read() {
+            cb(url_string.clone());
+        }
         #[cfg(feature = "deeplink")]
         {
             crate::packages::deeplink::notify_deep_link(&url_string);
+        }
+        Ok(())
+    });
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Java_dev_gpui_mobile_GpuiActivity_nativeImeCommitText(
+    _env: *mut std::ffi::c_void,
+    _class: *mut std::ffi::c_void,
+    text: *mut std::ffi::c_void,
+) {
+    let _ = with_env(|env| {
+        if let Some(text) = unsafe { borrow_jstring(env, text) } {
+            IME_EVENTS.lock().push_back(ImeEvent::CommitText(text));
+            wake_for_ime();
+        }
+        Ok(())
+    });
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Java_dev_gpui_mobile_GpuiActivity_nativeImeSetComposingText(
+    _env: *mut std::ffi::c_void,
+    _class: *mut std::ffi::c_void,
+    text: *mut std::ffi::c_void,
+) {
+    let _ = with_env(|env| {
+        let text = unsafe { borrow_jstring(env, text) }.unwrap_or_default();
+        IME_EVENTS
+            .lock()
+            .push_back(ImeEvent::SetComposingText(text));
+        wake_for_ime();
+        Ok(())
+    });
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Java_dev_gpui_mobile_GpuiActivity_nativeImeFinishComposing(
+    _env: *mut std::ffi::c_void,
+    _class: *mut std::ffi::c_void,
+) {
+    IME_EVENTS.lock().push_back(ImeEvent::FinishComposing);
+    wake_for_ime();
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Java_dev_gpui_mobile_GpuiActivity_nativeImeDeleteSurrounding(
+    _env: *mut std::ffi::c_void,
+    _class: *mut std::ffi::c_void,
+    before: i32,
+    after: i32,
+) {
+    IME_EVENTS
+        .lock()
+        .push_back(ImeEvent::DeleteSurrounding { before, after });
+    wake_for_ime();
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Java_dev_gpui_mobile_GpuiActivity_nativeImeEditorAction(
+    _env: *mut std::ffi::c_void,
+    _class: *mut std::ffi::c_void,
+    action_code: i32,
+) {
+    IME_EVENTS
+        .lock()
+        .push_back(ImeEvent::EditorAction(action_code));
+    wake_for_ime();
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Java_dev_gpui_mobile_GpuiActivity_nativeBackPressed(
+    _env: *mut std::ffi::c_void,
+    _class: *mut std::ffi::c_void,
+) {
+    if let Some(cb) = *BACK_PRESSED_LISTENER.read() {
+        cb();
+    } else {
+        move_app_to_back();
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Java_dev_gpui_mobile_GpuiNativeBridge_nativeBridgeResult(
+    _env: *mut std::ffi::c_void,
+    _class: *mut std::ffi::c_void,
+    request_id: i64,
+    ok: u8,
+    payload_json: *mut std::ffi::c_void,
+) {
+    let _ = with_env(|env| {
+        let payload = unsafe { borrow_jstring(env, payload_json) }.unwrap_or_else(|| "null".into());
+        if let Some(cb) = *BRIDGE_RESULT_LISTENER.read() {
+            cb(request_id.max(0) as u64, ok != 0, payload);
+        }
+        Ok(())
+    });
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Java_dev_gpui_mobile_GpuiNativeBridge_nativeBridgeEvent(
+    _env: *mut std::ffi::c_void,
+    _class: *mut std::ffi::c_void,
+    channel: *mut std::ffi::c_void,
+    payload_json: *mut std::ffi::c_void,
+) {
+    let _ = with_env(|env| {
+        let channel = unsafe { borrow_jstring(env, channel) }.unwrap_or_default();
+        let payload = unsafe { borrow_jstring(env, payload_json) }.unwrap_or_else(|| "null".into());
+        if let Some(cb) = *BRIDGE_EVENT_LISTENER.read() {
+            cb(channel, payload);
+        }
+        Ok(())
+    });
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Java_dev_gpui_mobile_GpuiWebSocket_nativeWsEvent(
+    _env: *mut std::ffi::c_void,
+    _class: *mut std::ffi::c_void,
+    socket_id: i64,
+    event_type: *mut std::ffi::c_void,
+    text_payload: *mut std::ffi::c_void,
+    binary_payload: *mut std::ffi::c_void,
+    code: i32,
+    reason: *mut std::ffi::c_void,
+) {
+    let _ = with_env(|env| {
+        let event_type = unsafe { borrow_jstring(env, event_type) }.unwrap_or_default();
+        let text = unsafe { borrow_jstring(env, text_payload) };
+        let binary = unsafe { borrow_jbyte_array(env, binary_payload) };
+        let reason = unsafe { borrow_jstring(env, reason) };
+        if let Some(cb) = *WS_EVENT_LISTENER.read() {
+            cb(
+                socket_id.max(0) as u64,
+                event_type,
+                text,
+                binary,
+                code,
+                reason,
+            );
+        }
+        Ok(())
+    });
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Java_dev_gpui_mobile_GpuiAccessibilityBridge_nativeA11yStateChanged(
+    _env: *mut std::ffi::c_void,
+    _class: *mut std::ffi::c_void,
+    enabled: u8,
+) {
+    A11Y_ENABLED.store(enabled != 0, Ordering::Release);
+    if enabled != 0 {
+        wake_for_ime();
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Java_dev_gpui_mobile_GpuiAccessibilityBridge_nativeA11yAction(
+    _env: *mut std::ffi::c_void,
+    _class: *mut std::ffi::c_void,
+    node_id: i64,
+    action: *mut std::ffi::c_void,
+    arg: *mut std::ffi::c_void,
+) {
+    let _ = with_env(|env| {
+        let action = unsafe { borrow_jstring(env, action) }.unwrap_or_default();
+        let arg = unsafe { borrow_jstring(env, arg) };
+        if let Some(cb) = *A11Y_ACTION_LISTENER.read() {
+            cb(node_id.max(0) as u64, action, arg);
         }
         Ok(())
     });

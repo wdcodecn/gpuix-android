@@ -407,6 +407,7 @@ impl CustomElement for TextEditorElement {
                     content_height: 20.0,
                     content_width: 0.0,
                     display_is_placeholder: false,
+                    layout_cache: None,
                     caret_color,
                     blink_anchor: cx.background_executor().now(),
                     blink_task: None,
@@ -643,6 +644,18 @@ fn push_undo_snapshot(history: &mut VecDeque<EditSnapshot>, snapshot: EditSnapsh
     history.push_back(snapshot);
 }
 
+#[derive(PartialEq)]
+struct EditorLayoutCacheKey {
+    display: SharedString,
+    is_placeholder: bool,
+    marked_range: Option<Range<usize>>,
+    wrap_width_bits: Option<u32>,
+    font: gpui::Font,
+    font_size_bits: u32,
+    line_height_bits: u32,
+    color: gpui::Hsla,
+}
+
 struct TextEditorState {
     element_id: u64,
     callback: Option<EventCallback>,
@@ -675,6 +688,7 @@ struct TextEditorState {
     content_height: f32,
     content_width: f32,
     display_is_placeholder: bool,
+    layout_cache: Option<EditorLayoutCacheKey>,
     caret_color: gpui::Hsla,
     blink_anchor: Instant,
     blink_task: Option<Task<()>>,
@@ -1410,9 +1424,27 @@ impl TextEditorState {
         } else {
             style.color
         };
+        let wrap_width = self.multiline.then_some(width);
+        let font = style.font();
+        let marked_for_key = (!is_placeholder)
+            .then(|| self.marked_range.clone())
+            .flatten();
+        let cache_key = EditorLayoutCacheKey {
+            display: display.clone(),
+            is_placeholder,
+            marked_range: marked_for_key,
+            wrap_width_bits: wrap_width.map(|w| f32::from(w).to_bits()),
+            font: font.clone(),
+            font_size_bits: f32::from(font_size).to_bits(),
+            line_height_bits: f32::from(self.line_height).to_bits(),
+            color,
+        };
+        if self.layout_cache.as_ref() == Some(&cache_key) && !self.last_lines.is_empty() {
+            return self.content_height;
+        }
         let run = |len: usize, underline: bool| TextRun {
             len,
-            font: style.font(),
+            font: font.clone(),
             color,
             background_color: None,
             underline: underline.then_some(UnderlineStyle {
@@ -1433,7 +1465,6 @@ impl TextEditorState {
             .collect(),
             _ => vec![run(display.len(), false)],
         };
-        let wrap_width = self.multiline.then_some(width);
         let lines = window
             .text_system()
             .shape_text(display, font_size, &runs, wrap_width, None)
@@ -1460,6 +1491,7 @@ impl TextEditorState {
         self.display_is_placeholder = is_placeholder;
         self.last_lines = lines;
         self.line_starts = line_starts;
+        self.layout_cache = Some(cache_key);
         self.content_height
     }
 

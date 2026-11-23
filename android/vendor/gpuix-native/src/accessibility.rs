@@ -212,6 +212,149 @@ fn role_from_aria(token: &str) -> Option<Role> {
     })
 }
 
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct A11yNodeSnapshot {
+    pub id: u64,
+    pub role: String,
+    pub label: String,
+    pub value: String,
+    pub clickable: bool,
+    pub checkable: bool,
+    pub checked: bool,
+    pub enabled: bool,
+    pub focused: bool,
+    /// Logical dp `[x, y, width, height]`; GpuiAccessibilityBridge scales by display density.
+    pub bounds: [f64; 4],
+}
+
+fn collect_descendant_text(
+    tree: &crate::retained_tree::RetainedTree,
+    id: u64,
+    out: &mut String,
+) {
+    let Some(el) = tree.elements.get(&id) else {
+        return;
+    };
+    if let Some(content) = &el.content {
+        if !content.is_empty() {
+            if !out.is_empty() {
+                out.push(' ');
+            }
+            out.push_str(content);
+        }
+    }
+    for &child_id in &el.children {
+        if out.len() >= 256 {
+            break;
+        }
+        collect_descendant_text(tree, child_id, out);
+    }
+}
+
+pub(crate) fn collect_android_a11y_tree(
+    tree: &crate::retained_tree::RetainedTree,
+    bounds: &HashMap<u64, crate::automation::ElementBounds>,
+    focused_id: Option<u64>,
+) -> Vec<A11yNodeSnapshot> {
+    let Some(root_id) = tree.root_id else {
+        return Vec::new();
+    };
+    let mut nodes = Vec::new();
+    let mut stack = vec![root_id];
+
+    while let Some(id) = stack.pop() {
+        let Some(el) = tree.elements.get(&id) else {
+            continue;
+        };
+        for &child in el.children.iter().rev() {
+            stack.push(child);
+        }
+
+        let props = el.custom_props();
+        let explicit_role = props.get("role").and_then(|v| v.as_str());
+        if matches!(explicit_role, Some("none" | "presentation")) {
+            continue;
+        }
+
+        let Some(b) = bounds.get(&id) else {
+            continue;
+        };
+        if b.width <= 0.5 || b.height <= 0.5 {
+            continue;
+        }
+
+        let clickable = el.events().contains("click");
+        let aria_label = string_prop(props, "aria-label").unwrap_or_default();
+        let aria_value = string_prop(props, "aria-valuetext").unwrap_or_default();
+        let role_str = explicit_role
+            .map(str::to_string)
+            .unwrap_or_else(|| match el.element_type.as_str() {
+                "input" | "textarea" => "textbox".to_string(),
+                "img" => "img".to_string(),
+                "text" => "text".to_string(),
+                _ if clickable => "button".to_string(),
+                _ => "generic".to_string(),
+            });
+
+        let aria_checked = props.get("aria-checked");
+        let checkable = aria_checked.is_some()
+            || matches!(role_str.as_str(), "checkbox" | "switch" | "radio");
+        let checked = aria_checked
+            .and_then(|v| v.as_bool())
+            .or_else(|| aria_checked.and_then(|v| v.as_str()).map(|s| s == "true"))
+            .unwrap_or(false);
+        let enabled = !bool_prop(props, "aria-disabled").unwrap_or(false);
+        let focused = focused_id == Some(id);
+
+        let is_semantic = clickable
+            || !aria_label.is_empty()
+            || !aria_value.is_empty()
+            || explicit_role.is_some()
+            || matches!(el.element_type.as_str(), "input" | "textarea" | "img")
+            || (el.element_type == "text"
+                && el.content.as_ref().is_some_and(|c| !c.trim().is_empty()));
+
+        if !is_semantic {
+            continue;
+        }
+
+        let mut label = aria_label;
+        if label.is_empty() {
+            if el.element_type == "text" {
+                label = el.content.clone().unwrap_or_default();
+            } else if clickable {
+                collect_descendant_text(tree, id, &mut label);
+            } else if el.element_type == "img" {
+                label = string_prop(props, "alt").unwrap_or_default();
+            }
+        }
+
+        let value = if !aria_value.is_empty() {
+            aria_value
+        } else if matches!(el.element_type.as_str(), "input" | "textarea") {
+            string_prop(props, "value").unwrap_or_default()
+        } else {
+            String::new()
+        };
+
+        nodes.push(A11yNodeSnapshot {
+            id,
+            role: role_str,
+            label,
+            value,
+            clickable,
+            checkable,
+            checked,
+            enabled,
+            focused,
+            bounds: [b.x, b.y, b.width, b.height],
+        });
+    }
+
+    nodes
+}
+
 #[cfg(test)]
 mod tests {
     use super::role_from_aria;
