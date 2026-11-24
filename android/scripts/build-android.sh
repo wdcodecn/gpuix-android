@@ -413,6 +413,38 @@ else
 
     src_libcxx="$ndk_toolchain/sysroot/usr/lib/${cxx_triple}/libc++_shared.so"
     sync_file_if_changed "$src_libcxx" "$abi_jni_dir/libc++_shared.so"
+
+    case "$abi" in
+      arm64-v8a|x86_64)
+        readelf_bin="$ndk_toolchain/bin/llvm-readelf"
+        if [[ -x "$readelf_bin" || -x "${readelf_bin}.exe" ]]; then
+          for so_file in "$abi_jni_dir"/*.so; do
+            [[ -f "$so_file" ]] || continue
+            GPUIX_CHECK_SO="$so_file" GPUIX_READELF="$readelf_bin" bun -e '
+              const { execFileSync } = require("node:child_process");
+              const so = process.env.GPUIX_CHECK_SO;
+              const readelf = process.env.GPUIX_READELF;
+              const out = execFileSync(readelf, ["-l", "--wide", so], { encoding: "utf8" });
+              const loadLines = out.split(/\r?\n/).filter((l) => /^\s*LOAD\s+/.test(l));
+              if (loadLines.length === 0) {
+                console.error(`16KB alignment check failed: no LOAD segments in ${so}`);
+                process.exit(1);
+              }
+              for (const line of loadLines) {
+                const cols = line.trim().split(/\s+/);
+                const alignRaw = cols[cols.length - 1] || "";
+                const align = Number(alignRaw);
+                if (!Number.isFinite(align) || align < 0x4000) {
+                  console.error(`16KB alignment check failed for ${so}: LOAD segment alignment ${alignRaw} (< 0x4000)`);
+                  process.exit(1);
+                }
+              }
+            '
+          done
+          echo "Verified 16KB ELF LOAD alignment ($abi)"
+        fi
+        ;;
+    esac
   done
 fi
 

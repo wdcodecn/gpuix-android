@@ -10,5 +10,5 @@
     "skipLibCheck": true,
     "noEmit": true
   },
-  "include": ["scripts/**/*.ts", "android/scripts/**/*.ts"]
+  "include": ["scripts/**/*.ts", "android/scripts/**/*.ts", "android/runtime/**/*.ts", "tests/**/*.ts"]
 }

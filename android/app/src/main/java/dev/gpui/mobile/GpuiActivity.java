@@ -270,15 +270,19 @@ public class GpuiActivity extends NativeActivity {
 
     @Override
     protected void onPause() {
-        GpuiPlatformView.pauseAll();
+        if (sInstance == this) {
+            GpuiPlatformView.pauseAll();
+        }
         super.onPause();
     }
 
     @Override
     protected void onResume() {
         super.onResume();
-        applyHighRefreshRate();
-        GpuiPlatformView.resumeAll();
+        if (sInstance == this) {
+            applyHighRefreshRate();
+            GpuiPlatformView.resumeAll();
+        }
     }
 
     @SuppressWarnings("deprecation")
@@ -328,11 +332,11 @@ public class GpuiActivity extends NativeActivity {
 
     @Override
     protected void onDestroy() {
-        GpuiAccessibilityBridge.detach(this);
-        GpuiNativeBridge.cleanup();
-        GpuiWebSocket.closeAll();
-        GpuiPlatformView.disposeAll();
         if (sInstance == this) {
+            GpuiAccessibilityBridge.detach(this);
+            GpuiNativeBridge.cleanup();
+            GpuiWebSocket.closeAll();
+            GpuiPlatformView.disposeAll();
             sInstance = null;
         }
         super.onDestroy();

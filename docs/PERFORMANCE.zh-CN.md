@@ -122,3 +122,51 @@
 | **全局共享缓存（`~/.cache/gpuix-android`）** | — | **`5.20 GiB`** | 含 `deps 308 MiB`、`hermes 69.5 MiB`、`cargo-target 4.81 GiB`、`native 26.8 MiB` |
 
 > 注：`debug-1`（从已编入约半数依赖的 `cargo-target` 续编 `android-dev` 剩余 ~150 个 crate 含 `gpui`/`wgpu` 并首次打 debug APK）耗时 `77.83 s`；`gpuix-base-ui-debug.apk` 体积为 `27,637,125 B`。可使用 `gpuix cache status` 与 `gpuix cache clean [--all]` 随时巡检与回收空间。
+
+---
+
+## 四、2026-11-24 全栈架构重构、重建压测与 `gpuix bench` 实测
+
+围绕同进程 Activity 重建稳定性、`android/runtime` 与 Java 插件解耦、SourceMap 堆栈反解、受管宿主模式以及 16KB ELF 页对齐构建门禁，完成以下更新与真机复测：
+
+### 1. 静态检查、自动化测试与空间清理
+
+- **`gpuix-android` 单测与类型检查**：`bun test`（覆盖 `android/runtime` 全量 11 个 `GPX1` 二进制 Opcode/UTF-8/URL/Web APIs/Bridge/WebSocket/Viewport、`config.ts`、`scripts/sourcemap.ts` 及受管宿主 `init`/`eject`、Android 16/17 `SurfaceFlinger` 图层解析）18 pass / 0 fail（150 expect() calls），`tsc` 0 错误。
+- **Rust 核心单测与目录收敛**：`gpui-mobile` 宿主机 `cargo test --lib` 26 passed / 0 failed（统一至全局 `CARGO_TARGET_DIR`），确认无任何 `android/vendor/*/target` 目录生成；通过 `bun scripts/gpuix.ts cache clean` 清理历史残留 `android/vendor/gpuix-native/target`（`2.96 GiB`）与过期 debug target（`122 MiB`），共回收 `3.08 GiB`。
+
+### 2. 构建耗时、16KB 对齐门禁与 `gpuix bench` 产物分解
+
+在 `gpuix-base-ui`（`playground.tsx`）受管构建模式下实测：
+
+- **Debug 构建耗时**：`21.40 s`（`21,402 ms`），`app.hbc` `1,545,379 B`，`Verified 16KB ELF LOAD alignment (arm64-v8a)` 通过。
+- **Release 首次构建耗时**（含主动会话让位重构编译）：`96.19 s`（`96,190 ms`）。
+- **Release 二次热缓存构建耗时**：`1.38 s`（`1,375 ms`，命中 `Native cache hit` 跳过 Cargo，Gradle 耗时 `468 ms`）。
+- **`gpuix bench` Release APK 分项与对齐输出**（`sha256=f86bbd1fb120`）：
+  - **总大小**：`16.8 MiB`（`17,635,557 B`）
+  - **Native `.so`（16KB `LOAD >= 0x4000` 验证通过）**：`15.4 MiB`（`libgpuix_android.so=11.0 MiB`、`libgpuix_js.so=2.99 MiB`、`libc++_shared.so=1.36 MiB`）
+  - **JS/HBC**：`1.28 MiB`（`assets/gpuix/app.hbc` `1,344,284 B`）
+  - **DEX / Resources**：`58.9 KiB` / `103 KiB`
+
+### 3. 真机冷启、同进程连续重建压测与帧延迟基准
+
+- **测试设备**：OPPO PKC110（`SWS8GUDUGIHECIMN`，120Hz Vulkan）
+- **冷启动**：`LaunchState: COLD`，`TotalTime: 659 ms`（`WaitTime: 664 ms`），进程 PID `23461`，已装 APK 与本地 SHA-256 校验一致（`f86bbd1fb120`）。
+- **同进程连续 3 轮 `FLAG_ACTIVITY_CLEAR_TASK` 销毁重建压测**（最严苛的“先创建新 Activity、旧会话尚存”并发重建场景）：
+  - 第 1/2/3 轮 `LaunchState: WARM` 耗时分别为 **`262 ms`**、**`273 ms`**、**`329 ms`**（`WaitTime` `269 / 277 / 336 ms`）；
+  - 同 PID（`23461`）内完整记录 3 次 `superseding previous active Android session` → `shutdown_platform: cleared active AndroidPlatform session`（约 `3–4 ms` 完成退场）→ `init_platform: AndroidPlatform created` → `Executing Hermes bundle gpuix/app.hbc`；
+  - 全程 **`must construct App on main thread` = 0 次**、`PANIC` = 0 次、`FATAL EXCEPTION` = 0 次、`SIGSEGV`/`SIGABRT` = 0 次。
+- **交互滑动后 `gpuix bench` 帧延迟实测**（图层 `VRI-dev.gpuix.baseui/dev.gpui.mobile.GpuiActivity#267876`）：
+  - 有效帧间隔样本 `N=62`，**`P50 = 8.33 ms`、`P99 = 8.53 ms`，估算帧率 `120.1 fps`（120 Hz 面板）**。
+
+### 4. OTA 热更新合并最终版验收（2026-11-24）
+
+- **自动化测试与工具链校验**：
+  - `gpuix-android`：`bun test` 26 pass / 0 fail（195 expect() calls，覆盖 `cli-config.test.ts`、`runtime.test.ts`（含 `gpuix.ota` 与 `__gpuixHotCleanup`）、`ota.test.ts` 与 Java `SHA256withECDSA` 跨语言验签）；`tsc --noEmit` 0 错误；`npm pack --dry-run`（303 files）通过；
+  - Rust OTA 核心状态机：`rustc --edition 2021 --test android/rust/src/ota.rs` 6 passed / 0 failed；
+  - OTA 签名工具链端到端校验：`gpuix ota keygen` → `gpuix ota build`（为 `gpuix-base-ui` 生成 `app.hbc` `1,349,477 B`，ECDSA P-256 签名）→ `gpuix ota verify` 验签通过。
+- **最终版 Release APK 构建与产物分项**（`gpuix-base-ui-release.apk`，`sha256=3c2a222eb57b237677cfacbcbf1b0f2e6c395d5e57dd1880c20d8c369d3da2c0`）：
+  - 首次全缓存刷新构建（含 `runner.cpp` Hermes 编译与 `libgpuix_android.so` 重编）：`246.25 s`；
+  - 二次热缓存构建（命中 `Native cache hit (arm64-v8a 91b7176fd8c4, profile=release)` 与 `Android HBC up to date`，Gradle `524 ms`）：**`1.59 s`**；
+  - 通过 `Verified 16KB ELF LOAD alignment (arm64-v8a)`；
+  - APK 总大小：**`17,710,039 B`（`16.89 MiB`）**，关键分项为 `lib/arm64-v8a/libgpuix_android.so` `11,586,680 B`、`lib/arm64-v8a/libgpuix_js.so` `3,139,248 B`、`lib/arm64-v8a/libc++_shared.so` `1,423,696 B`、`assets/gpuix/app.hbc` `1,349,443 B`、`classes.dex` `161,060 B`、`assets/gpuix/ota-meta.kv` `256 B`（`embedded_format=hbc`、`embedded_build_id=9d48989111f590cead806f6d843a0115bee7c2e02d4c3ee5e50d85cdd5373b94`）。
+- **真机状态说明**：打包完成后当前主机未检测到在线 ADB 设备，本版整合 OTA 后的最终 APK 尚未进行真机装机复测；上一小节的真机冷启、`FLAG_ACTIVITY_CLEAR_TASK` 重建与 120Hz 帧延迟数据来自同日 OTA 合入前的重构基线包。

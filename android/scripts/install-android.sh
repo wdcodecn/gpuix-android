@@ -12,13 +12,14 @@ elif [[ -n "${2:-}" ]]; then
   echo "Unknown install option: $2" >&2
   exit 1
 fi
-project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-android_root="$project_root/android"
+android_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+project_root="${GPUIX_PROJECT_ROOT:-$(dirname "$android_root")}"
+out_dir="${GPUIX_OUT_DIR:-$project_root/dist/android}"
 artifact_stem="$(basename "$project_root" | tr -cs 'A-Za-z0-9._-' '-')"
 artifact_stem="${artifact_stem#-}"
 artifact_stem="${artifact_stem%-}"
 artifact_stem="${artifact_stem:-gpuix-android}"
-apk_path="$project_root/dist/android/$artifact_stem-$variant.apk"
+apk_path="$out_dir/$artifact_stem-$variant.apk"
 [[ -f "$apk_path" ]] || { echo "Build the Android APK first." >&2; exit 1; }
 app_id="$(bun "$android_root/scripts/config.ts" --field appId --project "$project_root")"
 activity_name="${GPUIX_ANDROID_ACTIVITY:-dev.gpui.mobile.GpuiActivity}"

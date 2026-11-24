@@ -9,6 +9,7 @@
 #include <atomic>
 #include <cstring>
 #include <deque>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -20,7 +21,7 @@ constexpr char kTag[] = "GPUIX-JS";
 constexpr uint64_t kHermesBytecodeMagic = 0x1F1903C103BC1FC6ULL;
 
 struct Task { void *data; void (*callback)(void *); };
-struct HotEval { std::string source; std::string url; };
+struct HotEval { std::vector<uint8_t> bytes; std::string url; bool reset_timers; };
 struct Runner;
 struct Timer { uv_timer_t handle{}; Runner *owner; napi_ref callback; uint32_t id; bool repeat; };
 struct Work { uv_work_t request{}; Runner *owner; void *data; void (*execute)(void *); void (*complete)(void *, napi_status); };
@@ -32,6 +33,8 @@ struct Runner {
   std::mutex tasks_mutex;
   std::deque<Task> tasks;
   std::deque<HotEval> evals;
+  // Keeps persistent .hbc buffers alive for the lifetime of the Hermes VM.
+  std::vector<std::unique_ptr<std::vector<uint8_t>>> retained_bundles;
   std::unordered_map<uint32_t, Timer *> timers;
   std::unordered_map<uint32_t, napi_ref> raf_callbacks;
   std::vector<uint32_t> raf_order;
@@ -49,6 +52,7 @@ std::mutex active_mutex;
 Runner *active = nullptr;
 std::atomic<gpuix_request_vsync_fn> vsync_requester{nullptr};
 std::atomic<gpuix_fatal_error_fn> fatal_handler{nullptr};
+std::atomic<gpuix_hot_eval_result_fn> hot_eval_handler{nullptr};
 
 bool is_hermes_bytecode(const uint8_t *data, size_t length) {
   if (!data || length < sizeof(kHermesBytecodeMagic)) return false;
@@ -87,11 +91,44 @@ void log_exception(napi_env env) {
     report_fatal(text(env, error));
 }
 
+bool capture_exception_text(napi_env env, std::string &out) {
+  bool pending = false;
+  napi_is_exception_pending(env, &pending);
+  if (!pending) return false;
+  napi_value error, stack;
+  napi_get_and_clear_last_exception(env, &error);
+  if (napi_get_named_property(env, error, "stack", &stack) == napi_ok)
+    out = text(env, stack);
+  else
+    out = text(env, error);
+  report_fatal(out);
+  return true;
+}
+
 void checkpoint(Runner *runner) {
   log_exception(runner->env);
   if (runner->runtime->drainJobs() == hermes::vm::ExecutionStatus::EXCEPTION)
     log_exception(runner->env);
   runner->runtime->clearKeptObjects();
+}
+
+void close_timer(Timer *timer) {
+  timer->owner->timers.erase(timer->id);
+  napi_delete_reference(timer->owner->env, timer->callback);
+  uv_timer_stop(&timer->handle);
+  uv_close(reinterpret_cast<uv_handle_t *>(&timer->handle), [](uv_handle_t *handle) { delete static_cast<Timer *>(handle->data); });
+}
+
+void clear_timers_and_raf(Runner *runner) {
+  for (auto &[id, ref] : runner->raf_callbacks) {
+    napi_delete_reference(runner->env, ref);
+  }
+  runner->raf_callbacks.clear();
+  runner->raf_order.clear();
+  runner->has_raf.store(false, std::memory_order_release);
+  while (!runner->timers.empty()) {
+    close_timer(runner->timers.begin()->second);
+  }
 }
 
 void drain_raf(Runner *runner, double timestamp_ms) {
@@ -159,19 +196,61 @@ void dispatch(uv_async_t *handle) {
         checkpoint(runner);
       }
     }
-    auto st = hermes_run_script(
-        runner->env,
-        reinterpret_cast<const uint8_t *>(item.source.data()),
-        item.source.size() + 1,
-        nullptr,
-        nullptr,
-        item.url.c_str(),
-        nullptr,
-        &result);
-    if (st != napi_ok) {
-      log_exception(runner->env);
+    if (item.reset_timers) {
+      clear_timers_and_raf(runner);
     }
-    checkpoint(runner);
+
+    napi_status st = napi_generic_failure;
+    if (is_hermes_bytecode(item.bytes.data(), item.bytes.size())) {
+      auto owned = std::make_unique<std::vector<uint8_t>>(std::move(item.bytes));
+      const uint8_t *bc_data = owned->data();
+      const size_t bc_size = owned->size();
+      runner->retained_bundles.push_back(std::move(owned));
+      hermes_bytecode_flags bc_flags{};
+      bc_flags.struct_size = sizeof(hermes_bytecode_flags);
+      bc_flags.persistent = true;
+      __android_log_print(ANDROID_LOG_INFO, kTag, "Hot-evaluating Hermes HBC %s (%zu bytes)", item.url.c_str(), bc_size);
+      st = hermes_run_bytecode(
+          runner->env,
+          bc_data,
+          bc_size,
+          nullptr,
+          nullptr,
+          item.url.c_str(),
+          &bc_flags,
+          &result);
+    } else {
+      if (item.bytes.empty() || item.bytes.back() != 0) {
+        item.bytes.push_back(0);
+      }
+      __android_log_print(ANDROID_LOG_INFO, kTag, "Hot-evaluating JS %s (%zu bytes)", item.url.c_str(), item.bytes.size());
+      st = hermes_run_script(
+          runner->env,
+          item.bytes.data(),
+          item.bytes.size(),
+          nullptr,
+          nullptr,
+          item.url.c_str(),
+          nullptr,
+          &result);
+    }
+
+    std::string err_msg;
+    bool has_ex = capture_exception_text(runner->env, err_msg);
+    if (!has_ex && st == napi_ok) {
+      if (runner->runtime->drainJobs() == hermes::vm::ExecutionStatus::EXCEPTION) {
+        has_ex = capture_exception_text(runner->env, err_msg);
+      }
+      runner->runtime->clearKeptObjects();
+    }
+    bool ok = (st == napi_ok) && !has_ex;
+    if (!ok && err_msg.empty()) {
+      err_msg = "hermes eval failed (status=" + std::to_string(static_cast<int>(st)) + ")";
+      report_fatal(err_msg);
+    }
+    if (auto fn = hot_eval_handler.load(std::memory_order_acquire)) {
+      fn(ok, item.url.c_str(), ok ? nullptr : err_msg.c_str());
+    }
     napi_close_handle_scope(runner->env, scope);
   }
 
@@ -211,13 +290,6 @@ bool cancel_work(void *data, void *work_data) {
   auto *runner = static_cast<Runner *>(data);
   auto it = runner->work.find(work_data);
   return it != runner->work.end() && uv_cancel(reinterpret_cast<uv_req_t *>(&it->second->request)) == 0;
-}
-
-void close_timer(Timer *timer) {
-  timer->owner->timers.erase(timer->id);
-  napi_delete_reference(timer->owner->env, timer->callback);
-  uv_timer_stop(&timer->handle);
-  uv_close(reinterpret_cast<uv_handle_t *>(&timer->handle), [](uv_handle_t *handle) { delete static_cast<Timer *>(handle->data); });
 }
 
 napi_value schedule(napi_env env, napi_callback_info info) {
@@ -426,11 +498,20 @@ extern "C" int gpuix_js_run(const uint8_t *bundle, size_t length, gpuix_register
         hermes_bytecode_flags bc_flags{};
         bc_flags.struct_size = sizeof(hermes_bytecode_flags);
         bc_flags.persistent = true;
-        __android_log_print(ANDROID_LOG_INFO, kTag, "Hermes Node-API registered GPUIX, mmap-running HBC %zu bytes", length);
+        __android_log_print(ANDROID_LOG_INFO, kTag, "Hermes Node-API registered GPUIX, running HBC %zu bytes", length);
         status = hermes_run_bytecode(runner.env, bundle, length, nullptr, nullptr, "gpuix-app.hbc", &bc_flags, &result);
       } else {
+        std::vector<uint8_t> js_buf;
+        const uint8_t *js_ptr = bundle;
+        size_t js_len = length;
+        if (length > 0 && bundle[length - 1] != 0) {
+          js_buf.assign(bundle, bundle + length);
+          js_buf.push_back(0);
+          js_ptr = js_buf.data();
+          js_len = js_buf.size();
+        }
         __android_log_print(ANDROID_LOG_INFO, kTag, "Hermes Node-API registered GPUIX, compiling JS %zu bytes", length);
-        status = hermes_run_script(runner.env, bundle, length, nullptr, nullptr, "gpuix-app.js", nullptr, &result);
+        status = hermes_run_script(runner.env, js_ptr, js_len, nullptr, nullptr, "gpuix-app.js", nullptr, &result);
       }
     }
   }
@@ -438,12 +519,7 @@ extern "C" int gpuix_js_run(const uint8_t *bundle, size_t length, gpuix_register
   napi_close_handle_scope(runner.env, scope);
   if (status == napi_ok) uv_run(&runner.loop, UV_RUN_DEFAULT);
   { std::lock_guard<std::mutex> lock(active_mutex); active = nullptr; }
-  for (auto &[id, ref] : runner.raf_callbacks) {
-    napi_delete_reference(runner.env, ref);
-  }
-  runner.raf_callbacks.clear();
-  runner.raf_order.clear();
-  while (!runner.timers.empty()) close_timer(runner.timers.begin()->second);
+  clear_timers_and_raf(&runner);
   uv_unref(reinterpret_cast<uv_handle_t *>(&runner.async));
   for (const auto &[data, work] : runner.work)
     uv_cancel(reinterpret_cast<uv_req_t *>(&work->request));
@@ -475,6 +551,10 @@ extern "C" void gpuix_js_set_fatal_handler(gpuix_fatal_error_fn fn) {
   fatal_handler.store(fn, std::memory_order_release);
 }
 
+extern "C" void gpuix_js_set_hot_eval_handler(gpuix_hot_eval_result_fn fn) {
+  hot_eval_handler.store(fn, std::memory_order_release);
+}
+
 extern "C" void gpuix_js_on_vsync(double timestamp_ms) {
   std::lock_guard<std::mutex> lock(active_mutex);
   if (active && active->has_raf.load(std::memory_order_acquire)) {
@@ -489,17 +569,22 @@ extern "C" bool gpuix_js_has_raf_callbacks(void) {
   return active && active->has_raf.load(std::memory_order_acquire);
 }
 
-extern "C" bool gpuix_js_eval_script(const uint8_t *source, size_t length, const char *source_url) {
-  if (!source || length == 0) return false;
+extern "C" bool gpuix_js_eval_bundle(const uint8_t *data, size_t length, const char *source_url, bool reset_timers) {
+  if (!data || length == 0) return false;
   std::lock_guard<std::mutex> lock(active_mutex);
   if (!active) return false;
   {
     std::lock_guard<std::mutex> qlock(active->tasks_mutex);
     active->evals.push_back(HotEval{
-        std::string(reinterpret_cast<const char *>(source), length),
-        source_url ? std::string(source_url) : std::string("gpuix-hot.js"),
+        std::vector<uint8_t>(data, data + length),
+        source_url ? std::string(source_url) : std::string("gpuix-hot.bundle"),
+        reset_timers,
     });
   }
   uv_async_send(&active->async);
   return true;
+}
+
+extern "C" bool gpuix_js_eval_script(const uint8_t *source, size_t length, const char *source_url) {
+  return gpuix_js_eval_bundle(source, length, source_url ? source_url : "gpuix-hot.js", true);
 }

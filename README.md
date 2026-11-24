@@ -60,6 +60,7 @@ gpuix install <ADB_SERIAL>
 | `gpuix build --release` | Local release APK |
 | `gpuix build --aab` | Google Play Android App Bundle |
 | `gpuix run SERIAL` | Build, install and launch on one explicit device |
+| `gpuix ota <keygen\|build\|verify\|serve>` | Production OTA release signing, verification and local serving |
 
 Artifacts are copied to `dist/android/` with stable names.
 

@@ -9,8 +9,11 @@
     "typecheck": "tsc --noEmit",
     "gpuix": "gpuix",
     "gpuix:doctor": "gpuix doctor",
+    "gpuix:dev": "gpuix dev",
     "gpuix:build": "gpuix build",
-    "gpuix:run": "gpuix run"
+    "gpuix:run": "gpuix run",
+    "gpuix:cache": "gpuix cache",
+    "gpuix:bench": "gpuix bench"
   },
   "dependencies": {
     "@gpuix/native": "0.11.0",

@@ -16,7 +16,10 @@
     "scripts/gpuix.ts",
     "scripts/gpuix-android.ts",
     "scripts/dev-server.ts",
+    "scripts/ota.ts",
+    "scripts/sourcemap.ts",
     "android/.cargo",
+    "android/runtime",
     "android/README.md",
     "android/app/build.gradle.kts",
     "android/app/proguard-rules.pro",
@@ -49,12 +52,22 @@
     "android/vendor/gpuix-native/build.rs",
     "android/vendor/gpuix-native/LICENSE"
   ],
+  "exports": {
+    "./native-sdk": {
+      "types": "./android/runtime/types.ts"
+    },
+    "./runtime": {
+      "types": "./android/runtime/index.ts",
+      "import": "./android/runtime/index.ts"
+    }
+  },
   "bin": {
     "gpuix": "./scripts/gpuix.ts",
     "gpuix-android": "./scripts/gpuix.ts"
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
+    "test": "bun test",
     "help": "bun scripts/gpuix.ts help"
   },
   "devDependencies": {

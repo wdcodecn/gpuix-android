@@ -25,8 +25,28 @@ struct AndroidInit {
 /// The initial receive is non-blocking because blocking Android's NativeActivity
 /// callback prevents the system from delivering its Focus event and causes an
 /// input-dispatch ANR.
+struct ActiveAndroidSession {
+    platform: Arc<gpui_mobile::android::AndroidPlatform>,
+    app: android_activity::AndroidApp,
+    stop_js: Arc<dyn Fn() + Send + Sync>,
+}
+
 static ANDROID_INIT: OnceLock<Mutex<Option<Sender<AndroidInit>>>> = OnceLock::new();
 static ANDROID_EVENT_CALLBACK: OnceLock<Mutex<Option<EventCallback>>> = OnceLock::new();
+static ANDROID_SESSION_LOCK: Mutex<()> = Mutex::new(());
+static ACTIVE_ANDROID_SESSION: Mutex<Option<ActiveAndroidSession>> = Mutex::new(None);
+
+fn clear_active_session_if(platform: &Arc<gpui_mobile::android::AndroidPlatform>) {
+    let mut active = ACTIVE_ANDROID_SESSION
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if active
+        .as_ref()
+        .is_some_and(|session| Arc::ptr_eq(&session.platform, platform))
+    {
+        *active = None;
+    }
+}
 
 fn shared_android_callback() -> Option<EventCallback> {
     ANDROID_EVENT_CALLBACK
@@ -232,11 +252,47 @@ pub fn run_android(
     app: android_activity::AndroidApp,
     start_js: impl FnOnce() + Send + 'static,
 ) -> anyhow::Result<()> {
+    run_android_with_stop(app, start_js, || {})
+}
+
+/// Run an Android Activity host session with explicit JS shutdown coordination.
+///
+/// Serializes Activity lifecycles across `onDestroy` → `onCreate` recreations
+/// inside the same process so the previous `gpuix-js` runtime and GPUI platform
+/// finish tearing down before the new `android_main` thread initializes.
+pub fn run_android_with_stop(
+    app: android_activity::AndroidApp,
+    start_js: impl FnOnce() + Send + 'static,
+    stop_js: impl Fn() + Send + Sync + 'static,
+) -> anyhow::Result<()> {
+    let stop_js: Arc<dyn Fn() + Send + Sync> = Arc::new(stop_js);
+    if let Some(prev) = ACTIVE_ANDROID_SESSION
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take()
+    {
+        log::info!("run_android_with_stop: superseding previous active Android session");
+        if let Some(slot) = ANDROID_INIT.get() {
+            slot.lock().unwrap().take();
+        }
+        (prev.stop_js)();
+        prev.platform.quit();
+        prev.app.create_waker().wake();
+    }
+    let _session_guard = ANDROID_SESSION_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     gpui_mobile::android::init_logger();
     gpui_mobile::android::jni::install_panic_hook();
-    gpui_mobile::android::jni::init_platform(&app);
-    let platform = gpui_mobile::android::jni::shared_platform()
-        .ok_or_else(|| anyhow::anyhow!("Android platform initialization failed"))?;
+    let platform = gpui_mobile::android::jni::init_platform(&app);
+    *ACTIVE_ANDROID_SESSION
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(ActiveAndroidSession {
+        platform: Arc::clone(&platform),
+        app: app.clone(),
+        stop_js: Arc::clone(&stop_js),
+    });
+    let shared_platform = gpui_mobile::android::SharedPlatform::new(Arc::clone(&platform));
     let (sender, requests) = channel::<AndroidInit>();
     let slot = ANDROID_INIT.get_or_init(|| Mutex::new(None));
     {
@@ -244,13 +300,18 @@ pub fn run_android(
         anyhow::ensure!(slot.is_none(), "Android GPUIX host is already running");
         *slot = Some(sender);
     }
-    if let Err(error) = std::thread::Builder::new()
+    let js_handle = match std::thread::Builder::new()
         .name("gpuix-js".into())
         .spawn(start_js)
     {
-        slot.lock().unwrap().take();
-        return Err(error.into());
-    }
+        Ok(handle) => handle,
+        Err(error) => {
+            slot.lock().unwrap().take();
+            clear_active_session_if(&platform);
+            gpui_mobile::android::jni::shutdown_platform(&platform);
+            return Err(error.into());
+        }
+    };
     // Hermes normally reaches `GpuixRenderer.init()` before the first Android
     // surface is delivered.  If the GPUI callback starts first, however, the
     // old `cx.spawn` fallback depends on the Android foreground dispatcher to
@@ -262,7 +323,7 @@ pub fn run_android(
 
     let active_renderer = Arc::new(Mutex::new(None::<Arc<AtomicBool>>));
     let active_renderer_for_launch = active_renderer.clone();
-    gpui::Application::with_platform(platform.into_rc()).run(move |cx| {
+    gpui::Application::with_platform(shared_platform.into_rc()).run(move |cx| {
         // Hermes began before Android delivered this surface, so the normal
         // path consumes an already queued request without blocking the
         // NativeActivity loop. The rare slow-start path polls asynchronously.
@@ -288,6 +349,10 @@ pub fn run_android(
     if let Some(running) = active_renderer.lock().unwrap().take() {
         running.store(false, Ordering::Release);
     }
+    stop_js();
+    let _ = js_handle.join();
+    gpui_mobile::android::jni::shutdown_platform(&platform);
+    clear_active_session_if(&platform);
     Ok(())
 }
 

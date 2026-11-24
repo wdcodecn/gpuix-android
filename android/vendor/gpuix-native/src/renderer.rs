@@ -61,7 +61,7 @@ use crate::theme::Theme;
 #[path = "renderer_android.rs"]
 mod android_host;
 #[cfg(target_os = "android")]
-pub use android_host::run_android;
+pub use android_host::{run_android, run_android_with_stop};
 #[cfg(target_os = "android")]
 pub use gpui_mobile::android::{jni as android_jni, vsync as android_vsync};
 

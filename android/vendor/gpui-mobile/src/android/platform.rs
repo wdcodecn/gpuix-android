@@ -50,7 +50,7 @@ use std::{
     rc::Rc,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc,
+        Arc, OnceLock,
     },
 };
 
@@ -557,28 +557,27 @@ impl AndroidPlatform {
             AndroidDispatcher::new(&app)
         };
 
-        let text_system = Arc::new(CosmicTextSystem::new("Roboto"));
-        let locale = if headless {
-            "en-US".to_string()
+        let text_system = if headless {
+            Arc::new(CosmicTextSystem::new("Roboto"))
         } else {
-            read_android_locale()
-        };
-        let discovered = if headless {
-            DiscoveredFonts::default()
-        } else if let Ok(xml) = std::fs::read_to_string("/system/etc/fonts.xml") {
-            let parsed = parse_android_fonts_xml(&xml, &locale);
-            log::info!(
-                "fonts.xml parsed for locale={}: core={}, locale_priority={}, extra={}, emoji={}",
-                locale,
-                parsed.core.len(),
-                parsed.locale_priority.len(),
-                parsed.extra.len(),
-                parsed.emoji.len()
-            );
-            parsed
-        } else {
-            DiscoveredFonts::default()
-        };
+            static SHARED_TEXT_SYSTEM: OnceLock<Arc<CosmicTextSystem>> = OnceLock::new();
+            Arc::clone(SHARED_TEXT_SYSTEM.get_or_init(|| {
+                let text_system = Arc::new(CosmicTextSystem::new("Roboto"));
+                let locale = read_android_locale();
+                let discovered = if let Ok(xml) = std::fs::read_to_string("/system/etc/fonts.xml") {
+                    let parsed = parse_android_fonts_xml(&xml, &locale);
+                    log::info!(
+                        "fonts.xml parsed for locale={}: core={}, locale_priority={}, extra={}, emoji={}",
+                        locale,
+                        parsed.core.len(),
+                        parsed.locale_priority.len(),
+                        parsed.extra.len(),
+                        parsed.emoji.len()
+                    );
+                    parsed
+                } else {
+                    DiscoveredFonts::default()
+                };
 
         // Two-phase font loading:
         // Phase 1 (synchronous): load minimal core sans-serif faces needed
@@ -617,7 +616,7 @@ impl AndroidPlatform {
         // Phase 2 (background thread, non-headless):
         // Batch 0: locale-priority font (e.g. zh-Hans CJK/OEM Sans) loaded first and painted immediately.
         // Batch 1 & 2: remaining weights, monospace, extended scripts, and CBDT emoji.
-        if !headless {
+        {
             let bg_text_system = Arc::clone(&text_system);
             std::thread::Builder::new()
                 .name("gpuix-fonts".into())
@@ -741,6 +740,9 @@ impl AndroidPlatform {
                 })
                 .ok();
         }
+                text_system
+            }))
+        };
 
         let displays = if headless {
             // Provide a synthetic 1080×1920 display for headless builds.
@@ -970,6 +972,20 @@ impl AndroidPlatform {
     /// Get a clone of the shared GPU context handle.
     pub fn gpu_context(&self) -> GpuContext {
         Rc::clone(&self.state.lock().gpu_context)
+    }
+
+    /// Release all tracked windows and drop the shared `WgpuContext` on the
+    /// owning `android_main` thread during session teardown.
+    pub fn clear_windows(&self) {
+        let windows = {
+            let mut state = self.state.lock();
+            state.windows.drain_all()
+        };
+        for win in windows {
+            win.term_window();
+        }
+        let gpu_ctx = self.gpu_context();
+        *gpu_ctx.borrow_mut() = None;
     }
 
     // ── display management ────────────────────────────────────────────────────

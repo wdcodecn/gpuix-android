@@ -2328,6 +2328,11 @@ impl WindowList {
     pub fn is_empty(&self) -> bool {
         self.windows.is_empty()
     }
+
+    /// Remove and return all tracked windows.
+    pub fn drain_all(&mut self) -> Vec<Arc<AndroidWindow>> {
+        std::mem::take(&mut self.windows)
+    }
 }
 
 // ── tests ─────────────────────────────────────────────────────────────────────
