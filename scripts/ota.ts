@@ -5,21 +5,27 @@ import { chmod, mkdir, readFile, rm } from 'node:fs/promises'
 import { compileAndroidBundle } from '../android/scripts/build-js'
 import { loadGpuixAndroidConfig, normalizeOtaPublicKey, resolveOtaConfig } from '../android/scripts/config'
 
+export type OtaManifestAction = 'update' | 'rollback_to_embedded'
+
 export type OtaManifest = {
   schemaVersion: 1
+  action?: OtaManifestAction
   appId: string
   channel: string
   runtimeVersion: string
   releaseId: string
   minVersionCode: number
+  manifestSeq?: number
   mandatory: boolean
   notes?: string
   publishedAt: string
-  bundle: {
+  manifestSignature?: string
+  bundle?: {
     format: 'hbc' | 'js'
     url: string
     sha256: string
     size: number
+    hermesBytecodeVersion?: number
     signature?: string
   }
 }
@@ -45,6 +51,8 @@ export type BuildOtaReleaseOptions = {
   privateKey?: string
   skipHbc?: boolean
   debug?: boolean
+  manifestSeq?: number
+  action?: OtaManifestAction
 }
 
 export type BuildOtaReleaseResult = {
@@ -59,10 +67,12 @@ export type VerifyOtaReleaseResult = {
   manifestPath: string
   bundlePath: string
   releaseId: string
-  format: 'hbc' | 'js'
+  action: OtaManifestAction
+  format: 'hbc' | 'js' | 'embedded'
   sha256: string
   size: number
   signatureVerified: boolean
+  manifestSignatureVerified: boolean
 }
 
 export type ServeOtaOptions = {
@@ -81,8 +91,8 @@ export function otaUsage(): string {
 Usage:
   gpuix ota keygen [--out DIR]
   gpuix ota build [--cwd DIR] [--out DIR] [--channel NAME] [--runtime-version VER]
-                  [--release-id ID] [--base-url URL] [--mandatory] [--notes TEXT]
-                  [--private-key FILE_OR_PEM] [--no-hbc] [--debug]
+                  [--release-id ID] [--base-url URL] [--seq N] [--mandatory] [--notes TEXT]
+                  [--private-key FILE_OR_PEM] [--rollback-to-embedded] [--no-hbc] [--debug]
   gpuix ota verify <MANIFEST_PATH> [--public-key FILE_OR_B64]
   gpuix ota serve [ADB_SERIAL] [--cwd DIR] [--dir DIR] [--port 8787]`
 }
@@ -156,6 +166,41 @@ async function resolvePublicKeyObject(input: string) {
   return createPublicKey(toPublicKeyPem(normalizedB64))
 }
 
+/** Canonical signing payload matched byte-for-byte with `GpuiOtaManager.buildManifestSigningPayload`. */
+export function buildManifestSigningPayload(manifest: Partial<OtaManifest>): string {
+  const schemaVersion = manifest.schemaVersion ?? 1
+  const action = manifest.action?.trim() || 'update'
+  const appId = manifest.appId?.trim() ?? ''
+  const channel = manifest.channel?.trim() ?? ''
+  const runtimeVersion = manifest.runtimeVersion?.trim() ?? ''
+  const releaseId = manifest.releaseId?.trim() ?? ''
+  const minVersionCode = manifest.minVersionCode ?? 1
+  const manifestSeq = manifest.manifestSeq ?? 0
+  const mandatory = Boolean(manifest.mandatory) ? 'true' : 'false'
+  const bundleFormat = manifest.bundle?.format?.trim().toLowerCase() ?? ''
+  const bundleSha256 = manifest.bundle?.sha256?.trim().toLowerCase() ?? ''
+  const bundleSize = manifest.bundle?.size ?? 0
+  const hbcVersion = manifest.bundle?.hermesBytecodeVersion ?? 0
+
+  return [
+    'gpuix-ota-manifest-v1',
+    `schemaVersion=${schemaVersion}`,
+    `action=${action}`,
+    `appId=${appId}`,
+    `channel=${channel}`,
+    `runtimeVersion=${runtimeVersion}`,
+    `releaseId=${releaseId}`,
+    `minVersionCode=${minVersionCode}`,
+    `manifestSeq=${manifestSeq}`,
+    `mandatory=${mandatory}`,
+    `bundleFormat=${bundleFormat}`,
+    `bundleSha256=${bundleSha256}`,
+    `bundleSize=${bundleSize}`,
+    `hermesBytecodeVersion=${hbcVersion}`,
+    '',
+  ].join('\n')
+}
+
 export async function keygenOta(options: { outDir: string }): Promise<KeygenResult> {
   const outDir = path.resolve(options.outDir)
   await mkdir(outDir, { recursive: true })
@@ -207,6 +252,55 @@ export async function buildOtaRelease(options: BuildOtaReleaseOptions): Promise<
     fail('runtimeVersion must be a non-empty single-line string')
   }
 
+  const action: OtaManifestAction = options.action ?? 'update'
+  const manifestSeq = options.manifestSeq ?? Math.floor(Date.now() / 1000)
+  if (!Number.isSafeInteger(manifestSeq) || manifestSeq < 1) {
+    fail(`invalid manifestSeq: ${String(manifestSeq)}`)
+  }
+
+  const rawPrivateKey = options.privateKey ?? process.env.GPUIX_OTA_PRIVATE_KEY
+  const privatePem =
+    rawPrivateKey && rawPrivateKey.trim().length > 0 ? await resolvePrivateKeyPem(rawPrivateKey.trim()) : undefined
+
+  if (action === 'rollback_to_embedded') {
+    if (!privatePem) {
+      fail('--rollback-to-embedded requires --private-key or GPUIX_OTA_PRIVATE_KEY')
+    }
+    const releaseId = (options.releaseId ?? `rollback-${formatReleaseTimestamp()}`).trim()
+    if (!RELEASE_ID_PATTERN.test(releaseId) || releaseId.includes('..')) {
+      fail(`invalid releaseId: ${releaseId}`)
+    }
+    const manifest: OtaManifest = {
+      schemaVersion: 1,
+      action: 'rollback_to_embedded',
+      appId: config.appId,
+      channel,
+      runtimeVersion,
+      releaseId,
+      minVersionCode: config.versionCode,
+      manifestSeq,
+      mandatory: true,
+      ...(options.notes ? { notes: options.notes } : {}),
+      publishedAt: new Date().toISOString(),
+    }
+    manifest.manifestSignature = cryptoSign(
+      'sha256',
+      Buffer.from(buildManifestSigningPayload(manifest), 'utf8'),
+      privatePem,
+    ).toString('base64')
+
+    await mkdir(outDir, { recursive: true })
+    const manifestPath = path.join(outDir, 'manifest.json')
+    await Bun.write(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`)
+    return {
+      outDir,
+      manifestPath,
+      bundlePath: '',
+      manifest,
+      hermescUsed: false,
+    }
+  }
+
   const tmpBuildDir = path.join(outDir, '.tmp-build')
   await mkdir(tmpBuildDir, { recursive: true })
   let compiled
@@ -235,9 +329,7 @@ export async function buildOtaRelease(options: BuildOtaReleaseOptions): Promise<
   await Bun.write(bundlePath, compiled.bytes)
 
   let signature: string | undefined
-  const rawPrivateKey = options.privateKey ?? process.env.GPUIX_OTA_PRIVATE_KEY
-  if (rawPrivateKey && rawPrivateKey.trim().length > 0) {
-    const privatePem = await resolvePrivateKeyPem(rawPrivateKey.trim())
+  if (privatePem) {
     signature = cryptoSign('sha256', compiled.bytes, privatePem).toString('base64')
   }
 
@@ -249,11 +341,13 @@ export async function buildOtaRelease(options: BuildOtaReleaseOptions): Promise<
 
   const manifest: OtaManifest = {
     schemaVersion: 1,
+    action: 'update',
     appId: config.appId,
     channel,
     runtimeVersion,
     releaseId,
     minVersionCode: config.versionCode,
+    manifestSeq,
     mandatory: Boolean(options.mandatory),
     ...(options.notes ? { notes: options.notes } : {}),
     publishedAt: new Date().toISOString(),
@@ -262,8 +356,16 @@ export async function buildOtaRelease(options: BuildOtaReleaseOptions): Promise<
       url: bundleUrl,
       sha256: compiled.sha256,
       size: compiled.bytes.length,
+      ...(compiled.hbcVersion > 0 ? { hermesBytecodeVersion: compiled.hbcVersion } : {}),
       ...(signature ? { signature } : {}),
     },
+  }
+  if (privatePem) {
+    manifest.manifestSignature = cryptoSign(
+      'sha256',
+      Buffer.from(buildManifestSigningPayload(manifest), 'utf8'),
+      privatePem,
+    ).toString('base64')
   }
 
   const manifestPath = path.join(outDir, 'manifest.json')
@@ -290,9 +392,45 @@ export async function verifyOtaRelease(
   if (manifest.schemaVersion !== 1) {
     fail(`unsupported manifest schemaVersion: ${String(manifest.schemaVersion)}`)
   }
+  const action: OtaManifestAction = manifest.action ?? 'update'
+  if (action !== 'update' && action !== 'rollback_to_embedded') {
+    fail(`unsupported manifest action: ${String(manifest.action)}`)
+  }
   if (!manifest.releaseId || !RELEASE_ID_PATTERN.test(manifest.releaseId) || manifest.releaseId.includes('..')) {
     fail(`invalid manifest releaseId: ${String(manifest.releaseId)}`)
   }
+
+  const pubKey = publicKeyInput && publicKeyInput.trim().length > 0
+    ? await resolvePublicKeyObject(publicKeyInput)
+    : null
+
+  let manifestSignatureVerified = false
+  if (pubKey && manifest.manifestSignature) {
+    const sigBytes = Buffer.from(manifest.manifestSignature, 'base64')
+    const payload = Buffer.from(buildManifestSigningPayload(manifest), 'utf8')
+    if (!cryptoVerify('sha256', payload, pubKey, sigBytes)) {
+      fail('ECDSA SHA-256 manifestSignature verification failed')
+    }
+    manifestSignatureVerified = true
+  }
+
+  if (action === 'rollback_to_embedded') {
+    if (pubKey && !manifest.manifestSignature) {
+      fail('public key provided, but rollback_to_embedded manifest lacks manifestSignature')
+    }
+    return {
+      manifestPath,
+      bundlePath: '',
+      releaseId: manifest.releaseId,
+      action,
+      format: 'embedded',
+      sha256: '',
+      size: 0,
+      signatureVerified: manifestSignatureVerified,
+      manifestSignatureVerified,
+    }
+  }
+
   if (!manifest.bundle || (manifest.bundle.format !== 'hbc' && manifest.bundle.format !== 'js')) {
     fail('manifest missing valid bundle.format ("hbc" | "js")')
   }
@@ -333,17 +471,22 @@ export async function verifyOtaRelease(
     if (bytes.length < HERMES_MAGIC.length || !bytes.subarray(0, 8).equals(HERMES_MAGIC)) {
       fail('bundle has .hbc format but lacks Hermes bytecode magic header')
     }
+    if (manifest.bundle.hermesBytecodeVersion && bytes.length >= 12) {
+      const actualHbcVer = bytes.readUInt32LE(8)
+      if (actualHbcVer !== manifest.bundle.hermesBytecodeVersion) {
+        fail(`Hermes bytecode version mismatch: manifest ${manifest.bundle.hermesBytecodeVersion}, got ${actualHbcVer}`)
+      }
+    }
   }
 
   let signatureVerified = false
-  if (publicKeyInput && publicKeyInput.trim().length > 0) {
+  if (pubKey) {
     if (!manifest.bundle.signature) {
       fail('public key provided, but manifest.bundle.signature is missing')
     }
-    const pubKey = await resolvePublicKeyObject(publicKeyInput)
     const sigBytes = Buffer.from(manifest.bundle.signature, 'base64')
     if (!cryptoVerify('sha256', bytes, pubKey, sigBytes)) {
-      fail('ECDSA SHA-256 signature verification failed')
+      fail('ECDSA SHA-256 bundle signature verification failed')
     }
     signatureVerified = true
   }
@@ -352,10 +495,12 @@ export async function verifyOtaRelease(
     manifestPath,
     bundlePath,
     releaseId: manifest.releaseId,
+    action,
     format: manifest.bundle.format,
     sha256: actualSha,
     size: bytes.length,
     signatureVerified,
+    manifestSignatureVerified,
   }
 }
 
@@ -476,10 +621,15 @@ export async function runOtaCommand(args: string[], defaultCwd: string): Promise
   }
 
   if (sub === 'build') {
-    const parsed = parseOtaArgs(rest, new Set(['mandatory', 'no-hbc', 'debug', 'help']))
+    const parsed = parseOtaArgs(rest, new Set(['mandatory', 'no-hbc', 'debug', 'rollback-to-embedded', 'help']))
     if (parsed.flags.has('help') || parsed.positional.length > 0) {
       process.stdout.write(`${otaUsage()}\n`)
       return
+    }
+    const rawSeq = parsed.values.get('seq')
+    const manifestSeq = rawSeq !== undefined ? Number(rawSeq) : undefined
+    if (rawSeq !== undefined && (!Number.isSafeInteger(manifestSeq) || (manifestSeq ?? 0) < 1)) {
+      fail(`invalid --seq value: ${rawSeq}`)
     }
     const projectRoot = path.resolve(parsed.values.get('cwd') ?? defaultCwd)
     const res = await buildOtaRelease({
@@ -494,13 +644,24 @@ export async function runOtaCommand(args: string[], defaultCwd: string): Promise
       privateKey: parsed.values.get('private-key'),
       skipHbc: parsed.flags.has('no-hbc'),
       debug: parsed.flags.has('debug'),
+      manifestSeq,
+      action: parsed.flags.has('rollback-to-embedded') ? 'rollback_to_embedded' : 'update',
     })
+    if (res.manifest.action === 'rollback_to_embedded') {
+      process.stdout.write(
+        `✓ Built OTA kill-switch manifest ${res.manifest.releaseId} (rollback_to_embedded, seq=${res.manifest.manifestSeq})\n` +
+        `  Manifest: ${res.manifestPath}\n` +
+        `  Signed:   yes (ECDSA P-256)\n`,
+      )
+      return
+    }
     process.stdout.write(
-      `✓ Built OTA release ${res.manifest.releaseId} (${res.manifest.bundle.format}, ${res.manifest.bundle.size} B)\n` +
+      `✓ Built OTA release ${res.manifest.releaseId} (${res.manifest.bundle?.format}, ${res.manifest.bundle?.size} B)\n` +
       `  Bundle:   ${res.bundlePath}\n` +
       `  Manifest: ${res.manifestPath}\n` +
-      `  SHA-256:  ${res.manifest.bundle.sha256}\n` +
-      `  Signed:   ${res.manifest.bundle.signature ? 'yes (ECDSA P-256)' : 'no'}\n`,
+      `  SHA-256:  ${res.manifest.bundle?.sha256}\n` +
+      `  Seq:      ${res.manifest.manifestSeq}\n` +
+      `  Signed:   ${res.manifest.bundle?.signature ? 'yes (ECDSA P-256)' : 'no'}\n`,
     )
     return
   }
@@ -512,10 +673,10 @@ export async function runOtaCommand(args: string[], defaultCwd: string): Promise
     }
     const res = await verifyOtaRelease(parsed.positional[0], parsed.values.get('public-key'))
     process.stdout.write(
-      `✓ Verified OTA release ${res.releaseId} (${res.format}, ${res.size} B)\n` +
-      `  Bundle:    ${res.bundlePath}\n` +
-      `  SHA-256:   ${res.sha256}\n` +
-      `  Signature: ${res.signatureVerified ? 'verified' : 'skipped (no --public-key)'}\n`,
+      `✓ Verified OTA release ${res.releaseId} (${res.action}, ${res.format}, ${res.size} B)\n` +
+      (res.bundlePath ? `  Bundle:    ${res.bundlePath}\n  SHA-256:   ${res.sha256}\n` : '') +
+      `  Signature: ${res.signatureVerified ? 'verified' : 'skipped (no --public-key)'}` +
+      `${res.manifestSignatureVerified ? ' (+manifestSignature)' : ''}\n`,
     )
     return
   }

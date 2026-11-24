@@ -7,6 +7,8 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.pm.ActivityInfo;
 import android.content.pm.PackageManager;
+import dev.gpui.mobile.bridge.DeviceSystemPlugin;
+import org.json.JSONObject;
 import android.graphics.Color;
 import android.graphics.Insets;
 import android.graphics.Rect;
@@ -85,6 +87,9 @@ public class GpuiActivity extends NativeActivity {
                 sNativeLibLoaded = true;
             }
         }
+
+        // Run Native-First OTA boot guard/rescue BEFORE NativeActivity starts Rust/Hermes.
+        GpuiOtaManager.onNativeBootStart(getApplicationContext());
 
         splash.setKeepOnScreenCondition(() -> !isNativeReady());
         setVolumeControlStream(AudioManager.STREAM_MUSIC);
@@ -271,6 +276,7 @@ public class GpuiActivity extends NativeActivity {
     @Override
     protected void onPause() {
         if (sInstance == this) {
+            emitAppStateEvent("background");
             GpuiPlatformView.pauseAll();
         }
         super.onPause();
@@ -282,6 +288,15 @@ public class GpuiActivity extends NativeActivity {
         if (sInstance == this) {
             applyHighRefreshRate();
             GpuiPlatformView.resumeAll();
+            DeviceSystemPlugin.startNetworkMonitor(this);
+            emitAppStateEvent("active");
+        }
+    }
+
+    private static void emitAppStateEvent(String state) {
+        try {
+            GpuiNativeBridge.emitEvent("appState", new JSONObject().put("state", state));
+        } catch (Throwable ignored) {
         }
     }
 
@@ -332,6 +347,7 @@ public class GpuiActivity extends NativeActivity {
 
     @Override
     protected void onDestroy() {
+        DeviceSystemPlugin.stopNetworkMonitor(this);
         if (sInstance == this) {
             GpuiAccessibilityBridge.detach(this);
             GpuiNativeBridge.cleanup();

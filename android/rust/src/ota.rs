@@ -1,11 +1,17 @@
 use std::collections::BTreeMap;
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, SystemTime};
 
 pub const HERMES_BYTECODE_MAGIC: [u8; 8] = 0x1F1903C103BC1FC6u64.to_le_bytes();
 pub const MAX_UNCONFIRMED_LAUNCH_ATTEMPTS: u32 = 2;
 const MAX_FAILED_IDS: usize = 32;
+const STATE_LOCK_WAIT_MS: u64 = 2000;
+const STATE_LOCK_STALE_SECS: u64 = 5;
+
+static OTA_STATE_PROCESS_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
 
 const SHA256_K: [u32; 64] = [
     0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
@@ -95,6 +101,7 @@ pub struct EmbeddedMeta {
     pub runtime_version: String,
     pub embedded_build_id: String,
     pub embedded_format: String,
+    pub hbc_version: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -118,6 +125,9 @@ pub struct OtaState {
     pub failed_ids: Vec<String>,
     pub last_rollback_reason: String,
     pub last_checked_at: u64,
+    pub boot_in_progress: bool,
+    pub boot_crash_streak: u32,
+    pub min_manifest_seq: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -129,6 +139,67 @@ pub enum BootPlan {
         source_url: String,
         confirmed: bool,
     },
+}
+
+struct LockFileGuard {
+    path: PathBuf,
+}
+
+impl Drop for LockFileGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+/// Serializes cross-language (`GpuiOtaManager.java` <-> `ota.rs`) access to `state.kv`.
+pub fn with_state_lock<F, R>(ota_dir: &Path, f: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    let proc_lock = OTA_STATE_PROCESS_MUTEX
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let _ = fs::create_dir_all(ota_dir);
+    let lock_path = ota_dir.join("state.lock");
+    let mut _guard: Option<LockFileGuard> = None;
+
+    let max_iters = STATE_LOCK_WAIT_MS / 5;
+    for _ in 0..max_iters {
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+        {
+            Ok(_) => {
+                _guard = Some(LockFileGuard {
+                    path: lock_path.clone(),
+                });
+                break;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                let stale = fs::metadata(&lock_path)
+                    .and_then(|m| m.modified())
+                    .and_then(|mtime| {
+                        SystemTime::now()
+                            .duration_since(mtime)
+                            .map_err(|_| std::io::Error::other("clock skew"))
+                    })
+                    .is_ok_and(|age| age > Duration::from_secs(STATE_LOCK_STALE_SECS));
+                if stale {
+                    let _ = fs::remove_file(&lock_path);
+                    continue;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(_) => break,
+        }
+    }
+
+    let result = f();
+    drop(_guard);
+    drop(proc_lock);
+    result
 }
 
 pub fn is_valid_release_id(id: &str) -> bool {
@@ -175,6 +246,10 @@ pub fn parse_embedded_meta(raw: &str) -> EmbeddedMeta {
             .get("embedded_format")
             .cloned()
             .unwrap_or_else(|| "hbc".to_string()),
+        hbc_version: map
+            .get("hbc_version")
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(0),
     }
 }
 
@@ -242,6 +317,9 @@ impl OtaState {
             failed_ids,
             last_rollback_reason: read("last_rollback_reason"),
             last_checked_at: read("last_checked_at").parse::<u64>().unwrap_or(0),
+            boot_in_progress: read("boot_in_progress") == "1",
+            boot_crash_streak: read("boot_crash_streak").parse::<u32>().unwrap_or(0),
+            min_manifest_seq: read("min_manifest_seq").parse::<u64>().unwrap_or(0),
         }
     }
 
@@ -304,7 +382,10 @@ impl OtaState {
              staged_bundle={}\n\
              failed_ids={}\n\
              last_rollback_reason={}\n\
-             last_checked_at={}\n",
+             last_checked_at={}\n\
+             boot_in_progress={}\n\
+             boot_crash_streak={}\n\
+             min_manifest_seq={}\n",
             self.base_version_code,
             sanitize_value(&self.runtime_version),
             sanitize_value(&self.embedded_build_id),
@@ -325,6 +406,9 @@ impl OtaState {
             sanitize_value(&self.failed_ids.join(",")),
             sanitize_value(&self.last_rollback_reason),
             self.last_checked_at,
+            if self.boot_in_progress { "1" } else { "0" },
+            self.boot_crash_streak,
+            self.min_manifest_seq,
         )
     }
 }
@@ -395,7 +479,11 @@ fn validate_rel_bundle_path(ota_dir: &Path, rel: &str) -> std::result::Result<Pa
     Ok(ota_dir.join(rel_path))
 }
 
-fn verify_and_read_slot(ota_dir: &Path, slot: &BundleSlot) -> std::result::Result<Vec<u8>, String> {
+fn verify_and_read_slot(
+    ota_dir: &Path,
+    slot: &BundleSlot,
+    expected_hbc_version: u32,
+) -> std::result::Result<Vec<u8>, String> {
     if !is_valid_release_id(&slot.id) {
         return Err(format!("invalid release id: {}", slot.id));
     }
@@ -419,6 +507,17 @@ fn verify_and_read_slot(ota_dir: &Path, slot: &BundleSlot) -> std::result::Resul
             || bytes[..8] != HERMES_BYTECODE_MAGIC
         {
             return Err("invalid Hermes bytecode magic".to_string());
+        }
+        if expected_hbc_version > 0 {
+            if bytes.len() < 12 {
+                return Err("truncated Hermes bytecode header".to_string());
+            }
+            let ver = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
+            if ver != expected_hbc_version {
+                return Err(format!(
+                    "Hermes bytecode version mismatch (expected {expected_hbc_version}, got {ver})"
+                ));
+            }
         }
     } else if slot.format != "js" {
         return Err(format!("unsupported bundle format: {}", slot.format));
@@ -466,65 +565,67 @@ fn demote_active_to_prev_or_embedded(state: &mut OtaState, reason: &str) {
 /// automatically rolling back invalid, APK-mismatched, or crash-looping releases.
 pub fn resolve_boot_bundle(data_dir: &Path, embedded: &EmbeddedMeta) -> BootPlan {
     let ota_dir = ota_root_dir(data_dir);
-    let (mut state, mut dirty) = load_or_sync_state(&ota_dir, embedded);
+    with_state_lock(&ota_dir, || {
+        let (mut state, mut dirty) = load_or_sync_state(&ota_dir, embedded);
 
-    for _attempt in 0..2 {
-        let Some(active) = state.active.clone() else {
-            if dirty {
-                save_state_best_effort(&ota_dir, &state);
-            }
-            return BootPlan::Embedded;
-        };
-
-        if !is_valid_release_id(&active.id) {
-            demote_active_to_prev_or_embedded(&mut state, "invalid active release id");
-            dirty = true;
-            continue;
-        }
-        if state.failed_ids.contains(&active.id) {
-            demote_active_to_prev_or_embedded(&mut state, "release previously failed");
-            dirty = true;
-            continue;
-        }
-        if !active.confirmed && active.attempts >= MAX_UNCONFIRMED_LAUNCH_ATTEMPTS {
-            let reason = format!(
-                "crash-loop guard triggered for {} after {} unconfirmed attempts",
-                active.id, active.attempts
-            );
-            demote_active_to_prev_or_embedded(&mut state, &reason);
-            dirty = true;
-            continue;
-        }
-
-        match verify_and_read_slot(&ota_dir, &active) {
-            Ok(bytes) => {
-                if !active.confirmed {
-                    if let Some(slot) = state.active.as_mut() {
-                        slot.attempts = slot.attempts.saturating_add(1);
-                        dirty = true;
-                    }
-                }
+        for _attempt in 0..2 {
+            let Some(active) = state.active.clone() else {
                 if dirty {
                     save_state_best_effort(&ota_dir, &state);
                 }
-                return BootPlan::Ota {
-                    source_url: format!("ota:{}", active.id),
-                    release_id: active.id,
-                    bytes,
-                    confirmed: active.confirmed,
-                };
-            }
-            Err(err) => {
-                demote_active_to_prev_or_embedded(&mut state, &err);
+                return BootPlan::Embedded;
+            };
+
+            if !is_valid_release_id(&active.id) {
+                demote_active_to_prev_or_embedded(&mut state, "invalid active release id");
                 dirty = true;
+                continue;
+            }
+            if state.failed_ids.contains(&active.id) {
+                demote_active_to_prev_or_embedded(&mut state, "release previously failed");
+                dirty = true;
+                continue;
+            }
+            if !active.confirmed && active.attempts >= MAX_UNCONFIRMED_LAUNCH_ATTEMPTS {
+                let reason = format!(
+                    "crash-loop guard triggered for {} after {} unconfirmed attempts",
+                    active.id, active.attempts
+                );
+                demote_active_to_prev_or_embedded(&mut state, &reason);
+                dirty = true;
+                continue;
+            }
+
+            match verify_and_read_slot(&ota_dir, &active, embedded.hbc_version) {
+                Ok(bytes) => {
+                    if !active.confirmed {
+                        if let Some(slot) = state.active.as_mut() {
+                            slot.attempts = slot.attempts.saturating_add(1);
+                            dirty = true;
+                        }
+                    }
+                    if dirty {
+                        save_state_best_effort(&ota_dir, &state);
+                    }
+                    return BootPlan::Ota {
+                        source_url: format!("ota:{}", active.id),
+                        release_id: active.id,
+                        bytes,
+                        confirmed: active.confirmed,
+                    };
+                }
+                Err(err) => {
+                    demote_active_to_prev_or_embedded(&mut state, &err);
+                    dirty = true;
+                }
             }
         }
-    }
 
-    state.active = None;
-    state.prev = None;
-    save_state_best_effort(&ota_dir, &state);
-    BootPlan::Embedded
+        state.active = None;
+        state.prev = None;
+        save_state_best_effort(&ota_dir, &state);
+        BootPlan::Embedded
+    })
 }
 
 /// Validates and reads the active OTA slot for in-process hot switching.
@@ -533,27 +634,29 @@ pub fn load_active_for_hot_apply(
     embedded: &EmbeddedMeta,
 ) -> std::result::Result<(String, Vec<u8>, bool), String> {
     let ota_dir = ota_root_dir(data_dir);
-    let (mut state, dirty) = load_or_sync_state(&ota_dir, embedded);
-    if dirty {
-        save_state_best_effort(&ota_dir, &state);
-        return Err("OTA state was reset for updated APK baseline".to_string());
-    }
-    let Some(active) = state.active.clone() else {
-        return Err("no active OTA release to apply".to_string());
-    };
-    if state.failed_ids.contains(&active.id) {
-        demote_active_to_prev_or_embedded(&mut state, "release is in failed_ids");
-        save_state_best_effort(&ota_dir, &state);
-        return Err(format!("release {} is blocklisted", active.id));
-    }
-    match verify_and_read_slot(&ota_dir, &active) {
-        Ok(bytes) => Ok((active.id, bytes, active.confirmed)),
-        Err(err) => {
-            demote_active_to_prev_or_embedded(&mut state, &err);
+    with_state_lock(&ota_dir, || {
+        let (mut state, dirty) = load_or_sync_state(&ota_dir, embedded);
+        if dirty {
             save_state_best_effort(&ota_dir, &state);
-            Err(err)
+            return Err("OTA state was reset for updated APK baseline".to_string());
         }
-    }
+        let Some(active) = state.active.clone() else {
+            return Err("no active OTA release to apply".to_string());
+        };
+        if state.failed_ids.contains(&active.id) {
+            demote_active_to_prev_or_embedded(&mut state, "release is in failed_ids");
+            save_state_best_effort(&ota_dir, &state);
+            return Err(format!("release {} is blocklisted", active.id));
+        }
+        match verify_and_read_slot(&ota_dir, &active, embedded.hbc_version) {
+            Ok(bytes) => Ok((active.id, bytes, active.confirmed)),
+            Err(err) => {
+                demote_active_to_prev_or_embedded(&mut state, &err);
+                save_state_best_effort(&ota_dir, &state);
+                Err(err)
+            }
+        }
+    })
 }
 
 /// Reads the current `active` slot when Java already updated `state.kv` for rollback.
@@ -563,24 +666,26 @@ pub fn load_current_active_or_embedded(
     embedded: &EmbeddedMeta,
 ) -> std::result::Result<Option<(String, Vec<u8>)>, String> {
     let ota_dir = ota_root_dir(data_dir);
-    let (mut state, dirty) = load_or_sync_state(&ota_dir, embedded);
-    if dirty {
-        save_state_best_effort(&ota_dir, &state);
-        return Ok(None);
-    }
-    let Some(active) = state.active.clone() else {
-        return Ok(None);
-    };
-    match verify_and_read_slot(&ota_dir, &active) {
-        Ok(bytes) => Ok(Some((active.id, bytes))),
-        Err(err) => {
-            state.active = None;
-            state.prev = None;
-            state.last_rollback_reason = sanitize_value(&err);
+    with_state_lock(&ota_dir, || {
+        let (mut state, dirty) = load_or_sync_state(&ota_dir, embedded);
+        if dirty {
             save_state_best_effort(&ota_dir, &state);
-            Ok(None)
+            return Ok(None);
         }
-    }
+        let Some(active) = state.active.clone() else {
+            return Ok(None);
+        };
+        match verify_and_read_slot(&ota_dir, &active, embedded.hbc_version) {
+            Ok(bytes) => Ok(Some((active.id, bytes))),
+            Err(err) => {
+                state.active = None;
+                state.prev = None;
+                state.last_rollback_reason = sanitize_value(&err);
+                save_state_best_effort(&ota_dir, &state);
+                Ok(None)
+            }
+        }
+    })
 }
 
 /// Records an unconfirmed OTA runtime/eval failure and rolls back to `prev` (if valid) or `Embedded`.
@@ -588,34 +693,37 @@ pub fn record_unconfirmed_failure_and_rollback(
     data_dir: &Path,
     release_id: &str,
     reason: &str,
+    expected_hbc_version: u32,
 ) -> Option<(String, Vec<u8>)> {
     let ota_dir = ota_root_dir(data_dir);
-    let state_path = state_file_path(&ota_dir);
-    let raw = fs::read_to_string(&state_path).ok()?;
-    let mut state = OtaState::from_kv(&raw);
+    with_state_lock(&ota_dir, || {
+        let state_path = state_file_path(&ota_dir);
+        let raw = fs::read_to_string(&state_path).ok()?;
+        let mut state = OtaState::from_kv(&raw);
 
-    let is_target_unconfirmed = state
-        .active
-        .as_ref()
-        .is_some_and(|slot| slot.id == release_id && !slot.confirmed);
-    if !is_target_unconfirmed {
-        return None;
-    }
+        let is_target_unconfirmed = state
+            .active
+            .as_ref()
+            .is_some_and(|slot| slot.id == release_id && !slot.confirmed);
+        if !is_target_unconfirmed {
+            return None;
+        }
 
-    demote_active_to_prev_or_embedded(&mut state, reason);
-    if let Some(prev_slot) = state.active.clone() {
-        match verify_and_read_slot(&ota_dir, &prev_slot) {
-            Ok(bytes) => {
-                save_state_best_effort(&ota_dir, &state);
-                return Some((prev_slot.id, bytes));
-            }
-            Err(_) => {
-                state.active = None;
+        demote_active_to_prev_or_embedded(&mut state, reason);
+        if let Some(prev_slot) = state.active.clone() {
+            match verify_and_read_slot(&ota_dir, &prev_slot, expected_hbc_version) {
+                Ok(bytes) => {
+                    save_state_best_effort(&ota_dir, &state);
+                    return Some((prev_slot.id, bytes));
+                }
+                Err(_) => {
+                    state.active = None;
+                }
             }
         }
-    }
-    save_state_best_effort(&ota_dir, &state);
-    None
+        save_state_best_effort(&ota_dir, &state);
+        None
+    })
 }
 
 #[cfg(test)]
@@ -634,6 +742,14 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    fn make_hbc(version: u32, payload: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(12 + payload.len());
+        out.extend_from_slice(&HERMES_BYTECODE_MAGIC);
+        out.extend_from_slice(&version.to_le_bytes());
+        out.extend_from_slice(payload);
+        out
     }
 
     fn write_release_file(data_dir: &Path, id: &str, format: &str, bytes: &[u8]) -> BundleSlot {
@@ -657,6 +773,7 @@ mod tests {
             runtime_version: "1".to_string(),
             embedded_build_id: "a".repeat(64),
             embedded_format: "hbc".to_string(),
+            hbc_version: 96,
         }
     }
 
@@ -690,6 +807,9 @@ mod tests {
         state.failed_ids = vec!["rel-0".to_string(), "rel-1".to_string()];
         state.last_rollback_reason = "line1\nline2".to_string();
         state.last_checked_at = 1_700_000_000_000;
+        state.boot_in_progress = true;
+        state.boot_crash_streak = 2;
+        state.min_manifest_seq = 42;
 
         let parsed = OtaState::from_kv(&state.to_kv());
         assert_eq!(parsed.base_version_code, 1);
@@ -697,6 +817,9 @@ mod tests {
         assert_eq!(parsed.failed_ids, state.failed_ids);
         assert_eq!(parsed.last_rollback_reason, "line1 line2");
         assert_eq!(parsed.last_checked_at, 1_700_000_000_000);
+        assert!(parsed.boot_in_progress);
+        assert_eq!(parsed.boot_crash_streak, 2);
+        assert_eq!(parsed.min_manifest_seq, 42);
     }
 
     #[test]
@@ -713,8 +836,7 @@ mod tests {
     fn apk_upgrade_invalidates_prior_ota_state() {
         let dir = temp_dir("apk_upgrade");
         let emb1 = sample_embedded();
-        let mut hbc = Vec::from(HERMES_BYTECODE_MAGIC);
-        hbc.extend_from_slice(b"bundle-v1");
+        let hbc = make_hbc(96, b"bundle-v1");
         let slot = write_release_file(&dir, "rel-1", "hbc", &hbc);
         let mut state = reset_for_embedded(&emb1);
         state.active = Some(slot);
@@ -725,7 +847,8 @@ mod tests {
         let plan = resolve_boot_bundle(&dir, &emb2);
         assert_eq!(plan, BootPlan::Embedded);
 
-        let reloaded = OtaState::from_kv(&fs::read_to_string(state_file_path(&ota_root_dir(&dir))).unwrap());
+        let reloaded =
+            OtaState::from_kv(&fs::read_to_string(state_file_path(&ota_root_dir(&dir))).unwrap());
         assert_eq!(reloaded.base_version_code, 2);
         assert!(reloaded.active.is_none());
         let _ = fs::remove_dir_all(&dir);
@@ -736,8 +859,7 @@ mod tests {
         let dir = temp_dir("crash_loop");
         let emb = sample_embedded();
 
-        let mut prev_hbc = Vec::from(HERMES_BYTECODE_MAGIC);
-        prev_hbc.extend_from_slice(b"healthy-prev");
+        let prev_hbc = make_hbc(96, b"healthy-prev");
         let mut prev_slot = write_release_file(&dir, "rel-prev", "hbc", &prev_hbc);
         prev_slot.confirmed = true;
 
@@ -749,12 +871,23 @@ mod tests {
         save_state_best_effort(&ota_root_dir(&dir), &state);
 
         // Attempt 1 and 2 are permitted for unconfirmed OTA.
-        assert!(matches!(resolve_boot_bundle(&dir, &emb), BootPlan::Ota { ref release_id, .. } if release_id == "rel-bad"));
-        assert!(matches!(resolve_boot_bundle(&dir, &emb), BootPlan::Ota { ref release_id, .. } if release_id == "rel-bad"));
+        assert!(matches!(
+            resolve_boot_bundle(&dir, &emb),
+            BootPlan::Ota { ref release_id, .. } if release_id == "rel-bad"
+        ));
+        assert!(matches!(
+            resolve_boot_bundle(&dir, &emb),
+            BootPlan::Ota { ref release_id, .. } if release_id == "rel-bad"
+        ));
 
         // Attempt 3 hits MAX_UNCONFIRMED_LAUNCH_ATTEMPTS (2) and rolls back to prev.
         match resolve_boot_bundle(&dir, &emb) {
-            BootPlan::Ota { release_id, bytes, confirmed, .. } => {
+            BootPlan::Ota {
+                release_id,
+                bytes,
+                confirmed,
+                ..
+            } => {
                 assert_eq!(release_id, "rel-prev");
                 assert_eq!(bytes, prev_hbc);
                 assert!(confirmed);
@@ -762,12 +895,16 @@ mod tests {
             other => panic!("expected rollback to rel-prev, got {other:?}"),
         }
 
-        let after = OtaState::from_kv(&fs::read_to_string(state_file_path(&ota_root_dir(&dir))).unwrap());
+        let after =
+            OtaState::from_kv(&fs::read_to_string(state_file_path(&ota_root_dir(&dir))).unwrap());
         assert!(after.failed_ids.contains(&"rel-bad".to_string()));
 
         // Confirmed prev remains stable across repeated launches.
         for _ in 0..4 {
-            assert!(matches!(resolve_boot_bundle(&dir, &emb), BootPlan::Ota { ref release_id, .. } if release_id == "rel-prev"));
+            assert!(matches!(
+                resolve_boot_bundle(&dir, &emb),
+                BootPlan::Ota { ref release_id, .. } if release_id == "rel-prev"
+            ));
         }
 
         // Now corrupt rel-prev on disk -> falls back cleanly to Embedded.
@@ -785,12 +922,72 @@ mod tests {
         state.active = Some(bad_slot);
         save_state_best_effort(&ota_root_dir(&dir), &state);
 
-        let fallback = record_unconfirmed_failure_and_rollback(&dir, "rel-hot-bad", "eval threw");
+        let fallback = record_unconfirmed_failure_and_rollback(
+            &dir,
+            "rel-hot-bad",
+            "eval threw",
+            emb.hbc_version,
+        );
         assert!(fallback.is_none());
         assert_eq!(resolve_boot_bundle(&dir, &emb), BootPlan::Embedded);
-        let after = OtaState::from_kv(&fs::read_to_string(state_file_path(&ota_root_dir(&dir))).unwrap());
+        let after =
+            OtaState::from_kv(&fs::read_to_string(state_file_path(&ota_root_dir(&dir))).unwrap());
         assert_eq!(after.failed_ids, vec!["rel-hot-bad".to_string()]);
         assert_eq!(after.last_rollback_reason, "eval threw");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hbc_version_mismatch_rejects_and_rolls_back() {
+        let dir = temp_dir("hbc_ver");
+        let emb = sample_embedded();
+        let mismatch_hbc = make_hbc(99, b"wrong-hermes-abi");
+        let bad_slot = write_release_file(&dir, "rel-old-hbc", "hbc", &mismatch_hbc);
+        let mut state = reset_for_embedded(&emb);
+        state.active = Some(bad_slot);
+        save_state_best_effort(&ota_root_dir(&dir), &state);
+
+        assert_eq!(resolve_boot_bundle(&dir, &emb), BootPlan::Embedded);
+        let after =
+            OtaState::from_kv(&fs::read_to_string(state_file_path(&ota_root_dir(&dir))).unwrap());
+        assert!(after.failed_ids.contains(&"rel-old-hbc".to_string()));
+        assert!(after
+            .last_rollback_reason
+            .contains("Hermes bytecode version mismatch"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn state_lock_serializes_concurrent_updates() {
+        let dir = temp_dir("state_lock");
+        let ota_dir = ota_root_dir(&dir);
+        let counter_path = ota_dir.join("counter.txt");
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let lock_dir = ota_dir.clone();
+            let path = counter_path.clone();
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..10 {
+                    with_state_lock(&lock_dir, || {
+                        let cur = fs::read_to_string(&path)
+                            .ok()
+                            .and_then(|s| s.trim().parse::<u32>().ok())
+                            .unwrap_or(0);
+                        write_atomic(&path, (cur + 1).to_string().as_bytes()).unwrap();
+                    });
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        let final_val = fs::read_to_string(&counter_path)
+            .unwrap()
+            .trim()
+            .parse::<u32>()
+            .unwrap();
+        assert_eq!(final_val, 80);
+        assert!(!ota_dir.join("state.lock").exists());
         let _ = fs::remove_dir_all(&dir);
     }
 }

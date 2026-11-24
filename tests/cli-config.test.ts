@@ -3,7 +3,7 @@ import path from 'node:path'
 import { tmpdir } from 'node:os'
 import { existsSync } from 'node:fs'
 import { mkdtemp, mkdir, rm } from 'node:fs/promises'
-import { loadGpuixAndroidConfig, writeGradleProperties } from '../android/scripts/config'
+import { loadGpuixAndroidConfig, syncGeneratedManifest, writeGradleProperties } from '../android/scripts/config'
 import { DEBUG_WRAPPER_LINE_OFFSET, wrapDebugBundle } from '../android/scripts/build-js'
 import { extractCandidateSurfaceLayers } from '../scripts/gpuix'
 import { decodeVlq, parseSourceMap, resolveOriginalPosition, symbolicateStack } from '../scripts/sourcemap'
@@ -220,5 +220,53 @@ describe('scripts/gpuix CLI managed host & eject flow', () => {
     expect(ranked.some((l) => l.includes('ActivityRecordInputSink'))).toBe(false)
     expect(ranked.some((l) => l.includes('animation-leash'))).toBe(false)
     expect(ranked.some((l) => l.includes('dev.gpuix.starter'))).toBe(false)
+  })
+
+  test('permissions config normalizes names, preserves INTERNET, and trims generated AndroidManifest.xml', async () => {
+    const project = await createTempDir('gpuix-perms-')
+    await mkdir(path.join(project, 'src'), { recursive: true })
+    await mkdir(path.join(project, 'android/app/src/main'), { recursive: true })
+    await Bun.write(path.join(project, 'src/main.tsx'), 'export {}\n')
+    await Bun.write(
+      path.join(project, 'android/app/src/main/AndroidManifest.xml'),
+      [
+        '<?xml version="1.0" encoding="utf-8"?>',
+        '<manifest xmlns:android="http://schemas.android.com/apk/res/android">',
+        '    <uses-permission android:name="android.permission.INTERNET" />',
+        '    <uses-permission android:name="android.permission.CAMERA" />',
+        '    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />',
+        '    <application android:label="Test" />',
+        '</manifest>',
+        '',
+      ].join('\n'),
+    )
+    await Bun.write(
+      path.join(project, 'gpuix.android.json'),
+      JSON.stringify({
+        entrypoint: 'src/main.tsx',
+        appId: 'dev.gpuix.permtest',
+        permissions: ['CAMERA', 'android.permission.VIBRATE', 'CAMERA'],
+      }),
+    )
+
+    const cfg = await loadGpuixAndroidConfig(project)
+    expect(cfg.permissions).toEqual([
+      'android.permission.INTERNET',
+      'android.permission.CAMERA',
+      'android.permission.VIBRATE',
+    ])
+
+    const generated = await syncGeneratedManifest(path.join(project, 'android'), cfg)
+    expect(generated).not.toBeNull()
+    const manifestText = await Bun.file(generated!).text()
+    expect(manifestText).toContain('android.permission.INTERNET')
+    expect(manifestText).toContain('android.permission.CAMERA')
+    expect(manifestText).toContain('android.permission.VIBRATE')
+    expect(manifestText).not.toContain('ACCESS_FINE_LOCATION')
+
+    delete cfg.permissions
+    const removed = await syncGeneratedManifest(path.join(project, 'android'), cfg)
+    expect(removed).toBeNull()
+    expect(existsSync(generated!)).toBe(false)
   })
 })

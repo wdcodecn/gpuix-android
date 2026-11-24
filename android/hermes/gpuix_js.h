@@ -34,6 +34,10 @@ bool gpuix_js_has_raf_callbacks(void);
 bool gpuix_js_eval_script(const uint8_t *source, size_t length, const char *source_url);
 // Evaluate a hot-reload JS source or Hermes bytecode (.hbc) bundle on the active Hermes thread.
 bool gpuix_js_eval_bundle(const uint8_t *data, size_t length, const char *source_url, bool reset_timers);
+// Enqueue a lightweight event-loop heartbeat ping and return the latest sequence number (0 if inactive).
+uint64_t gpuix_js_ping_async(void);
+// Return the last acknowledged event-loop heartbeat sequence number.
+uint64_t gpuix_js_ping_ack(void);
 
 #ifdef __cplusplus
 }

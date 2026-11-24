@@ -610,4 +610,61 @@ describe('android/runtime native-bridge, websocket, viewport & renderer', () => 
     viewport.subscribeSize((s) => nextSeen.push(s))
     expect(nextSeen).toEqual([{ width: 400, height: 800 }])
   })
+
+  test('fs, transfer, media gallery/compress, launcher helpers, and appState/networkChange events forward properly', async () => {
+    const calls: Array<{ module: string; method: string; args: Record<string, unknown> }> = []
+    g.__gpuixNative = {
+      nativeInvoke(id: number, module: string, method: string, argsJson: string) {
+        calls.push({ module, method, args: JSON.parse(argsJson) as Record<string, unknown> })
+        queueMicrotask(() => {
+          handleBridgeResultEvent(
+            JSON.stringify({ requestId: id, ok: true, payloadJson: JSON.stringify({ ok: true }) }),
+          )
+        })
+        return true
+      },
+    }
+
+    const sdk = createGpuixNativeSdk()
+    await sdk.fs.writeText('notes/a.txt', 'hello', { scope: 'cache', append: true })
+    await sdk.fs.readText('notes/a.txt', 'cache')
+    await sdk.fs.list('notes', 'files')
+    await sdk.fs.getStorageInfo()
+    await sdk.transfer.downloadFile({ url: 'https://cdn.example.com/a.bin', path: 'a.bin' })
+    await sdk.transfer.uploadFile({ url: 'https://cdn.example.com/up', path: 'a.bin', fieldName: 'doc' })
+    await sdk.media.saveToGallery({ path: '/data/user/0/app/cache/x.jpg' })
+    await sdk.media.compressImage({ path: '/data/user/0/app/cache/x.jpg', maxWidth: 800, quality: 75 })
+    await sdk.launcher.isAppInstalled('com.example.other')
+    await sdk.launcher.openMarket('com.example.other')
+
+    expect(calls).toEqual([
+      { module: 'fs', method: 'writeText', args: { path: 'notes/a.txt', content: 'hello', scope: 'cache', append: true } },
+      { module: 'fs', method: 'readText', args: { path: 'notes/a.txt', scope: 'cache' } },
+      { module: 'fs', method: 'list', args: { path: 'notes', scope: 'files' } },
+      { module: 'fs', method: 'getStorageInfo', args: {} },
+      { module: 'transfer', method: 'downloadFile', args: { url: 'https://cdn.example.com/a.bin', path: 'a.bin' } },
+      { module: 'transfer', method: 'uploadFile', args: { url: 'https://cdn.example.com/up', path: 'a.bin', fieldName: 'doc' } },
+      { module: 'media', method: 'saveToGallery', args: { path: '/data/user/0/app/cache/x.jpg' } },
+      { module: 'media', method: 'compressImage', args: { path: '/data/user/0/app/cache/x.jpg', maxWidth: 800, quality: 75 } },
+      { module: 'launcher', method: 'isAppInstalled', args: { packageName: 'com.example.other' } },
+      { module: 'launcher', method: 'openMarket', args: { packageName: 'com.example.other' } },
+    ])
+
+    const states: string[] = []
+    const nets: string[] = []
+    const tProgress: number[] = []
+    const u1 = sdk.onAppStateChange((ev) => states.push(ev.state))
+    const u2 = sdk.onNetworkChange((ev) => nets.push(`${ev.connected}:${ev.networkType}`))
+    const u3 = sdk.transfer.onProgress((ev) => tProgress.push(ev.bytesTransferred))
+
+    handleBridgeChannelEvent(JSON.stringify({ channel: 'appState', payloadJson: JSON.stringify({ state: 'background' }) }))
+    handleBridgeChannelEvent(JSON.stringify({ channel: 'networkChange', payloadJson: JSON.stringify({ connected: true, networkType: 'wifi', isMetered: false }) }))
+    handleBridgeChannelEvent(JSON.stringify({ channel: 'transferProgress', payloadJson: JSON.stringify({ direction: 'download', url: 'https://x', path: 'a.bin', bytesTransferred: 2048, totalBytes: 4096, progress: 0.5 }) }))
+    u1()
+    u2()
+    u3()
+    expect(states).toEqual(['background'])
+    expect(nets).toEqual(['true:wifi'])
+    expect(tProgress).toEqual([2048])
+  })
 })

@@ -9,6 +9,7 @@ import android.content.pm.PackageManager;
 import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.StatFs;
 import android.util.Base64;
 import android.util.Log;
 import java.io.BufferedInputStream;
@@ -37,6 +38,7 @@ import java.util.Set;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.regex.Pattern;
 import org.json.JSONArray;
 import org.json.JSONObject;
@@ -44,10 +46,11 @@ import org.json.JSONObject;
 /**
  * Production Over-The-Air (OTA) JS/HBC update manager for GPUIX Android.
  *
- * Shares an atomic key-value state file (`filesDir/gpuix_ota/state.kv`) with
- * the Rust cold-boot loader in `android/rust/src/ota.rs` so failed or
- * unconfirmed releases automatically roll back to the previous healthy slot or
- * the APK-embedded bundle.
+ * Implements Native-First boot guard & rescue in {@link #onNativeBootStart(Context)} so that even if
+ * business JavaScript crashes immediately at launch (e.g. broken splash/boot API), the native base
+ * can intercept launch after repeated early failures and fetch/apply a signed recovery bundle before
+ * executing JavaScript. Shares {@code filesDir/gpuix_ota/state.kv} under a cross-language lockfile
+ * ({@code state.lock}) with {@code android/rust/src/ota.rs}.
  */
 public final class GpuiOtaManager {
 
@@ -55,9 +58,14 @@ public final class GpuiOtaManager {
     private static final String META_ASSET_PATH = "gpuix/ota-meta.kv";
     private static final String OTA_DIR_NAME = "gpuix_ota";
     private static final String STATE_FILE_NAME = "state.kv";
+    private static final String STATE_LOCK_NAME = "state.lock";
     private static final int MAX_BUNDLE_BYTES = 32 * 1024 * 1024;
     private static final int MAX_MANIFEST_BYTES = 1024 * 1024;
     private static final int MAX_FAILED_IDS = 32;
+    private static final int RESCUE_CRASH_THRESHOLD = 2;
+    private static final long LOCK_WAIT_MS = 2000L;
+    private static final long LOCK_STALE_MS = 5000L;
+    private static final long MIN_FREE_DISK_BYTES = 16L * 1024L * 1024L;
     private static final byte[] HERMES_MAGIC = new byte[] {
         (byte) 0xC6, (byte) 0x1F, (byte) 0xBC, (byte) 0x03,
         (byte) 0xC1, (byte) 0x03, (byte) 0x19, (byte) 0x1F
@@ -68,8 +76,15 @@ public final class GpuiOtaManager {
     private static final Object STATE_LOCK = new Object();
     private static final Handler MAIN_HANDLER = new Handler(Looper.getMainLooper());
     private static final ScheduledExecutorService SCHEDULER = Executors.newSingleThreadScheduledExecutor();
+    private static final AtomicBoolean RESTART_IN_FLIGHT = new AtomicBoolean(false);
+    private static volatile Context sAppContext = null;
+    private static volatile boolean sNativeLaunchCheckStarted = false;
 
     private GpuiOtaManager() {
+    }
+
+    private interface StateAction<T> {
+        T run() throws Exception;
     }
 
     private static final class EmbeddedMeta {
@@ -83,6 +98,7 @@ public final class GpuiOtaManager {
         String checkOnLaunch = "manual";
         String embeddedFormat = "hbc";
         String embeddedBuildId = "";
+        long hbcVersion = 0;
     }
 
     private static final class BundleSlot {
@@ -115,7 +131,191 @@ public final class GpuiOtaManager {
         final List<String> failedIds = new ArrayList<>();
         String lastRollbackReason = "";
         long lastCheckedAt = 0;
+        boolean bootInProgress = false;
+        int bootCrashStreak = 0;
+        long minManifestSeq = 0;
     }
+
+    // ── Native-First boot guard & rescue lifecycle ───────────────────────────
+
+    /**
+     * Called from {@code GpuiActivity.onCreate()} immediately after loading {@code libgpuix_android.so}
+     * and BEFORE {@code super.onCreate()} starts Rust/Hermes.
+     */
+    public static void onNativeBootStart(Context ctx) {
+        if (ctx == null) return;
+        final Context appCtx = ctx.getApplicationContext();
+        sAppContext = appCtx;
+        sNativeLaunchCheckStarted = false;
+        RESTART_IN_FLIGHT.set(false);
+
+        final EmbeddedMeta meta = loadEmbeddedMeta(appCtx);
+        final int crashStreak;
+        try {
+            crashStreak = withStateLock(appCtx, () -> {
+                OtaState state = loadOrSyncStateLocked(appCtx, meta);
+                if (state.bootInProgress) {
+                    state.bootCrashStreak = Math.min(99, state.bootCrashStreak + 1);
+                }
+                state.bootInProgress = true;
+                saveStateLocked(appCtx, state);
+                return state.bootCrashStreak;
+            });
+        } catch (Throwable t) {
+            Log.e(TAG, "onNativeBootStart state update failed", t);
+            safeSetBootGateReady(true);
+            return;
+        }
+
+        if (crashStreak >= RESCUE_CRASH_THRESHOLD) {
+            Log.w(TAG, "Entering Native-First OTA rescue mode (bootCrashStreak=" + crashStreak + ")");
+            safeSetBootGateReady(false);
+            sNativeLaunchCheckStarted = !meta.manifestUrl.isEmpty();
+            SCHEDULER.execute(() -> {
+                try {
+                    runNativeRescue(appCtx, meta);
+                } catch (Throwable t) {
+                    Log.e(TAG, "Native-First OTA rescue failed", t);
+                } finally {
+                    safeSetBootGateReady(true);
+                }
+            });
+            return;
+        }
+
+        safeSetBootGateReady(true);
+        if (!meta.manifestUrl.isEmpty()
+                && ("background".equals(meta.checkOnLaunch) || "immediate".equals(meta.checkOnLaunch))) {
+            sNativeLaunchCheckStarted = true;
+            SCHEDULER.execute(() -> {
+                try {
+                    runNativeBackgroundLaunchCheck(appCtx, meta);
+                } catch (Throwable t) {
+                    Log.w(TAG, "Native launch OTA check failed: " + t.getMessage());
+                }
+            });
+        }
+    }
+
+    private static void runNativeRescue(Context ctx, EmbeddedMeta meta) {
+        boolean recoveredWithUpdate = false;
+        if (!meta.manifestUrl.isEmpty()) {
+            try {
+                validateHttpUrl(ctx, meta.manifestUrl, "manifestUrl");
+                String body = fetchText(meta.manifestUrl, null, 2500, 3500);
+                JSONObject resolved = normalizeAndValidateManifest(ctx, meta.manifestUrl, new JSONObject(body));
+                String action = resolved.optString("action", "update");
+                if ("rollback_to_embedded".equals(action)) {
+                    applyKillSwitchLocked(ctx, meta, resolved, "Native rescue kill-switch rollback");
+                    return;
+                }
+                String targetId = resolved.getString("releaseId");
+                OtaState snapshot = withStateLock(ctx, () -> loadOrSyncStateLocked(ctx, meta));
+                boolean isSameFailedActive = snapshot.active != null && targetId.equals(snapshot.active.id);
+                if (!isSameFailedActive && !snapshot.failedIds.contains(targetId)
+                        && isManifestCompatible(meta, resolved, false) == null
+                        && snapshot.minManifestSeq <= Math.max(0L, resolved.optLong("manifestSeq", 0L))) {
+                    DownloadResult dl = downloadAndStageBundle(ctx, meta, resolved, snapshot, 3500);
+                    if (dl != null) {
+                        activateStagedSlot(ctx, meta, dl.releaseId, true);
+                        recoveredWithUpdate = true;
+                        Log.i(TAG, "Native rescue fetched and activated recovery release " + dl.releaseId);
+                    }
+                }
+            } catch (Throwable t) {
+                Log.w(TAG, "Native rescue network check did not yield a fix: " + t.getMessage());
+            }
+        }
+
+        if (!recoveredWithUpdate) {
+            try {
+                withStateLock(ctx, () -> {
+                    OtaState state = loadOrSyncStateLocked(ctx, meta);
+                    if (state.active != null) {
+                        Log.w(TAG, "Native rescue demoting crashing OTA release " + state.active.id);
+                        addFailedId(state.failedIds, state.active.id);
+                        state.active = null;
+                        if (state.prev != null
+                                && !state.failedIds.contains(state.prev.id)
+                                && verifySlotFile(ctx, state.prev, meta.hbcVersion)) {
+                            BundleSlot restored = state.prev.copy();
+                            restored.confirmed = true;
+                            restored.attempts = 0;
+                            state.active = restored;
+                        }
+                        state.prev = null;
+                        state.bootCrashStreak = 0;
+                        state.lastRollbackReason = "Native rescue demoted early-crashing OTA bundle";
+                        saveStateLocked(ctx, state);
+                        gcUnusedReleasesLocked(getOtaDir(ctx), state);
+                    }
+                    return null;
+                });
+            } catch (Throwable t) {
+                Log.e(TAG, "Native rescue fallback failed", t);
+            }
+        }
+    }
+
+    private static void runNativeBackgroundLaunchCheck(Context ctx, EmbeddedMeta meta) throws Exception {
+        validateHttpUrl(ctx, meta.manifestUrl, "manifestUrl");
+        String body = fetchText(meta.manifestUrl, null, 4000, 8000);
+        JSONObject resolved = normalizeAndValidateManifest(ctx, meta.manifestUrl, new JSONObject(body));
+        long now = System.currentTimeMillis();
+        OtaState state = withStateLock(ctx, () -> {
+            OtaState s = loadOrSyncStateLocked(ctx, meta);
+            s.lastCheckedAt = now;
+            saveStateLocked(ctx, s);
+            return s;
+        });
+
+        String action = resolved.optString("action", "update");
+        if ("rollback_to_embedded".equals(action)) {
+            boolean applied = applyKillSwitchLocked(ctx, meta, resolved, "Remote manifest kill-switch rollback");
+            if (applied) {
+                nativeTriggerHotRollback();
+            }
+            return;
+        }
+
+        String incompat = isManifestCompatible(meta, resolved, false);
+        if (incompat != null) return;
+        long seq = resolved.optLong("manifestSeq", 0L);
+        if (seq > 0 && seq < state.minManifestSeq) return;
+        String releaseId = resolved.getString("releaseId");
+        String bundleSha = resolved.getJSONObject("bundle").getString("sha256");
+        if (state.failedIds.contains(releaseId)) return;
+        if (state.active != null && (releaseId.equals(state.active.id) || bundleSha.equalsIgnoreCase(state.active.sha256))) {
+            return;
+        }
+        if (state.active == null && !meta.embeddedBuildId.isEmpty() && bundleSha.equalsIgnoreCase(meta.embeddedBuildId)) {
+            return;
+        }
+
+        DownloadResult dl = downloadAndStageBundle(ctx, meta, resolved, state, 30000);
+        if (dl == null) return;
+        boolean mandatory = resolved.optBoolean("mandatory", false);
+        if ("immediate".equals(meta.checkOnLaunch) || mandatory) {
+            activateStagedSlot(ctx, meta, dl.releaseId, false);
+            nativeTriggerHotApply();
+        }
+    }
+
+    /** Called via JNI from Rust watchdog / unrecoverable rollback path. */
+    public static boolean requestProcessRestartFromNative() {
+        Context ctx = sAppContext != null ? sAppContext : GpuiActivity.currentActivity();
+        if (ctx == null) {
+            Log.e(TAG, "requestProcessRestartFromNative: no application context available");
+            return false;
+        }
+        if (!RESTART_IN_FLIGHT.compareAndSet(false, true)) {
+            return true;
+        }
+        scheduleProcessRestart(ctx.getApplicationContext());
+        return true;
+    }
+
+    // ── Bridge handlers ──────────────────────────────────────────────────────
 
     public static void handle(Activity activity, long reqId, String method, JSONObject args) throws Exception {
         if (method == null) {
@@ -150,15 +350,10 @@ public final class GpuiOtaManager {
         }
     }
 
-    // ── Bridge handlers ──────────────────────────────────────────────────────
-
     private static void handleGetState(Activity activity, long reqId) throws Exception {
         Context ctx = activity.getApplicationContext();
         EmbeddedMeta meta = loadEmbeddedMeta(ctx);
-        OtaState state;
-        synchronized (STATE_LOCK) {
-            state = loadOrSyncStateLocked(ctx, meta);
-        }
+        OtaState state = withStateLock(ctx, () -> loadOrSyncStateLocked(ctx, meta));
         GpuiNativeBridge.resolve(reqId, buildStateJson(meta, state));
     }
 
@@ -166,69 +361,82 @@ public final class GpuiOtaManager {
         Context ctx = activity.getApplicationContext();
         EmbeddedMeta meta = loadEmbeddedMeta(ctx);
         String manifestUrl = args.optString("manifestUrl", "").trim();
-        if (manifestUrl.isEmpty()) {
-            manifestUrl = meta.manifestUrl;
-        }
+        if (manifestUrl.isEmpty()) manifestUrl = meta.manifestUrl;
         if (manifestUrl.isEmpty()) {
             GpuiNativeBridge.reject(reqId, "OTA manifestUrl is not configured");
             return;
         }
         String targetChannel = args.optString("channel", "").trim();
-        if (targetChannel.isEmpty()) {
-            targetChannel = meta.channel;
-        }
+        if (targetChannel.isEmpty()) targetChannel = meta.channel;
         validateHttpUrl(ctx, manifestUrl, "manifestUrl");
 
         int timeoutMs = Math.max(2000, Math.min(60000, args.optInt("timeoutMs", 15000)));
         JSONObject headers = args.optJSONObject("headers");
-        String body = fetchText(manifestUrl, headers, timeoutMs);
-        JSONObject rawManifest = new JSONObject(body);
-        JSONObject resolved = normalizeAndValidateManifest(ctx, manifestUrl, rawManifest);
+        String body = fetchText(manifestUrl, headers, timeoutMs, timeoutMs);
+        JSONObject resolved = normalizeAndValidateManifest(ctx, manifestUrl, new JSONObject(body));
 
         long now = System.currentTimeMillis();
-        OtaState state;
-        synchronized (STATE_LOCK) {
-            state = loadOrSyncStateLocked(ctx, meta);
-            state.lastCheckedAt = now;
-            saveStateLocked(ctx, state);
+        OtaState state = withStateLock(ctx, () -> {
+            OtaState s = loadOrSyncStateLocked(ctx, meta);
+            s.lastCheckedAt = now;
+            saveStateLocked(ctx, s);
+            return s;
+        });
+
+        String action = resolved.optString("action", "update");
+        long seq = resolved.optLong("manifestSeq", 0L);
+        if (seq > 0 && seq < state.minManifestSeq) {
+            JSONObject res = buildCheckResponse(meta, state, resolved, false, "downgrade_blocked");
+            GpuiNativeBridge.resolve(reqId, res);
+            return;
+        }
+
+        if ("rollback_to_embedded".equals(action)) {
+            boolean applied = applyKillSwitchLocked(ctx, meta, resolved, "Remote kill-switch rollback");
+            if (applied) {
+                SCHEDULER.schedule(() -> {
+                    try { nativeTriggerHotRollback(); } catch (Throwable ignored) {}
+                }, 40, TimeUnit.MILLISECONDS);
+            }
+            OtaState latest = withStateLock(ctx, () -> loadOrSyncStateLocked(ctx, meta));
+            GpuiNativeBridge.resolve(reqId, buildCheckResponse(meta, latest, resolved, false, "rollback_to_embedded"));
+            return;
         }
 
         String releaseId = resolved.getString("releaseId");
-        String manifestAppId = resolved.getString("appId");
-        String manifestRuntime = resolved.getString("runtimeVersion");
         String manifestChannel = resolved.optString("channel", "");
-        long minVersionCode = resolved.optLong("minVersionCode", 1);
-        JSONObject bundleObj = resolved.getJSONObject("bundle");
-        String bundleSha = bundleObj.getString("sha256").toLowerCase(Locale.US);
+        String bundleSha = resolved.getJSONObject("bundle").getString("sha256").toLowerCase(Locale.US);
 
-        String reason = null;
-        boolean available = true;
-        if (!meta.appId.isEmpty() && !meta.appId.equals(manifestAppId)) {
-            available = false;
-            reason = "app_id_mismatch";
-        } else if (!manifestChannel.isEmpty() && !targetChannel.isEmpty() && !targetChannel.equals(manifestChannel)) {
+        String reason = isManifestCompatible(meta, resolved, false);
+        boolean available = reason == null;
+        if (available && !manifestChannel.isEmpty() && !targetChannel.isEmpty() && !targetChannel.equals(manifestChannel)) {
             available = false;
             reason = "channel_mismatch";
-        } else if (!meta.runtimeVersion.isEmpty() && !meta.runtimeVersion.equals(manifestRuntime)) {
-            available = false;
-            reason = "runtime_mismatch";
-        } else if (meta.versionCode > 0 && meta.versionCode < minVersionCode) {
-            available = false;
-            reason = "min_version_not_met";
-        } else if (state.failedIds.contains(releaseId)) {
+        } else if (available && state.failedIds.contains(releaseId)) {
             available = false;
             reason = "blocklisted";
-        } else if (state.active != null && (releaseId.equals(state.active.id) || bundleSha.equalsIgnoreCase(state.active.sha256))) {
+        } else if (available && state.active != null && (releaseId.equals(state.active.id) || bundleSha.equalsIgnoreCase(state.active.sha256))) {
             available = false;
             reason = "up_to_date";
-        } else if (state.active == null && !meta.embeddedBuildId.isEmpty() && bundleSha.equalsIgnoreCase(meta.embeddedBuildId)) {
+        } else if (available && state.active == null && !meta.embeddedBuildId.isEmpty() && bundleSha.equalsIgnoreCase(meta.embeddedBuildId)) {
             available = false;
             reason = "up_to_date";
-        } else if (state.staged != null && releaseId.equals(state.staged.id) && verifySlotFile(ctx, state.staged)) {
+        } else if (available && state.staged != null && releaseId.equals(state.staged.id)
+                && verifySlotFile(ctx, state.staged, meta.hbcVersion)) {
             available = false;
             reason = "already_staged";
         }
 
+        GpuiNativeBridge.resolve(reqId, buildCheckResponse(meta, state, resolved, available, reason));
+    }
+
+    private static JSONObject buildCheckResponse(
+            EmbeddedMeta meta,
+            OtaState state,
+            JSONObject resolved,
+            boolean available,
+            String reason
+    ) throws Exception {
         JSONObject res = new JSONObject();
         res.put("available", available);
         res.put("reason", reason != null ? reason : JSONObject.NULL);
@@ -236,7 +444,7 @@ public final class GpuiOtaManager {
         res.put("stagedReleaseId", state.staged != null ? state.staged.id : JSONObject.NULL);
         res.put("embeddedBuildId", meta.embeddedBuildId);
         res.put("manifest", resolved);
-        GpuiNativeBridge.resolve(reqId, res);
+        return res;
     }
 
     private static void handleDownload(Activity activity, long reqId, JSONObject args) throws Exception {
@@ -245,9 +453,7 @@ public final class GpuiOtaManager {
 
         JSONObject manifestInput = args.optJSONObject("manifest");
         String manifestUrl = args.optString("manifestUrl", "").trim();
-        if (manifestUrl.isEmpty()) {
-            manifestUrl = meta.manifestUrl;
-        }
+        if (manifestUrl.isEmpty()) manifestUrl = meta.manifestUrl;
         if (manifestInput == null) {
             if (manifestUrl.isEmpty()) {
                 GpuiNativeBridge.reject(reqId, "download requires manifest or manifestUrl");
@@ -255,28 +461,97 @@ public final class GpuiOtaManager {
             }
             validateHttpUrl(ctx, manifestUrl, "manifestUrl");
             int timeoutMs = Math.max(2000, Math.min(60000, args.optInt("timeoutMs", 15000)));
-            manifestInput = new JSONObject(fetchText(manifestUrl, args.optJSONObject("headers"), timeoutMs));
+            manifestInput = new JSONObject(fetchText(manifestUrl, args.optJSONObject("headers"), timeoutMs, timeoutMs));
         }
 
         JSONObject manifest = normalizeAndValidateManifest(ctx, manifestUrl.isEmpty() ? null : manifestUrl, manifestInput);
+        if ("rollback_to_embedded".equals(manifest.optString("action", "update"))) {
+            applyKillSwitchLocked(ctx, meta, manifest, "Remote kill-switch rollback");
+            OtaState latest = withStateLock(ctx, () -> loadOrSyncStateLocked(ctx, meta));
+            JSONObject res = buildStateJson(meta, latest);
+            res.put("downloaded", false);
+            res.put("reused", false);
+            res.put("releaseId", manifest.optString("releaseId", "embedded"));
+            GpuiNativeBridge.resolve(reqId, res);
+            return;
+        }
+
+        String incompat = isManifestCompatible(meta, manifest, true);
+        if (incompat != null) {
+            GpuiNativeBridge.reject(reqId, incompat);
+            return;
+        }
+
         String releaseId = manifest.getString("releaseId");
-        String manifestAppId = manifest.getString("appId");
-        String manifestRuntime = manifest.getString("runtimeVersion");
-        long minVersionCode = manifest.optLong("minVersionCode", 1);
+        String expectedSha = manifest.getJSONObject("bundle").getString("sha256").toLowerCase(Locale.US);
+        long expectedSize = manifest.getJSONObject("bundle").optLong("size", -1);
 
-        if (!meta.appId.isEmpty() && !meta.appId.equals(manifestAppId)) {
-            GpuiNativeBridge.reject(reqId, "OTA manifest appId mismatch: " + manifestAppId);
+        OtaState current = withStateLock(ctx, () -> loadOrSyncStateLocked(ctx, meta));
+        long seq = manifest.optLong("manifestSeq", 0L);
+        if (seq > 0 && seq < current.minManifestSeq) {
+            GpuiNativeBridge.reject(reqId, "Manifest sequence " + seq + " < minManifestSeq " + current.minManifestSeq);
             return;
         }
-        if (!meta.runtimeVersion.isEmpty() && !meta.runtimeVersion.equals(manifestRuntime)) {
-            GpuiNativeBridge.reject(reqId, "OTA runtimeVersion mismatch: " + manifestRuntime + " != " + meta.runtimeVersion);
+        if (current.failedIds.contains(releaseId)) {
+            GpuiNativeBridge.reject(reqId, "Release " + releaseId + " is blocklisted after prior failure");
             return;
         }
-        if (meta.versionCode > 0 && meta.versionCode < minVersionCode) {
-            GpuiNativeBridge.reject(reqId, "APK versionCode " + meta.versionCode + " < minVersionCode " + minVersionCode);
+        if (current.staged != null && releaseId.equals(current.staged.id)
+                && expectedSha.equalsIgnoreCase(current.staged.sha256)
+                && verifySlotFile(ctx, current.staged, meta.hbcVersion)) {
+            emitProgress(releaseId, expectedSize > 0 ? expectedSize : 0, expectedSize, "ready");
+            JSONObject res = buildStateJson(meta, current);
+            res.put("downloaded", false);
+            res.put("reused", true);
+            res.put("releaseId", releaseId);
+            GpuiNativeBridge.resolve(reqId, res);
             return;
         }
 
+        int timeoutMs = Math.max(5000, Math.min(120000, args.optInt("timeoutMs", 45000)));
+        DownloadResult dl = downloadAndStageBundleWithHeaders(ctx, meta, manifest, args.optJSONObject("headers"), timeoutMs);
+        OtaState updated = withStateLock(ctx, () -> loadOrSyncStateLocked(ctx, meta));
+        JSONObject res = buildStateJson(meta, updated);
+        res.put("downloaded", true);
+        res.put("reused", false);
+        res.put("releaseId", dl.releaseId);
+        res.put("bytes", dl.bytesWritten);
+        GpuiNativeBridge.resolve(reqId, res);
+    }
+
+    private static final class DownloadResult {
+        final String releaseId;
+        final long bytesWritten;
+
+        DownloadResult(String releaseId, long bytesWritten) {
+            this.releaseId = releaseId;
+            this.bytesWritten = bytesWritten;
+        }
+    }
+
+    private static DownloadResult downloadAndStageBundle(
+            Context ctx,
+            EmbeddedMeta meta,
+            JSONObject manifest,
+            OtaState ignoredState,
+            int timeoutMs
+    ) {
+        try {
+            return downloadAndStageBundleWithHeaders(ctx, meta, manifest, null, timeoutMs);
+        } catch (Throwable t) {
+            Log.w(TAG, "downloadAndStageBundle failed: " + t.getMessage());
+            return null;
+        }
+    }
+
+    private static DownloadResult downloadAndStageBundleWithHeaders(
+            Context ctx,
+            EmbeddedMeta meta,
+            JSONObject manifest,
+            JSONObject headers,
+            int timeoutMs
+    ) throws Exception {
+        String releaseId = manifest.getString("releaseId");
         JSONObject bundleObj = manifest.getJSONObject("bundle");
         String format = bundleObj.getString("format");
         String bundleUrl = bundleObj.getString("url");
@@ -286,46 +561,26 @@ public final class GpuiOtaManager {
 
         validateHttpUrl(ctx, bundleUrl, "bundle.url");
         if (!meta.publicKey.isEmpty() && signatureB64.isEmpty()) {
-            GpuiNativeBridge.reject(reqId, "OTA publicKey is configured, but bundle.signature is missing");
-            return;
-        }
-
-        synchronized (STATE_LOCK) {
-            OtaState current = loadOrSyncStateLocked(ctx, meta);
-            if (current.failedIds.contains(releaseId)) {
-                GpuiNativeBridge.reject(reqId, "Release " + releaseId + " is blocklisted after prior failure");
-                return;
-            }
-            if (current.staged != null && releaseId.equals(current.staged.id)
-                    && expectedSha.equalsIgnoreCase(current.staged.sha256)
-                    && verifySlotFile(ctx, current.staged)) {
-                emitProgress(releaseId, expectedSize > 0 ? expectedSize : 0, expectedSize, "ready");
-                JSONObject res = buildStateJson(meta, current);
-                res.put("downloaded", false);
-                res.put("reused", true);
-                res.put("releaseId", releaseId);
-                GpuiNativeBridge.resolve(reqId, res);
-                return;
-            }
+            throw new SecurityException("OTA publicKey is configured, but bundle.signature is missing");
         }
 
         File otaDir = getOtaDir(ctx);
+        if (!otaDir.exists() && !otaDir.mkdirs()) {
+            throw new IllegalStateException("Cannot create OTA root directory");
+        }
+        long requiredBytes = Math.max(expectedSize > 0 ? expectedSize * 2L + 8L * 1024L * 1024L : MIN_FREE_DISK_BYTES, MIN_FREE_DISK_BYTES);
+        long availBytes = new StatFs(otaDir.getAbsolutePath()).getAvailableBytes();
+        if (availBytes < requiredBytes) {
+            throw new IllegalStateException("Insufficient storage for OTA download (" + availBytes + " < " + requiredBytes + ")");
+        }
+
         File tmpDir = new File(otaDir, "tmp");
         if (!tmpDir.exists() && !tmpDir.mkdirs()) {
             throw new IllegalStateException("Cannot create OTA tmp directory");
         }
         File tmpFile = new File(tmpDir, releaseId + "." + System.currentTimeMillis() + ".part");
-        int timeoutMs = Math.max(5000, Math.min(120000, args.optInt("timeoutMs", 45000)));
-
         try {
-            DownloadDigest digest = downloadToTempFile(
-                    bundleUrl,
-                    args.optJSONObject("headers"),
-                    timeoutMs,
-                    tmpFile,
-                    releaseId,
-                    expectedSize);
-
+            DownloadDigest digest = downloadToTempFile(bundleUrl, headers, timeoutMs, tmpFile, releaseId, expectedSize);
             emitProgress(releaseId, digest.bytesWritten, expectedSize > 0 ? expectedSize : digest.bytesWritten, "verifying");
 
             if (expectedSize > 0 && digest.bytesWritten != expectedSize) {
@@ -334,8 +589,8 @@ public final class GpuiOtaManager {
             if (!digest.sha256Hex.equalsIgnoreCase(expectedSha)) {
                 throw new IllegalStateException("SHA-256 mismatch: expected " + expectedSha + ", got " + digest.sha256Hex);
             }
-            if ("hbc".equals(format) && !hasValidHermesMagic(tmpFile)) {
-                throw new IllegalStateException("Invalid Hermes bytecode magic header");
+            if ("hbc".equals(format) && !hasValidHermesHeader(tmpFile, meta.hbcVersion)) {
+                throw new IllegalStateException("Invalid or incompatible Hermes bytecode header/version");
             }
             if (!meta.publicKey.isEmpty()) {
                 verifyEcdsaSignature(tmpFile, meta.publicKey, signatureB64);
@@ -347,13 +602,11 @@ public final class GpuiOtaManager {
             if (destParent != null && !destParent.exists() && !destParent.mkdirs()) {
                 throw new IllegalStateException("Cannot create release directory");
             }
-            if (destFile.exists() && !destFile.delete()) {
-                throw new IllegalStateException("Cannot overwrite staged bundle file");
-            }
             if (!tmpFile.renameTo(destFile)) {
                 copyFileAtomic(tmpFile, destFile);
             }
 
+            long seq = Math.max(0L, manifest.optLong("manifestSeq", 0L));
             BundleSlot staged = new BundleSlot();
             staged.id = releaseId;
             staged.sha256 = digest.sha256Hex.toLowerCase(Locale.US);
@@ -362,27 +615,100 @@ public final class GpuiOtaManager {
             staged.confirmed = false;
             staged.attempts = 0;
 
-            OtaState updated;
-            synchronized (STATE_LOCK) {
-                updated = loadOrSyncStateLocked(ctx, meta);
+            withStateLock(ctx, () -> {
+                OtaState updated = loadOrSyncStateLocked(ctx, meta);
                 updated.staged = staged;
+                if (seq > updated.minManifestSeq) {
+                    updated.minManifestSeq = seq;
+                }
                 saveStateLocked(ctx, updated);
                 gcUnusedReleasesLocked(otaDir, updated);
-            }
+                return null;
+            });
 
             emitProgress(releaseId, digest.bytesWritten, digest.bytesWritten, "ready");
-            JSONObject res = buildStateJson(meta, updated);
-            res.put("downloaded", true);
-            res.put("reused", false);
-            res.put("releaseId", releaseId);
-            res.put("bytes", digest.bytesWritten);
-            GpuiNativeBridge.resolve(reqId, res);
+            return new DownloadResult(releaseId, digest.bytesWritten);
         } finally {
             if (tmpFile.exists()) {
                 //noinspection ResultOfMethodCallIgnored
                 tmpFile.delete();
             }
         }
+    }
+
+    private static OtaState activateStagedSlot(
+            Context ctx,
+            EmbeddedMeta meta,
+            String expectedReleaseId,
+            boolean demoteActiveAsFailed
+    ) throws Exception {
+        return withStateLock(ctx, () -> {
+            OtaState updated = loadOrSyncStateLocked(ctx, meta);
+            if (updated.staged == null) {
+                throw new IllegalStateException("No staged OTA bundle is ready to apply");
+            }
+            if (expectedReleaseId != null && !expectedReleaseId.equals(updated.staged.id)) {
+                throw new IllegalStateException("Staged release mismatch");
+            }
+            if (!verifySlotFile(ctx, updated.staged, meta.hbcVersion)) {
+                updated.staged = null;
+                saveStateLocked(ctx, updated);
+                throw new IllegalStateException("Staged OTA bundle failed integrity verification");
+            }
+            if (demoteActiveAsFailed && updated.active != null) {
+                addFailedId(updated.failedIds, updated.active.id);
+                updated.active = null;
+            } else if (updated.active != null && updated.active.confirmed
+                    && !updated.active.id.equals(updated.staged.id)
+                    && !updated.failedIds.contains(updated.active.id)
+                    && verifySlotFile(ctx, updated.active, meta.hbcVersion)) {
+                BundleSlot prev = updated.active.copy();
+                prev.confirmed = true;
+                prev.attempts = 0;
+                updated.prev = prev;
+            }
+            BundleSlot nextActive = updated.staged.copy();
+            nextActive.confirmed = false;
+            nextActive.attempts = 0;
+            updated.active = nextActive;
+            updated.staged = null;
+            updated.lastRollbackReason = "";
+            if (demoteActiveAsFailed) {
+                updated.bootCrashStreak = 0;
+            }
+            saveStateLocked(ctx, updated);
+            gcUnusedReleasesLocked(getOtaDir(ctx), updated);
+            return updated;
+        });
+    }
+
+    private static boolean applyKillSwitchLocked(
+            Context ctx,
+            EmbeddedMeta meta,
+            JSONObject manifest,
+            String reason
+    ) throws Exception {
+        long seq = Math.max(0L, manifest.optLong("manifestSeq", 0L));
+        return withStateLock(ctx, () -> {
+            OtaState state = loadOrSyncStateLocked(ctx, meta);
+            if (seq > 0 && seq < state.minManifestSeq) {
+                return false;
+            }
+            if (state.active != null) {
+                addFailedId(state.failedIds, state.active.id);
+            }
+            state.active = null;
+            state.prev = null;
+            state.staged = null;
+            state.bootCrashStreak = 0;
+            if (seq > state.minManifestSeq) {
+                state.minManifestSeq = seq;
+            }
+            state.lastRollbackReason = sanitizeSingleLine(reason);
+            saveStateLocked(ctx, state);
+            gcUnusedReleasesLocked(getOtaDir(ctx), state);
+            return true;
+        });
     }
 
     private static void handleApply(Activity activity, long reqId, JSONObject args) throws Exception {
@@ -394,39 +720,8 @@ public final class GpuiOtaManager {
             return;
         }
 
-        OtaState updated;
-        String appliedId;
-        synchronized (STATE_LOCK) {
-            updated = loadOrSyncStateLocked(ctx, meta);
-            if (updated.staged == null) {
-                GpuiNativeBridge.reject(reqId, "No staged OTA bundle is ready to apply");
-                return;
-            }
-            if (!verifySlotFile(ctx, updated.staged)) {
-                updated.staged = null;
-                saveStateLocked(ctx, updated);
-                GpuiNativeBridge.reject(reqId, "Staged OTA bundle failed integrity verification");
-                return;
-            }
-            if (updated.active != null && updated.active.confirmed
-                    && !updated.active.id.equals(updated.staged.id)
-                    && !updated.failedIds.contains(updated.active.id)
-                    && verifySlotFile(ctx, updated.active)) {
-                BundleSlot prev = updated.active.copy();
-                prev.confirmed = true;
-                prev.attempts = 0;
-                updated.prev = prev;
-            }
-            BundleSlot nextActive = updated.staged.copy();
-            nextActive.confirmed = false;
-            nextActive.attempts = 0;
-            appliedId = nextActive.id;
-            updated.active = nextActive;
-            updated.staged = null;
-            updated.lastRollbackReason = "";
-            saveStateLocked(ctx, updated);
-            gcUnusedReleasesLocked(getOtaDir(ctx), updated);
-        }
+        OtaState updated = activateStagedSlot(ctx, meta, null, false);
+        String appliedId = updated.active != null ? updated.active.id : "";
 
         JSONObject res = buildStateJson(meta, updated);
         res.put("applied", true);
@@ -450,21 +745,42 @@ public final class GpuiOtaManager {
 
     private static void handleConfirm(Activity activity, long reqId) throws Exception {
         Context ctx = activity.getApplicationContext();
-        EmbeddedMeta meta = loadEmbeddedMeta(ctx);
-        OtaState state;
-        boolean confirmedNow = false;
-        synchronized (STATE_LOCK) {
-            state = loadOrSyncStateLocked(ctx, meta);
-            if (state.active != null) {
-                state.active.confirmed = true;
-                state.active.attempts = 0;
-                state.lastRollbackReason = "";
-                saveStateLocked(ctx, state);
-                confirmedNow = true;
-            }
+        if (safeHasBootFatal()) {
+            EmbeddedMeta meta = loadEmbeddedMeta(ctx);
+            OtaState state = withStateLock(ctx, () -> loadOrSyncStateLocked(ctx, meta));
+            JSONObject res = buildStateJson(meta, state);
+            res.put("confirmedNow", false);
+            res.put("blockedByFatal", true);
+            GpuiNativeBridge.resolve(reqId, res);
+            return;
         }
+
+        EmbeddedMeta meta = loadEmbeddedMeta(ctx);
+        final boolean[] slotConfirmed = new boolean[] { false };
+        OtaState state = withStateLock(ctx, () -> {
+            OtaState s = loadOrSyncStateLocked(ctx, meta);
+            boolean dirty = false;
+            if (s.bootInProgress || s.bootCrashStreak > 0) {
+                s.bootInProgress = false;
+                s.bootCrashStreak = 0;
+                dirty = true;
+            }
+            if (s.active != null) {
+                s.active.confirmed = true;
+                s.active.attempts = 0;
+                s.lastRollbackReason = "";
+                slotConfirmed[0] = true;
+                dirty = true;
+            }
+            if (dirty) {
+                saveStateLocked(ctx, s);
+            }
+            return s;
+        });
+        safeMarkBootHealthy();
+
         JSONObject res = buildStateJson(meta, state);
-        res.put("confirmedNow", confirmedNow);
+        res.put("confirmedNow", slotConfirmed[0]);
         GpuiNativeBridge.resolve(reqId, res);
     }
 
@@ -475,32 +791,33 @@ public final class GpuiOtaManager {
         String mode = args.optString("mode", "hot").trim().toLowerCase(Locale.US);
         String reason = args.optString("reason", "manual rollback").trim();
         if (reason.isEmpty()) reason = "manual rollback";
+        final String finalReason = reason;
 
-        OtaState state;
-        String rolledBackFrom = null;
-        synchronized (STATE_LOCK) {
-            state = loadOrSyncStateLocked(ctx, meta);
-            if (state.active != null) {
-                rolledBackFrom = state.active.id;
-                addFailedId(state.failedIds, rolledBackFrom);
-                state.active = null;
+        final String[] rolledBackFrom = new String[1];
+        OtaState state = withStateLock(ctx, () -> {
+            OtaState s = loadOrSyncStateLocked(ctx, meta);
+            if (s.active != null) {
+                rolledBackFrom[0] = s.active.id;
+                addFailedId(s.failedIds, rolledBackFrom[0]);
+                s.active = null;
             }
-            if (state.prev != null && !state.failedIds.contains(state.prev.id) && verifySlotFile(ctx, state.prev)) {
-                BundleSlot restored = state.prev.copy();
+            if (s.prev != null && !s.failedIds.contains(s.prev.id) && verifySlotFile(ctx, s.prev, meta.hbcVersion)) {
+                BundleSlot restored = s.prev.copy();
                 restored.confirmed = true;
                 restored.attempts = 0;
-                state.active = restored;
-                state.prev = null;
+                s.active = restored;
+                s.prev = null;
             } else {
-                state.prev = null;
+                s.prev = null;
             }
-            state.lastRollbackReason = sanitizeSingleLine(reason);
-            saveStateLocked(ctx, state);
-            gcUnusedReleasesLocked(getOtaDir(ctx), state);
-        }
+            s.lastRollbackReason = sanitizeSingleLine(finalReason);
+            saveStateLocked(ctx, s);
+            gcUnusedReleasesLocked(getOtaDir(ctx), s);
+            return s;
+        });
 
         JSONObject res = buildStateJson(meta, state);
-        res.put("rolledBackFrom", rolledBackFrom != null ? rolledBackFrom : JSONObject.NULL);
+        res.put("rolledBackFrom", rolledBackFrom[0] != null ? rolledBackFrom[0] : JSONObject.NULL);
         GpuiNativeBridge.resolve(reqId, res);
 
         if (applyNow) {
@@ -522,14 +839,14 @@ public final class GpuiOtaManager {
         Context ctx = activity.getApplicationContext();
         EmbeddedMeta meta = loadEmbeddedMeta(ctx);
         boolean applyNow = args.optBoolean("applyNow", true);
-        OtaState fresh;
-        synchronized (STATE_LOCK) {
+        OtaState fresh = withStateLock(ctx, () -> {
             File otaDir = getOtaDir(ctx);
             deleteRecursively(new File(otaDir, "releases"));
             deleteRecursively(new File(otaDir, "tmp"));
-            fresh = resetStateForMeta(meta);
-            saveStateLocked(ctx, fresh);
-        }
+            OtaState next = resetStateForMeta(meta);
+            saveStateLocked(ctx, next);
+            return next;
+        });
         JSONObject res = buildStateJson(meta, fresh);
         res.put("reset", true);
         GpuiNativeBridge.resolve(reqId, res);
@@ -545,12 +862,73 @@ public final class GpuiOtaManager {
         }
     }
 
-    // ── Manifest & HTTP helpers ──────────────────────────────────────────────
+    // ── Manifest, signature & HTTP helpers ───────────────────────────────────
+
+    private static String isManifestCompatible(EmbeddedMeta meta, JSONObject manifest, boolean detailed) {
+        String manifestAppId = manifest.optString("appId", "");
+        String manifestRuntime = manifest.optString("runtimeVersion", "");
+        long minVersionCode = manifest.optLong("minVersionCode", 1);
+        JSONObject bundle = manifest.optJSONObject("bundle");
+        long declaredHbcVersion = bundle != null ? bundle.optLong("hermesBytecodeVersion", 0) : 0;
+
+        if (!meta.appId.isEmpty() && !meta.appId.equals(manifestAppId)) {
+            return detailed ? ("OTA manifest appId mismatch: " + manifestAppId) : "app_id_mismatch";
+        }
+        if (!meta.runtimeVersion.isEmpty() && !meta.runtimeVersion.equals(manifestRuntime)) {
+            return detailed ? ("OTA runtimeVersion mismatch: " + manifestRuntime + " != " + meta.runtimeVersion) : "runtime_mismatch";
+        }
+        if (meta.versionCode > 0 && meta.versionCode < minVersionCode) {
+            return detailed ? ("APK versionCode " + meta.versionCode + " < minVersionCode " + minVersionCode) : "min_version_not_met";
+        }
+        if (meta.hbcVersion > 0 && declaredHbcVersion > 0 && meta.hbcVersion != declaredHbcVersion) {
+            return detailed ? ("Hermes bytecode version mismatch: " + declaredHbcVersion + " != " + meta.hbcVersion) : "hbc_version_mismatch";
+        }
+        return null;
+    }
+
+    /** Canonical manifest signing payload shared byte-for-byte with `scripts/ota.ts`. */
+    public static String buildManifestSigningPayload(JSONObject manifest) {
+        int schemaVersion = manifest.optInt("schemaVersion", 1);
+        String action = manifest.optString("action", "update").trim();
+        if (action.isEmpty()) action = "update";
+        String appId = manifest.optString("appId", "").trim();
+        String channel = manifest.optString("channel", "").trim();
+        String runtimeVersion = manifest.optString("runtimeVersion", "").trim();
+        String releaseId = manifest.optString("releaseId", "").trim();
+        long minVersionCode = manifest.optLong("minVersionCode", 1);
+        long manifestSeq = manifest.optLong("manifestSeq", 0);
+        boolean mandatory = manifest.optBoolean("mandatory", false);
+        JSONObject bundle = manifest.optJSONObject("bundle");
+        String bundleFormat = bundle != null ? bundle.optString("format", "").trim().toLowerCase(Locale.US) : "";
+        String bundleSha256 = bundle != null ? bundle.optString("sha256", "").trim().toLowerCase(Locale.US) : "";
+        long bundleSize = bundle != null ? bundle.optLong("size", 0) : 0;
+        long hbcVersion = bundle != null ? bundle.optLong("hermesBytecodeVersion", 0) : 0;
+
+        return "gpuix-ota-manifest-v1\n"
+                + "schemaVersion=" + schemaVersion + "\n"
+                + "action=" + action + "\n"
+                + "appId=" + appId + "\n"
+                + "channel=" + channel + "\n"
+                + "runtimeVersion=" + runtimeVersion + "\n"
+                + "releaseId=" + releaseId + "\n"
+                + "minVersionCode=" + minVersionCode + "\n"
+                + "manifestSeq=" + manifestSeq + "\n"
+                + "mandatory=" + (mandatory ? "true" : "false") + "\n"
+                + "bundleFormat=" + bundleFormat + "\n"
+                + "bundleSha256=" + bundleSha256 + "\n"
+                + "bundleSize=" + bundleSize + "\n"
+                + "hermesBytecodeVersion=" + hbcVersion + "\n";
+    }
 
     private static JSONObject normalizeAndValidateManifest(Context ctx, String baseUrl, JSONObject raw) throws Exception {
         int schemaVersion = raw.optInt("schemaVersion", -1);
         if (schemaVersion != 1) {
             throw new IllegalArgumentException("Unsupported OTA manifest schemaVersion: " + schemaVersion);
+        }
+        String action = raw.optString("action", "update").trim();
+        if (action.isEmpty()) action = "update";
+        if (!"update".equals(action) && !"rollback_to_embedded".equals(action)) {
+            throw new IllegalArgumentException("Unsupported OTA manifest action: " + action);
         }
         String appId = raw.optString("appId", "").trim();
         String runtimeVersion = raw.optString("runtimeVersion", "").trim();
@@ -558,6 +936,24 @@ public final class GpuiOtaManager {
         if (appId.isEmpty() || runtimeVersion.isEmpty() || !isValidReleaseId(releaseId)) {
             throw new IllegalArgumentException("Invalid manifest appId, runtimeVersion, or releaseId");
         }
+
+        EmbeddedMeta meta = loadEmbeddedMeta(ctx);
+        String manifestSig = raw.optString("manifestSignature", "").trim();
+        if (!meta.publicKey.isEmpty()) {
+            if ("rollback_to_embedded".equals(action) && manifestSig.isEmpty()) {
+                throw new SecurityException("rollback_to_embedded requires signed manifestSignature");
+            }
+            if (!manifestSig.isEmpty()) {
+                verifyEcdsaBytes(buildManifestSigningPayload(raw).getBytes(StandardCharsets.UTF_8), meta.publicKey, manifestSig);
+            }
+        }
+
+        JSONObject normalized = new JSONObject(raw.toString());
+        normalized.put("action", action);
+        if ("rollback_to_embedded".equals(action)) {
+            return normalized;
+        }
+
         JSONObject bundle = raw.optJSONObject("bundle");
         if (bundle == null) {
             throw new IllegalArgumentException("Manifest missing bundle object");
@@ -584,11 +980,10 @@ public final class GpuiOtaManager {
             throw new IllegalArgumentException("Invalid bundle.sha256 in manifest");
         }
         long size = bundle.optLong("size", -1);
-        if (size == 0 || size > MAX_BUNDLE_BYTES) {
+        if (size <= 0 || size > MAX_BUNDLE_BYTES) {
             throw new IllegalArgumentException("Invalid bundle.size in manifest: " + size);
         }
 
-        JSONObject normalized = new JSONObject(raw.toString());
         JSONObject normBundle = new JSONObject(bundle.toString());
         normBundle.put("format", format);
         normBundle.put("url", resolvedUrl);
@@ -601,17 +996,14 @@ public final class GpuiOtaManager {
         URL parsed = new URL(rawUrl);
         String scheme = parsed.getProtocol() != null ? parsed.getProtocol().toLowerCase(Locale.US) : "";
         boolean isDebuggable = (ctx.getApplicationInfo().flags & ApplicationInfo.FLAG_DEBUGGABLE) != 0;
-        if ("https".equals(scheme)) {
-            return;
-        }
-        if ("http".equals(scheme) && isDebuggable) {
+        if ("https".equals(scheme) || ("http".equals(scheme) && isDebuggable)) {
             return;
         }
         throw new SecurityException(label + " must use https:// in release builds");
     }
 
-    private static String fetchText(String urlStr, JSONObject headers, int timeoutMs) throws Exception {
-        HttpURLConnection conn = openConnection(urlStr, headers, timeoutMs);
+    private static String fetchText(String urlStr, JSONObject headers, int connectTimeoutMs, int readTimeoutMs) throws Exception {
+        HttpURLConnection conn = openConnection(urlStr, headers, connectTimeoutMs, readTimeoutMs);
         try {
             int status = conn.getResponseCode();
             InputStream stream = status >= 400 ? conn.getErrorStream() : conn.getInputStream();
@@ -655,7 +1047,7 @@ public final class GpuiOtaManager {
             String releaseId,
             long expectedSize
     ) throws Exception {
-        HttpURLConnection conn = openConnection(urlStr, headers, timeoutMs);
+        HttpURLConnection conn = openConnection(urlStr, headers, Math.min(timeoutMs, 10000), timeoutMs);
         try {
             int status = conn.getResponseCode();
             if (status < 200 || status >= 300) {
@@ -692,11 +1084,16 @@ public final class GpuiOtaManager {
         }
     }
 
-    private static HttpURLConnection openConnection(String urlStr, JSONObject headers, int timeoutMs) throws Exception {
+    private static HttpURLConnection openConnection(
+            String urlStr,
+            JSONObject headers,
+            int connectTimeoutMs,
+            int readTimeoutMs
+    ) throws Exception {
         HttpURLConnection conn = (HttpURLConnection) new URL(urlStr).openConnection();
         conn.setRequestMethod("GET");
-        conn.setConnectTimeout(timeoutMs);
-        conn.setReadTimeout(timeoutMs);
+        conn.setConnectTimeout(connectTimeoutMs);
+        conn.setReadTimeout(readTimeoutMs);
         conn.setInstanceFollowRedirects(true);
         conn.setUseCaches(false);
         conn.setRequestProperty("Cache-Control", "no-cache");
@@ -711,6 +1108,19 @@ public final class GpuiOtaManager {
             }
         }
         return conn;
+    }
+
+    private static void verifyEcdsaBytes(byte[] payload, String publicKeyB64, String signatureB64) throws Exception {
+        byte[] keyBytes = Base64.decode(publicKeyB64, Base64.DEFAULT);
+        byte[] sigBytes = Base64.decode(signatureB64, Base64.DEFAULT);
+        KeyFactory kf = KeyFactory.getInstance("EC");
+        PublicKey publicKey = kf.generatePublic(new X509EncodedKeySpec(keyBytes));
+        Signature verifier = Signature.getInstance("SHA256withECDSA");
+        verifier.initVerify(publicKey);
+        verifier.update(payload);
+        if (!verifier.verify(sigBytes)) {
+            throw new SecurityException("OTA ECDSA manifest signature verification failed");
+        }
     }
 
     private static void verifyEcdsaSignature(File bundleFile, String publicKeyB64, String signatureB64) throws Exception {
@@ -732,7 +1142,47 @@ public final class GpuiOtaManager {
         }
     }
 
-    // ── Metadata & state persistence (aligned with android/rust/src/ota.rs) ──
+    // ── Metadata, cross-language lock & state persistence ────────────────────
+
+    private static <T> T withStateLock(Context ctx, StateAction<T> action) throws Exception {
+        synchronized (STATE_LOCK) {
+            File otaDir = getOtaDir(ctx);
+            if (!otaDir.exists() && !otaDir.mkdirs()) {
+                return action.run();
+            }
+            File lockFile = new File(otaDir, STATE_LOCK_NAME);
+            boolean acquired = false;
+            long deadline = System.currentTimeMillis() + LOCK_WAIT_MS;
+            while (System.currentTimeMillis() < deadline) {
+                try {
+                    if (lockFile.createNewFile()) {
+                        acquired = true;
+                        break;
+                    }
+                    long age = System.currentTimeMillis() - lockFile.lastModified();
+                    if (age > LOCK_STALE_MS) {
+                        //noinspection ResultOfMethodCallIgnored
+                        lockFile.delete();
+                        continue;
+                    }
+                    Thread.sleep(5);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    break;
+                } catch (Throwable ignored) {
+                    break;
+                }
+            }
+            try {
+                return action.run();
+            } finally {
+                if (acquired) {
+                    //noinspection ResultOfMethodCallIgnored
+                    lockFile.delete();
+                }
+            }
+        }
+    }
 
     private static EmbeddedMeta loadEmbeddedMeta(Context ctx) {
         EmbeddedMeta meta = new EmbeddedMeta();
@@ -764,6 +1214,7 @@ public final class GpuiOtaManager {
             if (!kv.getOrDefault("check_on_launch", "").isEmpty()) meta.checkOnLaunch = kv.get("check_on_launch");
             if (!kv.getOrDefault("embedded_format", "").isEmpty()) meta.embeddedFormat = kv.get("embedded_format");
             meta.embeddedBuildId = kv.getOrDefault("embedded_build_id", "");
+            meta.hbcVersion = parseLong(kv.get("hbc_version"), 0);
         } catch (Throwable ignored) {
         }
         return meta;
@@ -827,16 +1278,13 @@ public final class GpuiOtaManager {
             throw new IllegalStateException("Cannot create gpuix_ota directory");
         }
         File target = new File(otaDir, STATE_FILE_NAME);
-        File tmp = new File(otaDir, STATE_FILE_NAME + ".tmp");
+        File tmp = new File(otaDir, STATE_FILE_NAME + ".tmp." + Thread.currentThread().getId());
         String encoded = serializeStateKv(state);
         try (FileOutputStream fos = new FileOutputStream(tmp)) {
             fos.write(encoded.getBytes(StandardCharsets.UTF_8));
             fos.getFD().sync();
         }
-        if (target.exists() && !target.delete()) {
-            // Fallback replace when rename cannot overwrite directly.
-            Log.w(TAG, "Could not delete previous state.kv before rename");
-        }
+        // POSIX rename atomically replaces target without a deletion window.
         if (!tmp.renameTo(target)) {
             copyFileAtomic(tmp, target);
             //noinspection ResultOfMethodCallIgnored
@@ -896,6 +1344,9 @@ public final class GpuiOtaManager {
         }
         state.lastRollbackReason = kv.getOrDefault("last_rollback_reason", "");
         state.lastCheckedAt = parseLong(kv.get("last_checked_at"), 0);
+        state.bootInProgress = "1".equals(kv.get("boot_in_progress"));
+        state.bootCrashStreak = (int) parseLong(kv.get("boot_crash_streak"), 0);
+        state.minManifestSeq = parseLong(kv.get("min_manifest_seq"), 0);
         return state;
     }
 
@@ -934,6 +1385,9 @@ public final class GpuiOtaManager {
         sb.append("failed_ids=").append(failed).append('\n');
         sb.append("last_rollback_reason=").append(sanitizeSingleLine(state.lastRollbackReason)).append('\n');
         sb.append("last_checked_at=").append(state.lastCheckedAt).append('\n');
+        sb.append("boot_in_progress=").append(state.bootInProgress ? "1" : "0").append('\n');
+        sb.append("boot_crash_streak=").append(state.bootCrashStreak).append('\n');
+        sb.append("min_manifest_seq=").append(state.minManifestSeq).append('\n');
         return sb.toString();
     }
 
@@ -950,12 +1404,17 @@ public final class GpuiOtaManager {
         res.put("checkOnLaunch", meta.checkOnLaunch);
         res.put("embeddedFormat", meta.embeddedFormat);
         res.put("embeddedBuildId", meta.embeddedBuildId);
+        res.put("hbcVersion", meta.hbcVersion);
         res.put("currentReleaseId", state.active != null ? state.active.id : JSONObject.NULL);
         res.put("currentFormat", state.active != null ? state.active.format : meta.embeddedFormat);
         res.put("stagedReleaseId", state.staged != null ? state.staged.id : JSONObject.NULL);
         res.put("previousReleaseId", state.prev != null ? state.prev.id : JSONObject.NULL);
         res.put("confirmed", state.active == null || state.active.confirmed);
         res.put("launchAttempts", state.active != null ? state.active.attempts : 0);
+        res.put("bootCrashStreak", state.bootCrashStreak);
+        res.put("rescueMode", state.bootCrashStreak >= RESCUE_CRASH_THRESHOLD);
+        res.put("minManifestSeq", state.minManifestSeq);
+        res.put("nativeLaunchCheckStarted", sNativeLaunchCheckStarted);
         JSONArray failedArr = new JSONArray();
         for (String id : state.failedIds) failedArr.put(id);
         res.put("failedReleaseIds", failedArr);
@@ -964,9 +1423,9 @@ public final class GpuiOtaManager {
         return res;
     }
 
-    // ── File, crypto, GC & process restart helpers ───────────────────────────
+    // ── File, bytecode header, GC & process restart helpers ──────────────────
 
-    private static boolean verifySlotFile(Context ctx, BundleSlot slot) {
+    private static boolean verifySlotFile(Context ctx, BundleSlot slot, long expectedHbcVersion) {
         if (slot == null || !isValidReleaseId(slot.id) || !SHA256_PATTERN.matcher(slot.sha256).matches()) {
             return false;
         }
@@ -978,7 +1437,7 @@ public final class GpuiOtaManager {
             return false;
         }
         try {
-            if ("hbc".equals(slot.format) && !hasValidHermesMagic(file)) {
+            if ("hbc".equals(slot.format) && !hasValidHermesHeader(file, expectedHbcVersion)) {
                 return false;
             }
             String actual = computeSha256Hex(file);
@@ -988,15 +1447,22 @@ public final class GpuiOtaManager {
         }
     }
 
-    private static boolean hasValidHermesMagic(File file) throws Exception {
-        if (file.length() < HERMES_MAGIC.length) return false;
-        byte[] header = new byte[HERMES_MAGIC.length];
+    private static boolean hasValidHermesHeader(File file, long expectedHbcVersion) throws Exception {
+        if (file.length() < 12) return false;
+        byte[] header = new byte[12];
         try (FileInputStream fis = new FileInputStream(file)) {
             int n = fis.read(header);
-            if (n < HERMES_MAGIC.length) return false;
+            if (n < 12) return false;
         }
         for (int i = 0; i < HERMES_MAGIC.length; i++) {
             if (header[i] != HERMES_MAGIC[i]) return false;
+        }
+        if (expectedHbcVersion > 0) {
+            long actualVer = (header[8] & 0xFFL)
+                    | ((header[9] & 0xFFL) << 8)
+                    | ((header[10] & 0xFFL) << 16)
+                    | ((header[11] & 0xFFL) << 24);
+            if (actualVer != expectedHbcVersion) return false;
         }
         return true;
     }
@@ -1158,7 +1624,37 @@ public final class GpuiOtaManager {
         target.delete();
     }
 
+    // ── Safe JNI wrappers ────────────────────────────────────────────────────
+
+    private static void safeSetBootGateReady(boolean ready) {
+        try {
+            nativeSetBootGateReady(ready);
+        } catch (UnsatisfiedLinkError ignored) {
+        }
+    }
+
+    private static void safeMarkBootHealthy() {
+        try {
+            nativeMarkBootHealthy();
+        } catch (UnsatisfiedLinkError ignored) {
+        }
+    }
+
+    private static boolean safeHasBootFatal() {
+        try {
+            return nativeHasBootFatal();
+        } catch (UnsatisfiedLinkError ignored) {
+            return false;
+        }
+    }
+
     // ── JNI hooks implemented by android/rust/src/lib.rs ─────────────────────
+
+    private static native void nativeSetBootGateReady(boolean ready);
+
+    private static native void nativeMarkBootHealthy();
+
+    private static native boolean nativeHasBootFatal();
 
     private static native boolean nativeTriggerHotApply();
 

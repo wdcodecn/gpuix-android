@@ -26,11 +26,13 @@ import org.json.JSONArray;
 import org.json.JSONObject;
 
 /**
- * Device/battery info, system UI (toast, alert, status bar, keepScreenOn), clipboard, launcher, and permissions.
+ * Device/battery info, system UI (toast, alert, status bar, keepScreenOn), clipboard, launcher, permissions, and network monitor.
  */
 public final class DeviceSystemPlugin {
 
     private static volatile String sInitialDeepLink = null;
+    private static ConnectivityManager.NetworkCallback sNetworkCallback = null;
+    private static final Object NET_LOCK = new Object();
 
     private DeviceSystemPlugin() {
     }
@@ -45,6 +47,69 @@ public final class DeviceSystemPlugin {
 
     public static void setInitialDeepLink(String url) {
         sInitialDeepLink = url;
+    }
+
+    public static void startNetworkMonitor(Context ctx) {
+        Context appCtx = ctx.getApplicationContext();
+        ConnectivityManager cm = (ConnectivityManager) appCtx.getSystemService(Context.CONNECTIVITY_SERVICE);
+        if (cm == null) return;
+        synchronized (NET_LOCK) {
+            if (sNetworkCallback != null) return;
+            ConnectivityManager.NetworkCallback cb = new ConnectivityManager.NetworkCallback() {
+                @Override
+                public void onAvailable(Network network) {
+                    emitNetworkState(cm);
+                }
+
+                @Override
+                public void onLost(Network network) {
+                    emitNetworkState(cm);
+                }
+
+                @Override
+                public void onCapabilitiesChanged(Network network, NetworkCapabilities caps) {
+                    emitNetworkState(cm);
+                }
+            };
+            try {
+                cm.registerDefaultNetworkCallback(cb);
+                sNetworkCallback = cb;
+            } catch (Throwable ignored) {
+            }
+        }
+    }
+
+    public static void stopNetworkMonitor(Context ctx) {
+        ConnectivityManager cm = (ConnectivityManager) ctx.getApplicationContext().getSystemService(Context.CONNECTIVITY_SERVICE);
+        synchronized (NET_LOCK) {
+            if (cm != null && sNetworkCallback != null) {
+                try {
+                    cm.unregisterNetworkCallback(sNetworkCallback);
+                } catch (Throwable ignored) {
+                }
+            }
+            sNetworkCallback = null;
+        }
+    }
+
+    private static void emitNetworkState(ConnectivityManager cm) {
+        try {
+            Network active = cm.getActiveNetwork();
+            NetworkCapabilities caps = active != null ? cm.getNetworkCapabilities(active) : null;
+            String netType = "none";
+            if (caps != null) {
+                if (caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) netType = "wifi";
+                else if (caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)) netType = "cellular";
+                else if (caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)) netType = "ethernet";
+                else netType = "other";
+            }
+            JSONObject payload = new JSONObject()
+                    .put("connected", !"none".equals(netType))
+                    .put("networkType", netType)
+                    .put("isMetered", cm.isActiveNetworkMetered());
+            BridgeContext.emitEvent("networkChange", payload);
+        } catch (Throwable ignored) {
+        }
     }
 
     public static void handleDevice(Activity activity, long reqId, String method) throws Exception {
@@ -241,6 +306,35 @@ public final class DeviceSystemPlugin {
                 Intent chooser = Intent.createChooser(send, title);
                 activity.startActivity(chooser);
                 BridgeContext.resolve(reqId, new JSONObject().put("shared", true));
+                break;
+            }
+            case "isAppInstalled": {
+                String pkg = args.optString("packageName", "").trim();
+                boolean installed = false;
+                if (!pkg.isEmpty()) {
+                    try {
+                        activity.getPackageManager().getPackageInfo(pkg, 0);
+                        installed = true;
+                    } catch (PackageManager.NameNotFoundException ignored) {
+                    }
+                }
+                BridgeContext.resolve(reqId, new JSONObject().put("installed", installed));
+                break;
+            }
+            case "openMarket": {
+                String pkg = args.optString("packageName", "").trim();
+                if (pkg.isEmpty()) pkg = activity.getPackageName();
+                Intent market = new Intent(Intent.ACTION_VIEW, Uri.parse("market://details?id=" + Uri.encode(pkg)));
+                market.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                try {
+                    activity.startActivity(market);
+                } catch (Throwable ignored) {
+                    Intent web = new Intent(Intent.ACTION_VIEW,
+                            Uri.parse("https://play.google.com/store/apps/details?id=" + Uri.encode(pkg)));
+                    web.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                    activity.startActivity(web);
+                }
+                BridgeContext.resolve(reqId, new JSONObject().put("opened", true));
                 break;
             }
             default:

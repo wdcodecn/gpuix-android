@@ -1,5 +1,14 @@
 import { getBridgeState } from './bridge-state'
-import type { GpuixNativeBinding, GpuixNativeSdk, OtaProgressEvent, SensorReading, Unsubscribe } from './types'
+import type {
+  AppStateEvent,
+  GpuixNativeBinding,
+  GpuixNativeSdk,
+  NetworkChangeEvent,
+  OtaProgressEvent,
+  SensorReading,
+  TransferProgressEvent,
+  Unsubscribe,
+} from './types'
 
 function getNativeBinding(): GpuixNativeBinding {
   return ((globalThis as { __gpuixNative?: GpuixNativeBinding }).__gpuixNative ?? {}) as GpuixNativeBinding
@@ -172,6 +181,8 @@ export function createGpuixNativeSdk(): GpuixNativeSdk {
         state.deepLinkListeners.delete(handler)
       }
     },
+    onAppStateChange: (fn) => sdk.onEvent('appState', fn as (payload: unknown) => void),
+    onNetworkChange: (fn) => sdk.onEvent('networkChange', fn as (payload: unknown) => void),
     notifications: {
       areEnabled: () => invokeNative('notifications', 'areEnabled', {}),
       show: (opts) => invokeNative('notifications', 'show', opts || {}),
@@ -229,6 +240,10 @@ export function createGpuixNativeSdk(): GpuixNativeSdk {
       canOpenUrl: (url) => invokeNative('launcher', 'canOpenUrl', { url: String(url || '') }),
       getInitialUrl: () => invokeNative('launcher', 'getInitialUrl', {}),
       share: (opts) => invokeNative('launcher', 'share', opts || {}, 120000),
+      isAppInstalled: (packageName) =>
+        invokeNative('launcher', 'isAppInstalled', { packageName: String(packageName || '') }),
+      openMarket: (packageName) =>
+        invokeNative('launcher', 'openMarket', packageName ? { packageName: String(packageName) } : {}),
     },
     permissions: {
       check: (permission) => invokeNative('permissions', 'check', { permission: String(permission || '') }),
@@ -262,10 +277,52 @@ export function createGpuixNativeSdk(): GpuixNativeSdk {
           account: account || 'default',
         }),
     },
+    fs: {
+      readText: (path, scope) =>
+        invokeNative('fs', 'readText', { path: String(path || ''), scope: scope || 'files' }),
+      writeText: (path, content, opts) =>
+        invokeNative('fs', 'writeText', {
+          path: String(path || ''),
+          content: String(content ?? ''),
+          scope: opts?.scope || 'files',
+          append: !!opts?.append,
+        }),
+      readBase64: (path, scope) =>
+        invokeNative('fs', 'readBase64', { path: String(path || ''), scope: scope || 'files' }),
+      writeBase64: (path, base64, opts) =>
+        invokeNative('fs', 'writeBase64', {
+          path: String(path || ''),
+          base64: String(base64 || ''),
+          scope: opts?.scope || 'files',
+          append: !!opts?.append,
+        }),
+      exists: (path, scope) =>
+        invokeNative('fs', 'exists', { path: String(path || ''), scope: scope || 'files' }),
+      stat: (path, scope) =>
+        invokeNative('fs', 'stat', { path: String(path || ''), scope: scope || 'files' }),
+      list: (path, scope) =>
+        invokeNative('fs', 'list', { path: path || '', scope: scope || 'files' }),
+      mkdir: (path, scope) =>
+        invokeNative('fs', 'mkdir', { path: String(path || ''), scope: scope || 'files' }),
+      remove: (path, opts) =>
+        invokeNative('fs', 'remove', {
+          path: String(path || ''),
+          scope: opts?.scope || 'files',
+          recursive: opts?.recursive !== false,
+        }),
+      getStorageInfo: () => invokeNative('fs', 'getStorageInfo', {}),
+    },
+    transfer: {
+      downloadFile: (opts) => invokeNative('transfer', 'downloadFile', opts || {}, 180000),
+      uploadFile: (opts) => invokeNative('transfer', 'uploadFile', opts || {}, 180000),
+      onProgress: (fn) => sdk.onEvent('transferProgress', fn as (payload: unknown) => void),
+    },
     media: {
       pickImage: () => invokeNative('media', 'pickImage', {}, 120000),
       pickFile: (mimeType) => invokeNative('media', 'pickFile', { mimeType: mimeType || '*/*' }, 120000),
       takePhoto: () => invokeNative('media', 'takePhoto', {}, 120000),
+      saveToGallery: (opts) => invokeNative('media', 'saveToGallery', opts || {}, 60000),
+      compressImage: (opts) => invokeNative('media', 'compressImage', opts || {}, 60000),
     },
     location: {
       getCurrentPosition: () => invokeNative('location', 'getCurrentPosition', {}, 30000),
@@ -292,4 +349,4 @@ export function installGpuixSdk(): void {
   g.gpuix = createGpuixNativeSdk()
 }
 
-export type { SensorReading, OtaProgressEvent }
+export type { AppStateEvent, NetworkChangeEvent, OtaProgressEvent, SensorReading, TransferProgressEvent }

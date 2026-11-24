@@ -32,12 +32,12 @@ Android 不包含 WebView，也不使用 React Native View 层。JS 仍然会产
 | --- | --- | --- |
 | `gpuix-base-ui` 依赖 | Base UI 组件、浮层、表单、主题与公共合约 | 在业务 App 中按需导入 |
 | `android/runtime` | 类型化 Android JS 运行时（`utf8`/`url`/`viewport`/`gpx1`/`web-apis`/`native-bridge`/`websocket`）与 `GpuixNativeSdk` | 由框架维护 |
-| `android/app/.../bridge` | 模块化 Java 原生插件（通知、音频/触感、生物识别/闪光灯/传感器、设备系统、KV/Keystore 存储、媒体/定位） | 由框架维护 |
+| `android/app/.../bridge` | 零三方依赖轻量插件（通知、音频/触感、生物识别/闪光灯/传感器、设备系统与网络监听、KV/Keystore 存储、媒体选取/相册保存/图片压缩、沙箱文件 `fs` 与流式传输 `transfer`、应用启动检测/跳商店） | 由框架维护 |
 | `android/vendor/gpuix-native` | GPUIX retained tree、N-API renderer、原生绘制与主动会话交接 | 由框架维护 |
 | `android/vendor/gpui-mobile` | Android window、输入、insets、滚动、帧策略与每会话平台生命周期 | 由框架维护 |
-| `android/rust`、`android/hermes` | Android 入口和独立 Hermes 运行时装载 | 受管托管 / `--eject` 后可自定义 |
-| `android/scripts` | JS 打包、Hermes、Rust、16KB 对齐校验、Gradle、APK/AAB 产物 | CLI 调用 |
-| `gpuix.android.json` | App 身份、入口、版本、可选 `features` 与 `abis`（受管模式唯一必需配置） | 每个 App 必须维护 |
+| `android/rust`、`android/hermes` | Android 入口、独立 Hermes 运行时、JS 无锁心跳探针、Rust `BOOT_GATE` 与 Watchdog 自愈 | 受管托管 / `--eject` 后可自定义 |
+| `android/scripts` | JS 打包、Hermes（输出 `hbc_version`）、声明式权限裁剪（`.build/AndroidManifest.xml`）、Rust、16KB 对齐校验、Gradle、APK/AAB 产物 | CLI 调用 |
+| `gpuix.android.json` | App 身份、入口、版本、可选 `features`/`abis`/`permissions` 与 `ota` 配置（受管模式唯一必需配置） | 每个 App 必须维护 |
 | `templates/react-gpui/src/main.tsx` | App 根组件模板 | 新项目的业务入口 |
 
 ## 外部接口与宿主模式（Managed vs Ejected）
@@ -63,7 +63,7 @@ Android 不包含 WebView，也不使用 React Native View 层。JS 仍然会产
 - JS UI 突变优先经 `GPX1` 零拷贝二进制突变协议 + 驻留 `StyleTable` 进入锁外预处理与 retained tree 合并，静态页面不主动重绘。
 - 窗口尺寸与安全区 insets 通过 `SharedWindowMetrics` 无锁快照与主动 `windowResize`/`windowInsets` Push 事件同步，避免 JS 轮询。
 - 渲染帧调度直接绑定 Android `AChoreographer` 硬件 VSync（`PresentMode::Fifo`）并采集 `pointer.history()` 历史触控样本；手势越过阈值或原生 Motion Spring 动画运行期间自动联动交互高刷，静止后恢复省电刷新策略。
-- **JS 运行时与 Java 插件架构**：[`android/runtime`](../android/runtime) 拆分出独立类型化运行时模块（含 `__gpuixBridgeState` 单例热切换清理与 `gpuix.ota` SDK），[`dev.gpui.mobile.bridge`](../android/app/src/main/java/dev/gpui/mobile/bridge) 与 `GpuiOtaManager` 各自承接原生插件及生产 OTA 下载、ECDSA 验签与激活回滚，并同步遵循 [OTA 方案说明](OTA.zh-CN.md)。
+- **JS 运行时、轻能力插件与 Native-First 自愈**：[`android/runtime`](../android/runtime) 拆分出独立类型化运行时模块（含 `__gpuixBridgeState` 单例热切换清理、`appState`/`networkChange`/`transferProgress` 事件与 `gpuix.ota` SDK）；[`dev.gpui.mobile.bridge`](../android/app/src/main/java/dev/gpui/mobile/bridge) 提供纯 Android SDK 原生插件（覆盖 [`FileTransferPlugin.java`](../android/app/src/main/java/dev/gpui/mobile/bridge/FileTransferPlugin.java) 沙箱 FS 与流式传输、相册/图片压缩、网络与启动器扩展，支持通过 `gpuix.android.json -> permissions` 按需裁剪清单权限）；`GpuiActivity` 在 `super.onCreate()` 前即触发 `GpuiOtaManager.onNativeBootStart()` 与 Rust `BOOT_GATE` / 心跳 Watchdog，实现连续早崩先拉包救活、卡死重启自愈、签名 Kill Switch 熔断与 `manifestSeq` 防降级，详见 [OTA 方案说明](OTA.zh-CN.md)。
 - **64 位 16KB ELF 页对齐构建门禁**：`build-android.sh` 在打包前自动使用 NDK `llvm-readelf` 检验 `arm64-v8a` / `x86_64` 全部 `.so` 的 `LOAD` 段对齐均满足 `>= 0x4000`。
 - 用户选择的刷新率是交互上限。系统低电量或 OEM 策略可以把 90/120 等请求压到
   实际允许值，App 不要求用户手动改设置。

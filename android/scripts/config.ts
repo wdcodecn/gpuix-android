@@ -32,6 +32,8 @@ export type GpuixAndroidConfig = {
   features?: string[]
   /** Optional Android ABIs to package (e.g. `["arm64-v8a"]` or `["arm64-v8a", "armeabi-v7a"]`). */
   abis?: string[]
+  /** Optional trimmed list of Android permissions (e.g. `["CAMERA", "ACCESS_FINE_LOCATION"]`). Always preserves `INTERNET`. */
+  permissions?: string[]
   /** Optional Over-The-Air JS/HBC hot-update configuration. */
   ota?: GpuixOtaConfig
 }
@@ -243,6 +245,28 @@ function asFeaturesList(value: unknown): string[] | undefined {
   return normalized
 }
 
+const permissionNamePattern = /^[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z0-9_]+)*$/
+
+function asPermissionsList(value: unknown): string[] | undefined {
+  if (value === undefined) return undefined
+  if (!Array.isArray(value)) {
+    configError('permissions must be an array of Android permission strings')
+  }
+  const normalized: string[] = ['android.permission.INTERNET']
+  for (const item of value) {
+    if (typeof item !== 'string' || item.trim().length === 0) {
+      configError('permissions entries must be non-empty strings')
+    }
+    const raw = item.trim()
+    if (!permissionNamePattern.test(raw)) {
+      configError(`invalid Android permission name: ${raw}`)
+    }
+    const full = raw.includes('.') ? raw : `android.permission.${raw}`
+    if (!normalized.includes(full)) normalized.push(full)
+  }
+  return normalized
+}
+
 export async function loadGpuixAndroidConfig(projectRoot: string): Promise<GpuixAndroidConfig> {
   const root = path.resolve(projectRoot)
   const configPath = path.join(root, 'gpuix.android.json')
@@ -269,6 +293,7 @@ export async function loadGpuixAndroidConfig(projectRoot: string): Promise<Gpuix
   )
   const versionCode = asPositiveInteger(raw.versionCode, 'versionCode', legacyDemoDefaults.versionCode)
   const ota = parseOtaConfig(raw.ota, String(versionCode))
+  const permissions = asPermissionsList(raw.permissions)
 
   const config: GpuixAndroidConfig = {
     entrypoint: projectRelativePath(root, entrypointInput),
@@ -282,6 +307,7 @@ export async function loadGpuixAndroidConfig(projectRoot: string): Promise<Gpuix
     versionCode,
     features: asFeaturesList(raw.features),
     abis: asAbisList(process.env.GPUIX_ABIS ? process.env.GPUIX_ABIS.split(',') : raw.abis),
+    ...(permissions !== undefined ? { permissions } : {}),
     ...(ota ? { ota } : {}),
   }
 
@@ -342,6 +368,34 @@ export async function writeGradleProperties(targetRoot: string, config: GpuixAnd
     ].join('\n'),
   )
   return outputPath
+}
+
+/**
+ * Generates `.build/AndroidManifest.xml` with trimmed `<uses-permission>` entries when `permissions`
+ * is specified in `gpuix.android.json`, or removes any stale generated manifest when omitted.
+ */
+export async function syncGeneratedManifest(
+  targetRoot: string,
+  config: GpuixAndroidConfig,
+): Promise<string | null> {
+  const androidDir = path.basename(targetRoot) === 'android'
+    ? targetRoot
+    : path.join(targetRoot, 'android')
+  const generatedPath = path.join(androidDir, '.build/AndroidManifest.xml')
+  if (config.permissions === undefined) {
+    await rm(generatedPath, { force: true })
+    return null
+  }
+  const sourceManifestPath = path.join(androidDir, 'app/src/main/AndroidManifest.xml')
+  const template = await Bun.file(sourceManifestPath).text()
+  const lines = config.permissions.map((perm) => `    <uses-permission android:name="${perm}" />`).join('\n')
+  const permissionBlockRegex = /(?:^[ \t]*<uses-permission\b[^>]*\/>\r?\n)+/m
+  if (!permissionBlockRegex.test(template)) {
+    throw new Error(`Could not locate <uses-permission> block in ${sourceManifestPath}`)
+  }
+  const updated = template.replace(permissionBlockRegex, `${lines}\n`)
+  await writeTextIfChanged(generatedPath, updated)
+  return generatedPath
 }
 
 function valueAfter(flag: string, args: string[]): string | undefined {

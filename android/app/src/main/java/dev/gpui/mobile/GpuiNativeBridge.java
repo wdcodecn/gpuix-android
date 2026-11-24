@@ -6,6 +6,7 @@ import android.util.Log;
 import dev.gpui.mobile.bridge.AudioHapticsPlugin;
 import dev.gpui.mobile.bridge.BridgeContext;
 import dev.gpui.mobile.bridge.DeviceSystemPlugin;
+import dev.gpui.mobile.bridge.FileTransferPlugin;
 import dev.gpui.mobile.bridge.HardwarePlugin;
 import dev.gpui.mobile.bridge.MediaLocationPlugin;
 import dev.gpui.mobile.bridge.NotificationsPlugin;
@@ -33,6 +34,7 @@ public final class GpuiNativeBridge {
         DeviceSystemPlugin.register();
         StoragePlugin.register();
         MediaLocationPlugin.register();
+        FileTransferPlugin.register();
         registerPlugin("ota", GpuiOtaManager::handle);
     }
 

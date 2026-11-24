@@ -2,24 +2,29 @@ package dev.gpui.mobile.bridge;
 
 import android.app.Activity;
 import android.content.ContentResolver;
+import android.content.ContentValues;
 import android.content.Context;
 import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.database.Cursor;
 import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
 import android.location.Location;
 import android.location.LocationListener;
 import android.location.LocationManager;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Environment;
 import android.os.Looper;
 import android.provider.MediaStore;
 import android.provider.OpenableColumns;
 import dev.gpui.mobile.GpuiNativeBridge;
 import java.io.File;
+import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.InputStream;
+import java.io.OutputStream;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import org.json.JSONObject;
@@ -75,9 +80,156 @@ public final class MediaLocationPlugin {
                 }
                 break;
             }
+            case "saveToGallery": {
+                saveImageToGallery(activity, reqId, args);
+                break;
+            }
+            case "compressImage": {
+                compressImageFile(activity, reqId, args);
+                break;
+            }
             default:
                 BridgeContext.reject(reqId, "Unsupported media method: " + method);
         }
+    }
+
+    private static File resolveReadableMediaFile(Context ctx, String pathInput) throws Exception {
+        String raw = pathInput != null ? pathInput.trim() : "";
+        if (raw.isEmpty()) {
+            throw new IllegalArgumentException("path is required");
+        }
+        File target = raw.startsWith("/")
+                ? new File(raw).getCanonicalFile()
+                : FileTransferPlugin.resolveSandboxFile(ctx, raw, "files", false);
+        String filesRoot = ctx.getFilesDir().getCanonicalPath();
+        String cacheRoot = ctx.getCacheDir().getCanonicalPath();
+        String tp = target.getPath();
+        if (!tp.startsWith(filesRoot + File.separator) && !tp.startsWith(cacheRoot + File.separator)) {
+            throw new SecurityException("Media path must stay inside app sandbox");
+        }
+        if (!target.isFile()) {
+            throw new IllegalArgumentException("File not found: " + raw);
+        }
+        return target;
+    }
+
+    private static void saveImageToGallery(Activity activity, long reqId, JSONObject args) throws Exception {
+        Context ctx = activity.getApplicationContext();
+        File src = resolveReadableMediaFile(ctx, args.optString("path", ""));
+        String mimeType = args.optString("mimeType", "").trim();
+        if (mimeType.isEmpty()) {
+            String lower = src.getName().toLowerCase(java.util.Locale.US);
+            mimeType = lower.endsWith(".png") ? "image/png" : lower.endsWith(".webp") ? "image/webp" : "image/jpeg";
+        }
+        String displayName = args.optString("displayName", "").trim();
+        if (displayName.isEmpty()) {
+            displayName = "gpuix_" + System.currentTimeMillis() + (mimeType.contains("png") ? ".png" : ".jpg");
+        }
+
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+            BridgeContext.reject(reqId, "saveToGallery requires Android 10 (API 29) or higher");
+            return;
+        }
+        ContentResolver cr = ctx.getContentResolver();
+        ContentValues values = new ContentValues();
+        values.put(MediaStore.Images.Media.DISPLAY_NAME, displayName);
+        values.put(MediaStore.Images.Media.MIME_TYPE, mimeType);
+        values.put(MediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + File.separator + "GPUIX");
+        values.put(MediaStore.Images.Media.IS_PENDING, 1);
+
+        Uri uri = cr.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values);
+        if (uri == null) {
+            BridgeContext.reject(reqId, "Failed to create MediaStore gallery entry");
+            return;
+        }
+        try {
+            try (InputStream in = new FileInputStream(src); OutputStream out = cr.openOutputStream(uri)) {
+                if (out == null) throw new IllegalStateException("Cannot open MediaStore output stream");
+                byte[] buf = new byte[16384];
+                int n;
+                while ((n = in.read(buf)) >= 0) {
+                    out.write(buf, 0, n);
+                }
+            }
+            ContentValues done = new ContentValues();
+            done.put(MediaStore.Images.Media.IS_PENDING, 0);
+            cr.update(uri, done, null, null);
+            BridgeContext.resolve(reqId, new JSONObject().put("saved", true).put("uri", uri.toString()));
+        } catch (Throwable t) {
+            cr.delete(uri, null, null);
+            throw t;
+        }
+    }
+
+    private static void compressImageFile(Activity activity, long reqId, JSONObject args) throws Exception {
+        Context ctx = activity.getApplicationContext();
+        File src = resolveReadableMediaFile(ctx, args.optString("path", ""));
+        int maxW = Math.max(64, args.optInt("maxWidth", 1280));
+        int maxH = Math.max(64, args.optInt("maxHeight", 1280));
+        int quality = Math.max(10, Math.min(100, args.optInt("quality", 82)));
+        String fmt = args.optString("format", "jpeg").trim().toLowerCase(java.util.Locale.US);
+
+        BitmapFactory.Options bounds = new BitmapFactory.Options();
+        bounds.inJustDecodeBounds = true;
+        BitmapFactory.decodeFile(src.getAbsolutePath(), bounds);
+        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) {
+            BridgeContext.reject(reqId, "Invalid image file");
+            return;
+        }
+
+        int inSample = 1;
+        while ((bounds.outWidth / inSample) > maxW * 2 || (bounds.outHeight / inSample) > maxH * 2) {
+            inSample *= 2;
+        }
+        BitmapFactory.Options opts = new BitmapFactory.Options();
+        opts.inSampleSize = inSample;
+        Bitmap decoded = BitmapFactory.decodeFile(src.getAbsolutePath(), opts);
+        if (decoded == null) {
+            BridgeContext.reject(reqId, "Failed to decode image");
+            return;
+        }
+
+        Bitmap outputBmp = decoded;
+        int w = decoded.getWidth();
+        int h = decoded.getHeight();
+        if (w > maxW || h > maxH) {
+            double scale = Math.min((double) maxW / (double) w, (double) maxH / (double) h);
+            int targetW = Math.max(1, (int) Math.round(w * scale));
+            int targetH = Math.max(1, (int) Math.round(h * scale));
+            outputBmp = Bitmap.createScaledBitmap(decoded, targetW, targetH, true);
+            if (outputBmp != decoded) {
+                decoded.recycle();
+            }
+        }
+
+        Bitmap.CompressFormat compressFmt = "png".equals(fmt)
+                ? Bitmap.CompressFormat.PNG
+                : "webp".equals(fmt) && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R
+                        ? Bitmap.CompressFormat.WEBP_LOSSY
+                        : Bitmap.CompressFormat.JPEG;
+        String ext = compressFmt == Bitmap.CompressFormat.PNG ? ".png"
+                : compressFmt == Bitmap.CompressFormat.JPEG ? ".jpg" : ".webp";
+        String mimeType = compressFmt == Bitmap.CompressFormat.PNG ? "image/png"
+                : compressFmt == Bitmap.CompressFormat.JPEG ? "image/jpeg" : "image/webp";
+
+        File dir = new File(ctx.getCacheDir(), "gpuix_media");
+        if (!dir.exists()) dir.mkdirs();
+        File dest = new File(dir, "compressed_" + System.currentTimeMillis() + ext);
+        int outW = outputBmp.getWidth();
+        int outH = outputBmp.getHeight();
+        try (FileOutputStream fos = new FileOutputStream(dest)) {
+            outputBmp.compress(compressFmt, quality, fos);
+        } finally {
+            outputBmp.recycle();
+        }
+
+        BridgeContext.resolve(reqId, new JSONObject()
+                .put("path", dest.getAbsolutePath())
+                .put("uri", Uri.fromFile(dest).toString())
+                .put("width", outW)
+                .put("height", outH)
+                .put("size", dest.length())
+                .put("mimeType", mimeType));
     }
 
     private static void launchCameraCapture(Activity activity, long reqId) {

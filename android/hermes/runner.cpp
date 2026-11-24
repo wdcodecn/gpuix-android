@@ -44,6 +44,8 @@ struct Runner {
   std::atomic<bool> vsync_pending{false};
   std::atomic<double> vsync_timestamp_ms{0.0};
   std::atomic<bool> has_raf{false};
+  std::atomic<uint64_t> ping_req{0};
+  std::atomic<uint64_t> ping_ack{0};
   uint32_t next_id{1};
   uint32_t next_raf_id{1};
 };
@@ -91,7 +93,7 @@ void log_exception(napi_env env) {
     report_fatal(text(env, error));
 }
 
-bool capture_exception_text(napi_env env, std::string &out) {
+bool capture_exception_text(napi_env env, std::string &out, bool report_to_fatal_handler = true) {
   bool pending = false;
   napi_is_exception_pending(env, &pending);
   if (!pending) return false;
@@ -101,7 +103,11 @@ bool capture_exception_text(napi_env env, std::string &out) {
     out = text(env, stack);
   else
     out = text(env, error);
-  report_fatal(out);
+  if (report_to_fatal_handler) {
+    report_fatal(out);
+  } else {
+    __android_log_print(ANDROID_LOG_ERROR, kTag, "%s", out.c_str());
+  }
   return true;
 }
 
@@ -164,6 +170,7 @@ void drain_raf(Runner *runner, double timestamp_ms) {
 void dispatch(uv_async_t *handle) {
   auto *runner = static_cast<Runner *>(handle->data);
   if (runner->stop.load(std::memory_order_acquire)) { uv_stop(&runner->loop); return; }
+  runner->ping_ack.store(runner->ping_req.load(std::memory_order_acquire), std::memory_order_release);
 
   std::deque<Task> tasks;
   std::deque<HotEval> evals;
@@ -236,10 +243,10 @@ void dispatch(uv_async_t *handle) {
     }
 
     std::string err_msg;
-    bool has_ex = capture_exception_text(runner->env, err_msg);
+    bool has_ex = capture_exception_text(runner->env, err_msg, false);
     if (!has_ex && st == napi_ok) {
       if (runner->runtime->drainJobs() == hermes::vm::ExecutionStatus::EXCEPTION) {
-        has_ex = capture_exception_text(runner->env, err_msg);
+        has_ex = capture_exception_text(runner->env, err_msg, false);
       }
       runner->runtime->clearKeptObjects();
     }
@@ -587,4 +594,18 @@ extern "C" bool gpuix_js_eval_bundle(const uint8_t *data, size_t length, const c
 
 extern "C" bool gpuix_js_eval_script(const uint8_t *source, size_t length, const char *source_url) {
   return gpuix_js_eval_bundle(source, length, source_url ? source_url : "gpuix-hot.js", true);
+}
+
+extern "C" uint64_t gpuix_js_ping_async(void) {
+  std::lock_guard<std::mutex> lock(active_mutex);
+  if (!active || active->stop.load(std::memory_order_acquire)) return 0;
+  uint64_t seq = active->ping_req.fetch_add(1, std::memory_order_acq_rel) + 1;
+  uv_async_send(&active->async);
+  return seq;
+}
+
+extern "C" uint64_t gpuix_js_ping_ack(void) {
+  std::lock_guard<std::mutex> lock(active_mutex);
+  if (!active) return 0;
+  return active->ping_ack.load(std::memory_order_acquire);
 }

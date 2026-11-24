@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { loadGpuixAndroidConfig, normalizeOtaPublicKey, resolveOtaConfig } from '../../android/scripts/config'
 import { formatOtaMetaKv } from '../../android/scripts/build-js'
-import { buildOtaRelease, keygenOta, verifyOtaRelease } from '../ota'
+import { buildManifestSigningPayload, buildOtaRelease, keygenOta, verifyOtaRelease } from '../ota'
 
 function makeTempProject(): string {
   const dir = mkdtempSync(path.join(tmpdir(), 'gpuix-ota-test-'))
@@ -149,12 +149,15 @@ describe('OTA keygen, build, verify & JVM cross-verification', () => {
 
       expect(built.manifest.schemaVersion).toBe(1)
       expect(built.manifest.releaseId).toBe('rel-test-1')
-      expect(built.manifest.bundle.format).toBe('js')
-      expect(built.manifest.bundle.url).toBe('https://cdn.example.com/app/bundles/rel-test-1/app.js')
-      expect(built.manifest.bundle.signature).toBeTruthy()
+      expect(built.manifest.bundle?.format).toBe('js')
+      expect(built.manifest.bundle?.url).toBe('https://cdn.example.com/app/bundles/rel-test-1/app.js')
+      expect(built.manifest.bundle?.signature).toBeTruthy()
+      expect(built.manifest.manifestSignature).toBeTruthy()
+      expect((built.manifest.manifestSeq ?? 0) > 0).toBe(true)
 
       const verified = await verifyOtaRelease(built.manifestPath, keys.publicKeyB64Path)
       expect(verified.signatureVerified).toBe(true)
+      expect(verified.manifestSignatureVerified).toBe(true)
       expect(verified.releaseId).toBe('rel-test-1')
 
       // Wrong key must fail verification.
@@ -178,15 +181,30 @@ describe('OTA keygen, build, verify & JVM cross-verification', () => {
     const dir = makeTempProject()
     const keysDir = path.join(dir, 'keys')
     const outDir = path.join(dir, 'dist/ota')
+    const killOutDir = path.join(dir, 'dist/kill')
     try {
       const keys = await keygenOta({ outDir: keysDir })
       const built = await buildOtaRelease({
         projectRoot: dir,
         outDir,
         releaseId: 'rel-jvm-1',
+        manifestSeq: 1001,
         privateKey: keys.privateKeyPath,
         skipHbc: true,
       })
+
+      const killSwitch = await buildOtaRelease({
+        projectRoot: dir,
+        outDir: killOutDir,
+        releaseId: 'kill-1002',
+        manifestSeq: 1002,
+        action: 'rollback_to_embedded',
+        privateKey: keys.privateKeyPath,
+      })
+      expect(killSwitch.manifest.action).toBe('rollback_to_embedded')
+      expect(killSwitch.manifest.manifestSignature).toBeTruthy()
+      const killVerified = await verifyOtaRelease(killSwitch.manifestPath, keys.publicKeyBase64)
+      expect(killVerified.manifestSignatureVerified).toBe(true)
 
       const javaFile = path.join(dir, 'VerifyOtaSig.java')
       writeFileSync(
@@ -221,20 +239,51 @@ public class VerifyOtaSig {
       const compile = Bun.spawnSync([hasJavac, javaFile, '-d', dir], { stdout: 'pipe', stderr: 'pipe' })
       expect(compile.exitCode).toBe(0)
 
-      const run = Bun.spawnSync(
+      // 1) Verify bundle bytes signature
+      const runBundle = Bun.spawnSync(
         [
           hasJava,
           '-cp',
           dir,
           'VerifyOtaSig',
           keys.publicKeyBase64,
-          built.manifest.bundle.signature ?? '',
+          built.manifest.bundle?.signature ?? '',
           built.bundlePath,
         ],
         { stdout: 'pipe', stderr: 'pipe' },
       )
-      expect(run.exitCode).toBe(0)
-      expect(new TextDecoder().decode(run.stdout).trim()).toBe('JVM_ECDSA_OK')
+      expect(runBundle.exitCode).toBe(0)
+      expect(new TextDecoder().decode(runBundle.stdout).trim()).toBe('JVM_ECDSA_OK')
+
+      // 2) Verify canonical manifestSignature for both update & kill-switch
+      const payloadUpdatePath = path.join(dir, 'manifest-update.payload')
+      writeFileSync(payloadUpdatePath, buildManifestSigningPayload(built.manifest))
+      const runManifestUpdate = Bun.spawnSync(
+        [hasJava, '-cp', dir, 'VerifyOtaSig', keys.publicKeyBase64, built.manifest.manifestSignature ?? '', payloadUpdatePath],
+        { stdout: 'pipe', stderr: 'pipe' },
+      )
+      expect(runManifestUpdate.exitCode).toBe(0)
+      expect(new TextDecoder().decode(runManifestUpdate.stdout).trim()).toBe('JVM_ECDSA_OK')
+
+      const payloadKillPath = path.join(dir, 'manifest-kill.payload')
+      writeFileSync(payloadKillPath, buildManifestSigningPayload(killSwitch.manifest))
+      const runManifestKill = Bun.spawnSync(
+        [hasJava, '-cp', dir, 'VerifyOtaSig', keys.publicKeyBase64, killSwitch.manifest.manifestSignature ?? '', payloadKillPath],
+        { stdout: 'pipe', stderr: 'pipe' },
+      )
+      expect(runManifestKill.exitCode).toBe(0)
+      expect(new TextDecoder().decode(runManifestKill.stdout).trim()).toBe('JVM_ECDSA_OK')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('formatOtaMetaKv includes hbc_version line', async () => {
+    const dir = makeTempProject()
+    try {
+      const config = await loadGpuixAndroidConfig(dir)
+      const meta = formatOtaMetaKv(config, 'hbc', 'b'.repeat(64), 96)
+      expect(meta).toContain('hbc_version=96\n')
     } finally {
       rmSync(dir, { recursive: true, force: true })
     }

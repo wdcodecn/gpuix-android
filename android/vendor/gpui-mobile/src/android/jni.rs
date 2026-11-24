@@ -2388,6 +2388,27 @@ pub unsafe extern "C" fn Java_dev_gpui_mobile_GpuiMediaSession_nativeMediaSeek(
     crate::packages::media_session::notify_seek(position_ms as u64);
 }
 
+/// Trigger an immediate clean Android process restart from native/Rust watchdog recovery.
+pub fn request_ota_process_restart() -> bool {
+    with_env(|env| {
+        let cls = find_app_class(env, "dev.gpui.mobile.GpuiOtaManager")?;
+        let ok = env
+            .call_static_method(
+                &cls,
+                jni::jni_str!("requestProcessRestartFromNative"),
+                jni::jni_sig!("()Z"),
+                &[],
+            )
+            .and_then(|v| v.z())
+            .map_err(|e| {
+                env.exception_clear();
+                e.to_string()
+            })?;
+        Ok(ok)
+    })
+    .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

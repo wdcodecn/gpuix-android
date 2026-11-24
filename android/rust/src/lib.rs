@@ -6,7 +6,7 @@ use std::net::{SocketAddr, TcpStream};
 use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc, Mutex, OnceLock,
+    Arc, Condvar, Mutex, OnceLock,
 };
 use std::time::Duration;
 
@@ -32,6 +32,8 @@ extern "C" {
         source_url: *const c_char,
         reset_timers: bool,
     ) -> bool;
+    fn gpuix_js_ping_async() -> u64;
+    fn gpuix_js_ping_ack() -> u64;
 }
 
 #[derive(Default)]
@@ -40,12 +42,38 @@ struct OtaRuntimeCtx {
     embedded: ota::EmbeddedMeta,
     running_ota_id: Option<String>,
     running_ota_confirmed: bool,
+    boot_healthy: bool,
+    boot_fatal_seen: bool,
+    rollback_queued: bool,
+    watchdog_gen: u64,
+    hot_stop: Option<Arc<AtomicBool>>,
 }
 
 static OTA_CTX: OnceLock<Mutex<OtaRuntimeCtx>> = OnceLock::new();
+static BOOT_GATE: OnceLock<(Mutex<bool>, Condvar)> = OnceLock::new();
 
 fn ota_ctx() -> &'static Mutex<OtaRuntimeCtx> {
     OTA_CTX.get_or_init(|| Mutex::new(OtaRuntimeCtx::default()))
+}
+
+fn boot_gate() -> &'static (Mutex<bool>, Condvar) {
+    BOOT_GATE.get_or_init(|| (Mutex::new(true), Condvar::new()))
+}
+
+fn wait_for_boot_gate(stop: &AtomicBool, max_wait: Duration) {
+    let (lock, cvar) = boot_gate();
+    let deadline = std::time::Instant::now() + max_wait;
+    let mut ready = lock.lock().unwrap();
+    while !*ready && !stop.load(Ordering::Acquire) {
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            log::warn!("Native boot gate wait timed out; proceeding with boot");
+            break;
+        }
+        let step = (deadline - now).min(Duration::from_millis(100));
+        let (guard, _) = cvar.wait_timeout(ready, step).unwrap();
+        ready = guard;
+    }
 }
 
 fn read_embedded_asset_bytes() -> Option<Vec<u8>> {
@@ -68,6 +96,36 @@ unsafe extern "C" fn on_js_request_vsync() {
     gpuix_native::android_vsync::request_vsync();
 }
 
+fn trigger_rollback_bundle_eval(prev: Option<(String, Vec<u8>)>, failed_label: &str) {
+    if let Some((prev_id, prev_bytes)) = prev {
+        log::warn!("Auto-rolling back failed OTA {failed_label} -> {prev_id}");
+        if let Ok(c_url) = CString::new(format!("ota-rollback:{prev_id}")) {
+            let ok = unsafe {
+                gpuix_js_eval_bundle(prev_bytes.as_ptr(), prev_bytes.len(), c_url.as_ptr(), true)
+            };
+            if ok {
+                return;
+            }
+        }
+    }
+    if let Some(emb_bytes) = read_embedded_asset_bytes() {
+        log::warn!("Auto-rolling back failed OTA {failed_label} -> embedded APK bundle");
+        let ok = unsafe {
+            gpuix_js_eval_bundle(
+                emb_bytes.as_ptr(),
+                emb_bytes.len(),
+                c"embedded:rollback".as_ptr(),
+                true,
+            )
+        };
+        if ok {
+            return;
+        }
+    }
+    log::error!("Failed to queue fallback bundle; requesting clean process restart");
+    let _ = gpuix_native::android_jni::request_ota_process_restart();
+}
+
 unsafe extern "C" fn on_js_fatal_error(message: *const c_char) {
     let text = if message.is_null() {
         "JavaScript fatal error (null message)".to_string()
@@ -76,16 +134,34 @@ unsafe extern "C" fn on_js_fatal_error(message: *const c_char) {
     };
     log::error!("JavaScript fatal error: {text}");
 
-    let maybe_unconfirmed = {
-        let ctx = ota_ctx().lock().unwrap();
-        match (&ctx.data_dir, &ctx.running_ota_id, ctx.running_ota_confirmed) {
-            (Some(dir), Some(id), false) => Some((dir.clone(), id.clone())),
-            _ => None,
+    let rollback_target = {
+        let mut ctx = ota_ctx().lock().unwrap();
+        ctx.boot_fatal_seen = true;
+        if !ctx.running_ota_confirmed && !ctx.rollback_queued {
+            if let (Some(dir), Some(id)) = (ctx.data_dir.clone(), ctx.running_ota_id.clone()) {
+                ctx.rollback_queued = true;
+                Some((dir, id, ctx.embedded.hbc_version))
+            } else {
+                None
+            }
+        } else {
+            None
         }
     };
-    if let Some((data_dir, id)) = maybe_unconfirmed {
-        log::warn!("Recording fatal error for unconfirmed OTA release {id}");
-        let _ = ota::record_unconfirmed_failure_and_rollback(&data_dir, &id, &text);
+    if let Some((data_dir, id, hbc_version)) = rollback_target {
+        log::warn!("Recording fatal error and recovering unconfirmed OTA release {id}");
+        let prev = ota::record_unconfirmed_failure_and_rollback(
+            &data_dir,
+            &id,
+            &text,
+            hbc_version,
+        );
+        {
+            let mut ctx = ota_ctx().lock().unwrap();
+            ctx.running_ota_id = None;
+            ctx.running_ota_confirmed = false;
+        }
+        trigger_rollback_bundle_eval(prev, &id);
     }
 }
 
@@ -107,6 +183,8 @@ unsafe extern "C" fn on_js_hot_eval_result(
 
     if ok {
         let mut ctx = ota_ctx().lock().unwrap();
+        ctx.rollback_queued = false;
+        ctx.boot_fatal_seen = false;
         if let Some(id) = url.strip_prefix("ota:") {
             ctx.running_ota_id = Some(id.to_string());
             ctx.running_ota_confirmed = false;
@@ -123,47 +201,74 @@ unsafe extern "C" fn on_js_hot_eval_result(
     log::error!("Hot eval failed for {url}: {err}");
 
     if let Some(failed_id) = url.strip_prefix("ota:") {
-        let data_dir = {
+        let (data_dir, hbc_version, already_queued) = {
             let mut ctx = ota_ctx().lock().unwrap();
+            ctx.boot_fatal_seen = true;
+            let was_queued = ctx.rollback_queued;
+            ctx.rollback_queued = true;
             ctx.running_ota_id = None;
             ctx.running_ota_confirmed = false;
-            ctx.data_dir.clone()
+            (ctx.data_dir.clone(), ctx.embedded.hbc_version, was_queued)
         };
-        if let Some(dir) = data_dir {
-            if let Some((prev_id, prev_bytes)) =
-                ota::record_unconfirmed_failure_and_rollback(&dir, failed_id, &err)
-            {
-                log::warn!("Auto-rolling back failed OTA {failed_id} -> {prev_id}");
-                if let Ok(c_url) = CString::new(format!("ota-rollback:{prev_id}")) {
-                    let _ = gpuix_js_eval_bundle(
-                        prev_bytes.as_ptr(),
-                        prev_bytes.len(),
-                        c_url.as_ptr(),
-                        true,
-                    );
-                    return;
-                }
+        if already_queued {
+            return;
+        }
+        let prev = data_dir.and_then(|dir| {
+            ota::record_unconfirmed_failure_and_rollback(&dir, failed_id, &err, hbc_version)
+        });
+        trigger_rollback_bundle_eval(prev, failed_id);
+    } else if url.starts_with("ota-rollback:") {
+        log::warn!("Rollback OTA failed; falling back to embedded APK bundle");
+        if let Some(emb_bytes) = read_embedded_asset_bytes() {
+            if gpuix_js_eval_bundle(
+                emb_bytes.as_ptr(),
+                emb_bytes.len(),
+                c"embedded:rollback".as_ptr(),
+                true,
+            ) {
+                return;
             }
         }
-        if let Some(emb_bytes) = read_embedded_asset_bytes() {
-            log::warn!("Auto-rolling back failed OTA {failed_id} -> embedded APK bundle");
-            let _ = gpuix_js_eval_bundle(
-                emb_bytes.as_ptr(),
-                emb_bytes.len(),
-                c"embedded:rollback".as_ptr(),
-                true,
-            );
-        }
-    } else if url.starts_with("ota-rollback:") {
-        if let Some(emb_bytes) = read_embedded_asset_bytes() {
-            log::warn!("Rollback OTA failed; falling back to embedded APK bundle");
-            let _ = gpuix_js_eval_bundle(
-                emb_bytes.as_ptr(),
-                emb_bytes.len(),
-                c"embedded:rollback".as_ptr(),
-                true,
-            );
-        }
+        let _ = gpuix_native::android_jni::request_ota_process_restart();
+    } else if url.starts_with("embedded:rollback") {
+        log::error!("Embedded rollback evaluation failed; requesting process restart");
+        let _ = gpuix_native::android_jni::request_ota_process_restart();
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn Java_dev_gpui_mobile_GpuiOtaManager_nativeSetBootGateReady(
+    _env: *mut c_void,
+    _class: *mut c_void,
+    ready: u8,
+) {
+    let (lock, cvar) = boot_gate();
+    let mut guard = lock.lock().unwrap();
+    *guard = ready != 0;
+    if *guard {
+        cvar.notify_all();
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn Java_dev_gpui_mobile_GpuiOtaManager_nativeMarkBootHealthy(
+    _env: *mut c_void,
+    _class: *mut c_void,
+) {
+    let mut ctx = ota_ctx().lock().unwrap();
+    ctx.boot_healthy = true;
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn Java_dev_gpui_mobile_GpuiOtaManager_nativeHasBootFatal(
+    _env: *mut c_void,
+    _class: *mut c_void,
+) -> u8 {
+    let ctx = ota_ctx().lock().unwrap();
+    if ctx.boot_fatal_seen {
+        1
+    } else {
+        0
     }
 }
 
@@ -185,6 +290,18 @@ pub unsafe extern "C" fn Java_dev_gpui_mobile_GpuiOtaManager_nativeTriggerHotApp
             let Ok(c_url) = CString::new(format!("ota:{release_id}")) else {
                 return 0;
             };
+            let hot_stop = {
+                let mut ctx = ota_ctx().lock().unwrap();
+                ctx.rollback_queued = false;
+                ctx.boot_fatal_seen = false;
+                ctx.boot_healthy = false;
+                ctx.running_ota_id = Some(release_id.clone());
+                ctx.running_ota_confirmed = false;
+                ctx.hot_stop.clone()
+            };
+            if let Some(stop_flag) = hot_stop {
+                start_boot_watchdog(stop_flag);
+            }
             let ok = gpuix_js_eval_bundle(bytes.as_ptr(), bytes.len(), c_url.as_ptr(), true);
             if ok {
                 log::info!("Queued OTA hot apply for {release_id} ({} bytes)", bytes.len());
@@ -240,6 +357,74 @@ pub unsafe extern "C" fn Java_dev_gpui_mobile_GpuiOtaManager_nativeTriggerHotRol
         }
     }
     0
+}
+
+fn watchdog_should_exit(hot_stop: &AtomicBool, gen: u64) -> bool {
+    if hot_stop.load(Ordering::Acquire) {
+        return true;
+    }
+    let ctx = ota_ctx().lock().unwrap();
+    ctx.boot_healthy || ctx.watchdog_gen != gen
+}
+
+fn start_boot_watchdog(hot_stop: Arc<AtomicBool>) {
+    let gen = {
+        let mut ctx = ota_ctx().lock().unwrap();
+        ctx.watchdog_gen = ctx.watchdog_gen.wrapping_add(1);
+        ctx.watchdog_gen
+    };
+    let _ = std::thread::Builder::new()
+        .name("gpuix-boot-watchdog".into())
+        .spawn(move || {
+            for _ in 0..30 {
+                if watchdog_should_exit(&hot_stop, gen) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            if watchdog_should_exit(&hot_stop, gen) {
+                return;
+            }
+            let seq = unsafe { gpuix_js_ping_async() };
+            if seq == 0 {
+                return;
+            }
+            for _ in 0..25 {
+                if watchdog_should_exit(&hot_stop, gen) {
+                    return;
+                }
+                if unsafe { gpuix_js_ping_ack() } >= seq {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            if watchdog_should_exit(&hot_stop, gen) {
+                return;
+            }
+            if unsafe { gpuix_js_ping_ack() } < seq {
+                log::error!(
+                    "JS thread heartbeat timeout (2500ms); triggering OTA watchdog recovery"
+                );
+                let unconfirmed = {
+                    let ctx = ota_ctx().lock().unwrap();
+                    match (&ctx.data_dir, &ctx.running_ota_id, ctx.running_ota_confirmed) {
+                        (Some(dir), Some(id), false) => {
+                            Some((dir.clone(), id.clone(), ctx.embedded.hbc_version))
+                        }
+                        _ => None,
+                    }
+                };
+                if let Some((dir, id, hbc_ver)) = unconfirmed {
+                    let _ = ota::record_unconfirmed_failure_and_rollback(
+                        &dir,
+                        &id,
+                        "JS thread heartbeat watchdog timeout",
+                        hbc_ver,
+                    );
+                }
+                let _ = gpuix_native::android_jni::request_ota_process_restart();
+            }
+        });
 }
 
 fn parse_dev_port(raw: &[u8]) -> u16 {
@@ -354,11 +539,16 @@ fn android_main(app: android_activity::AndroidApp) {
         ctx.embedded = embedded_meta.clone();
         ctx.running_ota_id = None;
         ctx.running_ota_confirmed = false;
+        ctx.boot_healthy = false;
+        ctx.boot_fatal_seen = false;
+        ctx.rollback_queued = false;
+        ctx.hot_stop = Some(Arc::clone(&hot_stop));
     }
 
     let result = gpuix_native::run_android_with_stop(
         app,
         move || {
+            wait_for_boot_gate(&hot_stop_for_js, Duration::from_millis(5500));
             if hot_stop_for_js.load(Ordering::Acquire) {
                 return;
             }
@@ -367,6 +557,48 @@ fn android_main(app: android_activity::AndroidApp) {
                     spawn_hot_reload_poller(parse_dev_port(bytes), Arc::clone(&hot_stop_for_js));
                 }
             }
+
+            {
+                let mut ctx = ota_ctx().lock().unwrap();
+                ctx.boot_healthy = false;
+                ctx.boot_fatal_seen = false;
+                ctx.rollback_queued = false;
+            }
+            start_boot_watchdog(Arc::clone(&hot_stop_for_js));
+
+            let run_embedded = || -> i32 {
+                let (mut _asset_hbc, mut _asset_js, bundle_name, source_ptr, source_len) =
+                    if let Some(mut hbc) = assets.open(c"gpuix/app.hbc") {
+                        match hbc.buffer() {
+                            Ok(buf) => {
+                                let ptr = buf.as_ptr();
+                                let len = buf.len();
+                                (Some(hbc), None, "gpuix/app.hbc", ptr, len)
+                            }
+                            Err(error) => {
+                                log::error!("Could not mmap Android APK asset gpuix/app.hbc: {error}");
+                                return 2;
+                            }
+                        }
+                    } else if let Some(mut js) = assets.open(c"gpuix/app.js") {
+                        match js.buffer() {
+                            Ok(buf) => {
+                                let ptr = buf.as_ptr();
+                                let len = buf.len();
+                                (None, Some(js), "gpuix/app.js", ptr, len)
+                            }
+                            Err(error) => {
+                                log::error!("Could not read Android APK asset gpuix/app.js: {error}");
+                                return 2;
+                            }
+                        }
+                    } else {
+                        log::error!("Neither gpuix/app.hbc nor gpuix/app.js exists in APK assets");
+                        return 2;
+                    };
+                log::info!("Executing embedded Hermes bundle {bundle_name} ({source_len} bytes)");
+                unsafe { gpuix_js_run(source_ptr, source_len, napi_register_module_v1) }
+            };
 
             let boot_plan = data_dir
                 .as_deref()
@@ -392,49 +624,61 @@ fn android_main(app: android_activity::AndroidApp) {
                     let exit = unsafe {
                         gpuix_js_run(bytes.as_ptr(), bytes.len(), napi_register_module_v1)
                     };
-                    if exit != 0 && !confirmed {
-                        if let Some(dir) = data_dir.as_deref() {
-                            let _ = ota::record_unconfirmed_failure_and_rollback(
-                                dir,
-                                &release_id,
-                                "JS host exited with non-zero status during unconfirmed OTA boot",
-                            );
+                    if exit != 0 && !hot_stop_for_js.load(Ordering::Acquire) {
+                        log::error!(
+                            "OTA bundle {release_id} exited non-zero ({exit}); recovering inline"
+                        );
+                        let prev = if !confirmed {
+                            data_dir.as_deref().and_then(|dir| {
+                                ota::record_unconfirmed_failure_and_rollback(
+                                    dir,
+                                    &release_id,
+                                    "JS host exited with non-zero status during unconfirmed OTA boot",
+                                    embedded_meta.hbc_version,
+                                )
+                            })
+                        } else {
+                            None
+                        };
+                        {
+                            let mut ctx = ota_ctx().lock().unwrap();
+                            ctx.boot_fatal_seen = false;
+                            ctx.rollback_queued = false;
                         }
-                    }
-                    exit
-                }
-                ota::BootPlan::Embedded => {
-                    let (mut _asset_hbc, mut _asset_js, bundle_name, source_ptr, source_len) =
-                        if let Some(mut hbc) = assets.open(c"gpuix/app.hbc") {
-                            match hbc.buffer() {
-                                Ok(buf) => {
-                                    let ptr = buf.as_ptr();
-                                    let len = buf.len();
-                                    (Some(hbc), None, "gpuix/app.hbc", ptr, len)
-                                }
-                                Err(error) => {
-                                    log::error!("Could not mmap Android APK asset gpuix/app.hbc: {error}");
-                                    return;
-                                }
+                        if let Some((prev_id, prev_bytes)) = prev {
+                            {
+                                let mut ctx = ota_ctx().lock().unwrap();
+                                ctx.running_ota_id = Some(prev_id.clone());
+                                ctx.running_ota_confirmed = true;
                             }
-                        } else if let Some(mut js) = assets.open(c"gpuix/app.js") {
-                            match js.buffer() {
-                                Ok(buf) => {
-                                    let ptr = buf.as_ptr();
-                                    let len = buf.len();
-                                    (None, Some(js), "gpuix/app.js", ptr, len)
-                                }
-                                Err(error) => {
-                                    log::error!("Could not read Android APK asset gpuix/app.js: {error}");
-                                    return;
-                                }
+                            log::warn!("Inline cold-boot recovery -> {prev_id}");
+                            unsafe {
+                                gpuix_js_run(
+                                    prev_bytes.as_ptr(),
+                                    prev_bytes.len(),
+                                    napi_register_module_v1,
+                                )
                             }
                         } else {
-                            log::error!("Neither gpuix/app.hbc nor gpuix/app.js exists in APK assets");
-                            return;
-                        };
-                    log::info!("Executing embedded Hermes bundle {bundle_name} ({source_len} bytes)");
-                    unsafe { gpuix_js_run(source_ptr, source_len, napi_register_module_v1) }
+                            {
+                                let mut ctx = ota_ctx().lock().unwrap();
+                                ctx.running_ota_id = None;
+                                ctx.running_ota_confirmed = true;
+                            }
+                            log::warn!("Inline cold-boot recovery -> embedded APK bundle");
+                            run_embedded()
+                        }
+                    } else {
+                        exit
+                    }
+                }
+                ota::BootPlan::Embedded => {
+                    {
+                        let mut ctx = ota_ctx().lock().unwrap();
+                        ctx.running_ota_id = None;
+                        ctx.running_ota_confirmed = true;
+                    }
+                    run_embedded()
                 }
             };
 
@@ -444,6 +688,8 @@ fn android_main(app: android_activity::AndroidApp) {
         },
         move || {
             hot_stop_for_stop.store(true, Ordering::Release);
+            let (_, cvar) = boot_gate();
+            cvar.notify_all();
             unsafe { gpuix_js_request_stop() };
         },
     );
@@ -451,4 +697,6 @@ fn android_main(app: android_activity::AndroidApp) {
         log::error!("Android GPUI host failed: {error:#}");
     }
     hot_stop.store(true, Ordering::Release);
+    let (_, cvar) = boot_gate();
+    cvar.notify_all();
 }

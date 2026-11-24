@@ -47,7 +47,7 @@ function scheduleOtaAutoConfirm(): void {
     if (sdk?.ota && typeof sdk.ota.confirm === 'function') {
       sdk.ota.confirm().catch(() => {})
     }
-  }, 1500)
+  }, 2000)
 }
 
 function scheduleLaunchOtaCheck(): void {
@@ -60,7 +60,7 @@ function scheduleLaunchOtaCheck(): void {
     sdk.ota
       .getState()
       .then((otaState) => {
-        if (!otaState || !otaState.manifestUrl) return
+        if (!otaState || !otaState.manifestUrl || otaState.nativeLaunchCheckStarted) return
         if (otaState.checkOnLaunch !== 'background' && otaState.checkOnLaunch !== 'immediate') return
         return sdk.ota.check({}).then((checkRes) => {
           if (!checkRes || !checkRes.available || !checkRes.manifest) return
@@ -181,8 +181,13 @@ export function GpuixRenderer(callback?: GpuixRendererEventCallback): GpuixRende
 export const isTerminal = (): boolean => false
 
 export type {
+  AppStateEvent,
   BatteryInfo,
+  CompressedImageResult,
   DeviceInfo,
+  FsEntry,
+  FsScope,
+  FsStorageInfo,
   GpuixBatchMutation,
   GpuixNativeBinding,
   GpuixNativeSdk,
@@ -191,10 +196,12 @@ export type {
   GpuixRendererInstance,
   LocationResult,
   MediaPickResult,
+  NetworkChangeEvent,
   OtaManifest,
   OtaProgressEvent,
   OtaState,
   SensorReading,
+  TransferProgressEvent,
   Unsubscribe,
   ViewportInsets,
   ViewportMetrics,

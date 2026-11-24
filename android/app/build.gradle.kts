@@ -23,6 +23,10 @@ android {
     buildToolsVersion = "37.0.0"
     ndkVersion = "30.0.16248370"
     sourceSets.getByName("main").assets.srcDir(rootProject.projectDir.resolve(".build/assets"))
+    val generatedManifest = rootProject.projectDir.resolve(".build/AndroidManifest.xml")
+    if (generatedManifest.isFile) {
+        sourceSets.getByName("main").manifest.srcFile(generatedManifest)
+    }
     androidResources {
         // Keep Hermes bytecode uncompressed and page-aligned in the APK for zero-copy mmap.
         noCompress += listOf("hbc")

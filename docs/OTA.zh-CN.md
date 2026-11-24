@@ -62,11 +62,12 @@ gpuix ota keygen --out .gpuix-ota-keys
 - `manifestUrl`：远端 `manifest.json` 地址；Release 包强制 `https://`，Debug 包允许 `http://127.0.0.1` 配合 `adb reverse` 联调。
 - `channel`：发布通道名（默认 `"production"`，匹配 `^[A-Za-z0-9._-]{1,64}$`）。
 - `runtimeVersion`：原生二进制兼容版本号（默认等于 `String(versionCode)`）。当原生 Rust/Java/ABI 或 Bridge API 发生不兼容变更时，务必递增 `runtimeVersion`；旧版 APK 会安全跳过不匹配的 OTA 包。
-- `publicKey`：可选 ECDSA P-256 SPKI 公钥（支持 Base64 或 PEM）；配置后，客户端将强制校验 `bundle.signature`。
+- `publicKey`：可选 ECDSA P-256 SPKI 公钥（支持 Base64 或 PEM）；配置后，客户端将强制校验 `bundle.signature` 与 `manifestSignature`。
 - `checkOnLaunch`：
-  - `"manual"`（默认）：仅由业务代码调用 `gpuix.ota.check()` 触发；
-  - `"background"`：应用首帧挂载 2.5s 后在后台静默检查并下载为 `staged`，下次冷启无缝生效（`mandatory: true` 的发布仍会立即热切换）；
+  - `"manual"`（默认）：正常启动由业务代码调用 `gpuix.ota.check()` 触发；但当底座检测到连续早崩救援（`bootCrashStreak >= 2`）时，即使设为 `"manual"`，Native 底座仍会抢先尝试远端救援拉包；
+  - `"background"`：Native 启动阶段及/或应用首帧挂载后静默检查并下载为 `staged`，下次冷启无缝生效（`mandatory: true` 仍会立即热切换）；
   - `"immediate"`：启动检查到新版本后，下载并立即热切换生效。
+- 声明式权限裁剪（`gpuix.android.json -> permissions`）：可选字符串数组（如 `["CAMERA", "VIBRATE"]`）。配置后，`android/scripts/config.ts` 会在 `android/.build/AndroidManifest.xml` 中自动生成裁剪后的权限清单并始终保留 `INTERNET`；未配置时保留默认全量底座权限。
 
 ### 3. 构建并发布 OTA 包（免重装 APK）
 
@@ -76,11 +77,24 @@ gpuix ota keygen --out .gpuix-ota-keys
 gpuix ota build \
   --cwd . \
   --out dist/ota \
+  --seq 2001 \
   --base-url https://cdn.example.com/myapp/production \
   --private-key .gpuix-ota-keys/ota-private.pem \
   --notes "Fix layout and update copy"
 
 gpuix ota verify dist/ota/manifest.json --public-key .gpuix-ota-keys/ota-public.b64
+```
+
+如需在紧急故障时从服务端签发“熔断回退至 APK 内置包”指令，可执行：
+
+```sh
+gpuix ota build \
+  --rollback-to-embedded \
+  --cwd . \
+  --out dist/ota \
+  --release-id kill-2003 \
+  --seq 2003 \
+  --private-key .gpuix-ota-keys/ota-private.pem
 ```
 
 随后把 `dist/ota/` 目录（`manifest.json` + `bundles/<releaseId>/app.hbc`）上传到任意静态 HTTP 服务即可。
@@ -107,22 +121,25 @@ gpuix ota verify dist/ota/manifest.json --public-key .gpuix-ota-keys/ota-public.
 
 通过 `globalThis.gpuix.ota` 访问：
 
-- `getState()`：获取当前运行源（`"embedded"` | `"ota"`）、版本、确认状态、已暂存版本、黑名单与回滚原因。
-- `check({ manifestUrl?, channel?, timeoutMs?, headers? })`：拉取并校验远端 `manifest.json` 是否存在兼容更新。
-- `download({ manifest?, manifestUrl?, timeoutMs?, headers? })`：流式下载 bundle，校验体积上限、SHA-256、HBC 魔数与 ECDSA 签名，原子落盘为 `staged`。
+- `getState()`：获取当前运行源（`"embedded"` | `"ota"`）、版本、`hbcVersion`、确认状态（`confirmed`）、连续启崩计数（`bootCrashStreak`）、救援态（`rescueMode`）、最低防降级序号（`minManifestSeq`）、原生首检去重标志（`nativeLaunchCheckStarted`）、已暂存版本、黑名单（`failedReleaseIds`）与回滚原因（`lastRollbackReason`）。
+- `check({ manifestUrl?, channel?, timeoutMs?, headers? })`：拉取并校验远端 `manifest.json`；当遇到低序号、Kill Switch 熔断、黑名单或不兼容包时，返回对应 `reason`（`downgrade_blocked`、`rollback_to_embedded`、`blocklisted`、`hbc_version_mismatch` 等）。
+- `download({ manifest?, manifestUrl?, timeoutMs?, headers? })`：流式下载 bundle，校验体积上限、磁盘剩余空间（`StatFs >= 16 MiB`）、SHA-256、HBC 魔数、字节码版本号与 ECDSA 签名，POSIX 原子落盘为 `staged`。
 - `apply({ mode?: "hot" | "next_launch" | "restart" })`：
-  - `"hot"`（默认）：当前 Hermes 运行时执行 `__gpuixHotCleanup()`、清理旧定时器/rAF 后立即切换至新 `.hbc`；
+  - `"hot"`（默认）：当前 Hermes 运行时执行 `__gpuixHotCleanup()`、清理旧定时器/rAF 后立即切换至新 `.hbc` 并重新挂载 Watchdog；
   - `"next_launch"`：标记为 `active`，等待下次冷启自动加载；
   - `"restart"`：拉起全新应用进程后退出当前进程，获得干净初始态。
-- `confirm()`：将当前 `active` OTA 标记为稳定已确认（框架默认在首帧提交成功 1500ms 后自动确认；也可通过 `setManualConfirm(true)` 改为业务主动确认）。
+- `confirm()`：将当前 `active` OTA 标记为稳定已确认并清零 `bootInProgress` / `bootCrashStreak`（框架默认在首帧提交成功 2000ms 后自动确认；也可通过 `setManualConfirm(true)` 改为业务主动确认）。
 - `rollback({ applyNow?, mode?, reason? })`：立即回退到上一个已确认版本或 APK 内置 bundle，并将当前问题版本加入 `failedReleaseIds`。
 - `reset({ applyNow? })`：清除全部 OTA 缓存与状态并切回 APK 内置 bundle。
 - `onProgress(cb)`：订阅 `{ releaseId, bytesReceived, totalBytes, progress, phase }` 下载进度事件。
 
 ---
 
-## 五、安全与自愈机制
+## 五、安全、Native-First 救援与自愈机制
 
-1. **APK 覆盖/商店升级自动淘汰**：冷启时校验 `(versionCode, runtimeVersion, embeddedBuildId)` 三元组；一旦用户通过应用商店或 `adb install` 升级了底座 APK，旧版 OTA 状态与缓存自动清理，避免新 APK 反被旧 JS 覆盖。
-2. **Crash-Loop Guard（崩溃自愈）**：每次未确认的 OTA 启动计数 `+1`；若连续 2 次未确认即崩溃或退出（或热切换执行同步抛出异常），Rust 启动器与错误钩子自动把该 `releaseId` 拉黑并回滚到上一个已确认健康版本（`prev`）或 APK 内置包（`embedded`）。
-3. **路径穿越与体积边界**：严格限制 `releaseId` 仅含 `[A-Za-z0-9._-]` 且禁止 `..`，强制单包上限 `32 MiB`，Release 模式强制 `https://`。
+1. **Native-First 底座优先启动救援**：`GpuiActivity.onCreate()` 在 `System.loadLibrary` 之后、`super.onCreate()` 拉起 Rust/Hermes 之前即同步调用 `GpuiOtaManager.onNativeBootStart()`。若上轮启动未健康打卡就崩溃退出且连续失败达阈值（`bootCrashStreak >= 2`），即使配置为 `checkOnLaunch: "manual"` 也会立刻通过 Rust `BOOT_GATE` Condvar 挂起 JS 引擎并保持系统 Splash，先在 Native 层同步拉取远端修复包（或降级回健康版本/内置包）后再放行执行 JS，彻底解决“开屏 API 502/异常导致业务 JS 刚启动即闪退无法拉取修复包”的问题。
+2. **JS 线程心跳 Watchdog（死循环/卡死自愈）**：`runner.cpp` 提供无锁心跳探针 `gpuix_js_ping_async()` / `gpuix_js_ping_ack()`。冷启与 `nativeTriggerHotApply` 热切换均会启动看门狗线程；若在初始挂起窗口后心跳停滞达 `2500 ms`，Watchdog 会将当前未确认 OTA 记入 `failedReleaseIds` 并通过 JNI 调用 `requestProcessRestartFromNative()` 自动重启至上一稳定版本或内置包。
+3. **跨语言文件锁与 POSIX 原子落盘**：`GpuiOtaManager.java` 与 `android/rust/src/ota.rs` 通过 `filesDir/gpuix_ota/state.lock`（5 ms 退避、5 s 过期自动回收）串行化对 `state.kv` 的读写；文件激活替换取消非原子 `delete()`，先写入临时文件再单次 `rename` 覆盖。
+4. **ECDSA P-256 双向验签、`manifestSeq` 防降级与远端 Kill Switch**：同时对 `bundle.signature` 与 `manifestSignature` 进行权威签名校验；`minManifestSeq` 单调递增阻止旧序号清单回放；签名校验通过的 `action="rollback_to_embedded"` 会立即触发 `nativeTriggerHotRollback()` 安全熔断回退至内置包。
+5. **APK 覆盖/商店升级自动淘汰与字节码 ABI 门禁**：冷启同步校验 `(versionCode, runtimeVersion, embeddedBuildId)` 三元组，并在构建阶段写入 `ota-meta.kv -> hbc_version`，运行期读取 `.hbc` 头部 8..12 字节确保与当前 Hermes 引擎版本严格匹配。
+6. **路径穿越与资源边界**：严格限制 `releaseId` 仅含 `[A-Za-z0-9._-]` 且禁止 `..`，强制单包上限 `32 MiB`、下载前要求磁盘可用空间 `>= 16 MiB`，Release 模式强制 `https://`。

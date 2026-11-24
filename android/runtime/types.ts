@@ -90,12 +90,17 @@ export type OtaState = {
   checkOnLaunch: 'manual' | 'background' | 'immediate'
   embeddedFormat: 'hbc' | 'js'
   embeddedBuildId: string
+  hbcVersion?: number
   currentReleaseId: string | null
   currentFormat: 'hbc' | 'js'
   stagedReleaseId: string | null
   previousReleaseId: string | null
   confirmed: boolean
   launchAttempts: number
+  bootCrashStreak?: number
+  rescueMode?: boolean
+  minManifestSeq?: number
+  nativeLaunchCheckStarted?: boolean
   failedReleaseIds: string[]
   lastRollbackReason: string | null
   lastCheckedAt: number
@@ -103,19 +108,23 @@ export type OtaState = {
 
 export type OtaManifest = {
   schemaVersion: number
+  action?: 'update' | 'rollback_to_embedded'
   appId: string
   channel?: string
   runtimeVersion: string
   releaseId: string
   minVersionCode?: number
+  manifestSeq?: number
   mandatory?: boolean
   notes?: string
   publishedAt?: string
-  bundle: {
+  manifestSignature?: string
+  bundle?: {
     format: 'hbc' | 'js'
     url: string
     sha256: string
     size: number
+    hermesBytecodeVersion?: number
     signature?: string
   }
 }
@@ -128,6 +137,51 @@ export type OtaProgressEvent = {
   phase: 'downloading' | 'verifying' | 'ready'
 }
 
+export type AppStateEvent = {
+  state: 'active' | 'background'
+}
+
+export type NetworkChangeEvent = {
+  connected: boolean
+  networkType: 'wifi' | 'cellular' | 'ethernet' | 'other' | 'none'
+  isMetered: boolean
+}
+
+export type TransferProgressEvent = {
+  direction: 'download' | 'upload'
+  url: string
+  path: string
+  bytesTransferred: number
+  totalBytes: number
+  progress: number
+}
+
+export type FsScope = 'files' | 'cache'
+
+export type FsEntry = {
+  name: string
+  isDirectory: boolean
+  size: number
+  modifiedAt: number
+}
+
+export type FsStorageInfo = {
+  filesAvailableBytes: number
+  filesTotalBytes: number
+  cacheAvailableBytes: number
+  fsFilesUsedBytes: number
+  fsCacheUsedBytes: number
+}
+
+export type CompressedImageResult = {
+  path: string
+  uri: string
+  width: number
+  height: number
+  size: number
+  mimeType: string
+}
+
 export type GpuixNativeSdk = {
   invoke: <T = unknown>(
     module: string,
@@ -138,6 +192,8 @@ export type GpuixNativeSdk = {
   onEvent: (channel: string, fn: (payload: unknown) => void) => Unsubscribe
   onBackPressed: (handler: () => boolean | void) => Unsubscribe
   onDeepLink: (handler: (url: string) => void) => Unsubscribe
+  onAppStateChange: (fn: (ev: AppStateEvent) => void) => Unsubscribe
+  onNetworkChange: (fn: (ev: NetworkChangeEvent) => void) => Unsubscribe
   notifications: {
     areEnabled: () => Promise<{ enabled: boolean; permissionGranted: boolean }>
     show: (opts: {
@@ -233,6 +289,8 @@ export type GpuixNativeSdk = {
     canOpenUrl: (url: string) => Promise<{ canOpen: boolean }>
     getInitialUrl: () => Promise<{ url: string | null }>
     share: (opts: { title?: string; text: string; url?: string }) => Promise<{ shared: boolean }>
+    isAppInstalled: (packageName: string) => Promise<{ installed: boolean }>
+    openMarket: (packageName?: string) => Promise<{ opened: boolean }>
   }
   permissions: {
     check: (permission: string) => Promise<{ granted: boolean }>
@@ -252,10 +310,51 @@ export type GpuixNativeSdk = {
     read: (service: string, account: string) => Promise<{ value: string | null }>
     delete: (service: string, account: string) => Promise<{ ok: boolean }>
   }
+  fs: {
+    readText: (path: string, scope?: FsScope) => Promise<{ content: string; size: number }>
+    writeText: (path: string, content: string, opts?: { scope?: FsScope; append?: boolean }) => Promise<{ written: number; path: string }>
+    readBase64: (path: string, scope?: FsScope) => Promise<{ base64: string; size: number }>
+    writeBase64: (path: string, base64: string, opts?: { scope?: FsScope; append?: boolean }) => Promise<{ written: number; path: string }>
+    exists: (path: string, scope?: FsScope) => Promise<{ exists: boolean; isDirectory: boolean }>
+    stat: (path: string, scope?: FsScope) => Promise<{ exists: boolean; size: number; isDirectory: boolean; modifiedAt: number }>
+    list: (path?: string, scope?: FsScope) => Promise<{ entries: FsEntry[] }>
+    mkdir: (path: string, scope?: FsScope) => Promise<{ created: boolean }>
+    remove: (path: string, opts?: { scope?: FsScope; recursive?: boolean }) => Promise<{ removed: boolean }>
+    getStorageInfo: () => Promise<FsStorageInfo>
+  }
+  transfer: {
+    downloadFile: (opts: {
+      url: string
+      path: string
+      scope?: FsScope
+      headers?: Record<string, string>
+      timeoutMs?: number
+    }) => Promise<{ path: string; scope: FsScope; bytes: number; sha256: string }>
+    uploadFile: (opts: {
+      url: string
+      path: string
+      scope?: FsScope
+      fieldName?: string
+      fileName?: string
+      mimeType?: string
+      fields?: Record<string, string>
+      headers?: Record<string, string>
+      timeoutMs?: number
+    }) => Promise<{ status: number; ok: boolean; body: string }>
+    onProgress: (fn: (ev: TransferProgressEvent) => void) => Unsubscribe
+  }
   media: {
     pickImage: () => Promise<MediaPickResult>
     pickFile: (mimeType?: string) => Promise<MediaPickResult>
     takePhoto: () => Promise<MediaPickResult>
+    saveToGallery: (opts: { path: string; mimeType?: string; displayName?: string }) => Promise<{ saved: boolean; uri: string }>
+    compressImage: (opts: {
+      path: string
+      maxWidth?: number
+      maxHeight?: number
+      quality?: number
+      format?: 'jpeg' | 'png' | 'webp'
+    }) => Promise<CompressedImageResult>
   }
   location: {
     getCurrentPosition: () => Promise<LocationResult>

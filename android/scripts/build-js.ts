@@ -7,6 +7,7 @@ import type { BunPlugin } from 'bun'
 import {
   loadGpuixAndroidConfig,
   resolveOtaConfig,
+  syncGeneratedManifest,
   writeGradleProperties,
   writeTextIfChanged,
   type GpuixAndroidConfig,
@@ -164,12 +165,23 @@ export type CompileAndroidBundleOptions = {
   tempWorkDir?: string
 }
 
+const HERMES_BYTECODE_MAGIC = Buffer.from([0xc6, 0x1f, 0xbc, 0x03, 0xc1, 0x03, 0x19, 0x1f])
+
+export function readHermesBytecodeVersion(bytes: Uint8Array): number {
+  if (bytes.length < 12) return 0
+  for (let i = 0; i < HERMES_BYTECODE_MAGIC.length; i += 1) {
+    if (bytes[i] !== HERMES_BYTECODE_MAGIC[i]) return 0
+  }
+  return (bytes[8] | (bytes[9] << 8) | (bytes[10] << 16) | ((bytes[11] << 24) >>> 0)) >>> 0
+}
+
 export type CompiledAndroidBundle = {
   format: 'hbc' | 'js'
   bytes: Buffer
   jsSource: string
   sha256: string
   hermescPath: string | null
+  hbcVersion: number
 }
 
 /**
@@ -214,7 +226,14 @@ export async function compileAndroidBundle(options: CompileAndroidBundleOptions)
       if (proc.exitCode === 0 && existsSync(tmpHbc)) {
         const bytes = Buffer.from(await Bun.file(tmpHbc).arrayBuffer())
         const sha256 = createHash('sha256').update(bytes).digest('hex')
-        return { format: 'hbc', bytes, jsSource, sha256, hermescPath: hermesc }
+        return {
+          format: 'hbc',
+          bytes,
+          jsSource,
+          sha256,
+          hermescPath: hermesc,
+          hbcVersion: readHermesBytecodeVersion(bytes),
+        }
       }
       const errText = new TextDecoder().decode(proc.stderr).trim()
       console.warn(`Warning: hermesc bytecode compilation failed (${errText}); falling back to JS bundle`)
@@ -226,13 +245,14 @@ export async function compileAndroidBundle(options: CompileAndroidBundleOptions)
 
   const bytes = Buffer.from(jsSource, 'utf8')
   const sha256 = createHash('sha256').update(bytes).digest('hex')
-  return { format: 'js', bytes, jsSource, sha256, hermescPath: null }
+  return { format: 'js', bytes, jsSource, sha256, hermescPath: null, hbcVersion: 0 }
 }
 
 export function formatOtaMetaKv(
   config: GpuixAndroidConfig,
   format: 'hbc' | 'js',
   embeddedBuildId: string,
+  hbcVersion = 0,
 ): string {
   const ota = resolveOtaConfig(config)
   const clean = (value: string) => value.replace(/[\r\n\0]/g, ' ')
@@ -248,6 +268,7 @@ export function formatOtaMetaKv(
     `check_on_launch=${ota.checkOnLaunch}`,
     `embedded_format=${format}`,
     `embedded_build_id=${embeddedBuildId}`,
+    `hbc_version=${hbcVersion}`,
     '',
   ].join('\n')
 }
@@ -368,9 +389,11 @@ if (import.meta.main) {
     ? Buffer.from(await Bun.file(hbcPath).arrayBuffer())
     : Buffer.from(androidSource, 'utf8')
   const embeddedBuildId = createHash('sha256').update(finalBytes).digest('hex')
-  await writeTextIfChanged(otaMetaPath, formatOtaMetaKv(config, finalFormat, embeddedBuildId))
+  const hbcVersion = compiledHbc ? readHermesBytecodeVersion(finalBytes) : 0
+  await writeTextIfChanged(otaMetaPath, formatOtaMetaKv(config, finalFormat, embeddedBuildId, hbcVersion))
 
   const gradleProperties = await writeGradleProperties(androidRoot, config)
+  await syncGeneratedManifest(androidRoot, config)
   if (compiledHbc) {
     const hbcBytes = Bun.file(hbcPath).size
     console.log(`Android HBC: ${hbcPath} (${hbcBytes} bytes, release=${isRelease})`)
