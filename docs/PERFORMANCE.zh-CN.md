@@ -169,4 +169,10 @@
   - 二次热缓存构建（命中 `Native cache hit (arm64-v8a 91b7176fd8c4, profile=release)` 与 `Android HBC up to date`，Gradle `524 ms`）：**`1.59 s`**；
   - 通过 `Verified 16KB ELF LOAD alignment (arm64-v8a)`；
   - APK 总大小：**`17,710,039 B`（`16.89 MiB`）**，关键分项为 `lib/arm64-v8a/libgpuix_android.so` `11,586,680 B`、`lib/arm64-v8a/libgpuix_js.so` `3,139,248 B`、`lib/arm64-v8a/libc++_shared.so` `1,423,696 B`、`assets/gpuix/app.hbc` `1,349,443 B`、`classes.dex` `161,060 B`、`assets/gpuix/ota-meta.kv` `256 B`（`embedded_format=hbc`、`embedded_build_id=9d48989111f590cead806f6d843a0115bee7c2e02d4c3ee5e50d85cdd5373b94`）。
-- **真机状态说明**：打包完成后当前主机未检测到在线 ADB 设备，本版整合 OTA 后的最终 APK 尚未进行真机装机复测；上一小节的真机冷启、`FLAG_ACTIVITY_CLEAR_TASK` 重建与 120Hz 帧延迟数据来自同日 OTA 合入前的重构基线包。
+- **真机全套回归实测（OPPO PKC110 / `SWS8GUDUGIHECIMN`）**：
+  - **装机冷启与同进程 `CLEAR_TASK` 压测**：首次冷启 `LaunchState: COLD`、`TotalTime: 773 ms`（`WaitTime: 783 ms`，`PID: 7022`；后续冷启 `TotalTime: 374 ms`）；同进程连续 3 轮 `FLAG_ACTIVITY_CLEAR_TASK` 销毁重建 `3/3 Status: ok`（`LaunchState: WARM`，`TotalTime: 287 ms / 292 ms / 304 ms`），压测前后均保持同 `PID 7022`，logcat 确认 3 次完整执行主动退场→重建，且 `must construct App on main thread` / `PANIC` / `FATAL EXCEPTION` / `SIGSEGV` / `SIGABRT` 为 **0 次**；
+  - **路由与 120Hz `gpuix bench` 实测**：`gpuix://native-demo` Deep Link 触发 `onNewIntent` / `nativeOnDeepLink` 且 0 错误；首页往返滑动后在图层 `VRI-dev.gpuix.baseui/dev.gpui.mobile.GpuiActivity#268830` 采样 `N=57` 帧间隔，核验设备与本地 SHA-256（`3c2a222eb57b`）及 16KB 对齐一致，实测 **`P50 = 8.33 ms`、`P99 = 8.54 ms`，估算 `120.1 fps`**。
+- **真机免重装 OTA 全链路闭环实测**（临时测试包 `dev.gpuix.otatest`，开启 ECDSA P-256 `publicKey` + `checkOnLaunch: "immediate"`）：
+  - **V1 → V2（`r2-hot-ok`，`1,055,428 B`）同进程热切换**：配合 `gpuix ota serve` 与 `adb reverse tcp:8787`，冷启后 2.5s 自动拉取验签，同进程 `PID 10179` 内 ~`9 ms` 完成 `CLEANUP_FROM_V1` → `Hot-evaluating Hermes HBC ota:r2-hot-ok` → `mount complete`，1.5s 自动 confirm 后 `getState()` 返回 `"source":"ota"`、`"currentReleaseId":"r2-hot-ok"`、`"confirmed":true`；
+  - **脱机冷启持久化**：停服并移除 `adb reverse` 后冷启（`PID 10496`，`TotalTime: 421 ms`），直接运行 `Booting OTA bundle r2-hot-ok (1055428 bytes, confirmed=true)`，未再回退内置 V1；
+  - **V3 坏包（`r3-bad-crash`，`556 B` 顶层抛错）自动回滚**：热切换触发 `INTENTIONAL_V3_CRASH` 后约 `8 ms` 自动触发 `Auto-rolling back failed OTA r3-bad-crash -> r2-hot-ok`，状态记录 `failedReleaseIds: ["r3-bad-crash"]`，同进程 `PID 10669` 存活、Native 崩溃 **0 次**。
