@@ -667,4 +667,121 @@ describe('android/runtime native-bridge, websocket, viewport & renderer', () => 
     expect(nets).toEqual(['true:wifi'])
     expect(tProgress).toEqual([2048])
   })
+
+  test('RedBox batches cancel OTA auto-confirm while clean batches confirm boot health', async () => {
+    const confirmedCalls: number[] = []
+    const pendingTimers: Array<() => void> = []
+    const origSetTimeout = globalThis.setTimeout
+    const origClearTimeout = globalThis.clearTimeout
+
+    class MockNativeRenderer {
+      applyBatch() {}
+      applyBinaryBatch() {}
+    }
+
+    g.__gpuixNative = {
+      GpuixRenderer: MockNativeRenderer,
+      nativeInvoke(id: number, module: string, method: string) {
+        queueMicrotask(() => {
+          if (module === 'ota' && method === 'confirm') {
+            confirmedCalls.push(id)
+            handleBridgeResultEvent(
+              JSON.stringify({
+                requestId: id,
+                ok: true,
+                payloadJson: JSON.stringify({ confirmedNow: true }),
+              }),
+            )
+            return
+          }
+          handleBridgeResultEvent(
+            JSON.stringify({ requestId: id, ok: true, payloadJson: JSON.stringify({ ok: true }) }),
+          )
+        })
+        return true
+      },
+    }
+
+    installHotLifecycleHooks()
+    const sdk = createGpuixNativeSdk()
+    g.gpuix = sdk
+
+    let nextTimerHandle = 100
+    const clearedHandles = new Set<number>()
+    ;(globalThis as { setTimeout: unknown }).setTimeout = ((fn: () => void, ms?: number) => {
+      if (ms === 1500) {
+        const handle = nextTimerHandle++
+        pendingTimers.push(() => {
+          if (!clearedHandles.has(handle)) fn()
+        })
+        return handle
+      }
+      return origSetTimeout(fn, ms)
+    }) as typeof setTimeout
+    ;(globalThis as { clearTimeout: unknown }).clearTimeout = ((id: unknown) => {
+      if (typeof id === 'number' && id >= 100) {
+        clearedHandles.add(id)
+        return
+      }
+      origClearTimeout(id as ReturnType<typeof setTimeout>)
+    }) as typeof clearTimeout
+
+    try {
+      const renderer = GpuixRenderer()
+      // 1. Clean batch schedules auto-confirm, then RedBox cancels and blocks it.
+      renderer.__applyBatchQueue?.([['createElement', 1, 'div'], ['setRoot', 1]])
+      expect(getBridgeState().otaAutoConfirmTimer).not.toBeNull()
+      renderer.__applyBatchQueue?.([
+        ['createElement', 2, 'div'],
+        ['setCustomProp', 2, 'testId', 'runtime-error-overlay'],
+      ])
+      expect(getBridgeState().otaAutoConfirmTimer).toBeNull()
+      expect(getBridgeState().otaAutoConfirmBlocked).toBe(true)
+      while (pendingTimers.length > 0) pendingTimers.shift()?.()
+      await Promise.resolve()
+      await Promise.resolve()
+      expect(confirmedCalls.length).toBe(0)
+
+      // 2. Hot cleanup resets RedBox block; clean embedded boot triggers confirm() to clear bootInProgress/watchdog.
+      ;(g.__gpuixHotCleanup as () => void)()
+      renderer.__applyBatchQueue?.([['createElement', 3, 'div'], ['setRoot', 3]])
+      while (pendingTimers.length > 0) pendingTimers.shift()?.()
+      await new Promise((r) => origSetTimeout(r, 10))
+      expect(confirmedCalls.length).toBe(1)
+
+      // 3. Unconfirmed OTA also confirms once after timer fires cleanly.
+      ;(g.__gpuixHotCleanup as () => void)()
+      renderer.__applyBatchQueue?.([['createElement', 4, 'div'], ['setRoot', 4]])
+      while (pendingTimers.length > 0) pendingTimers.shift()?.()
+      await new Promise((r) => origSetTimeout(r, 10))
+      expect(confirmedCalls.length).toBe(2)
+
+      // 4. Node ID 990001 RedBox via applyBatch also blocks auto-confirm.
+      ;(g.__gpuixHotCleanup as () => void)()
+      renderer.applyBatch(JSON.stringify([['createElement', 990001, 'div'], ['setRoot', 990001]]))
+      expect(getBridgeState().otaAutoConfirmTimer).toBeNull()
+      expect(getBridgeState().otaAutoConfirmBlocked).toBe(true)
+      while (pendingTimers.length > 0) pendingTimers.shift()?.()
+      await new Promise((r) => origSetTimeout(r, 10))
+      expect(confirmedCalls.length).toBe(2)
+    } finally {
+      globalThis.setTimeout = origSetTimeout
+      globalThis.clearTimeout = origClearTimeout
+    }
+  })
+
+  test('__gpuixHotCleanup rejects in-flight pendingBridge requests and clears timers', async () => {
+    g.__gpuixNative = {
+      nativeInvoke: () => true,
+      wsConnect: () => true,
+      wsClose: () => true,
+    }
+    installHotLifecycleHooks()
+    const sdk = createGpuixNativeSdk()
+    const inFlight = sdk.device.getInfo()
+    expect(getBridgeState().pendingBridge.size).toBe(1)
+    ;(g.__gpuixHotCleanup as () => void)()
+    expect(getBridgeState().pendingBridge.size).toBe(0)
+    await expect(inFlight).rejects.toThrow('cancelled by hot reload')
+  })
 })

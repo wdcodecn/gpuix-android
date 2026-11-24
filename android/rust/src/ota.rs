@@ -1,17 +1,14 @@
 use std::collections::BTreeMap;
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd};
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, SystemTime};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const HERMES_BYTECODE_MAGIC: [u8; 8] = 0x1F1903C103BC1FC6u64.to_le_bytes();
 pub const MAX_UNCONFIRMED_LAUNCH_ATTEMPTS: u32 = 2;
 const MAX_FAILED_IDS: usize = 32;
-const STATE_LOCK_WAIT_MS: u64 = 2000;
-const STATE_LOCK_STALE_SECS: u64 = 5;
-
-static OTA_STATE_PROCESS_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
 
 const SHA256_K: [u32; 64] = [
     0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
@@ -141,65 +138,13 @@ pub enum BootPlan {
     },
 }
 
-struct LockFileGuard {
-    path: PathBuf,
-}
-
-impl Drop for LockFileGuard {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
-    }
-}
-
-/// Serializes cross-language (`GpuiOtaManager.java` <-> `ota.rs`) access to `state.kv`.
+/// Serializes cross-language (`GpuiOtaManager.java` <-> `ota.rs`) access to `state.kv` via `flock`.
 pub fn with_state_lock<F, R>(ota_dir: &Path, f: F) -> R
 where
     F: FnOnce() -> R,
 {
-    let proc_lock = OTA_STATE_PROCESS_MUTEX
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let _ = fs::create_dir_all(ota_dir);
-    let lock_path = ota_dir.join("state.lock");
-    let mut _guard: Option<LockFileGuard> = None;
-
-    let max_iters = STATE_LOCK_WAIT_MS / 5;
-    for _ in 0..max_iters {
-        match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&lock_path)
-        {
-            Ok(_) => {
-                _guard = Some(LockFileGuard {
-                    path: lock_path.clone(),
-                });
-                break;
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-                let stale = fs::metadata(&lock_path)
-                    .and_then(|m| m.modified())
-                    .and_then(|mtime| {
-                        SystemTime::now()
-                            .duration_since(mtime)
-                            .map_err(|_| std::io::Error::other("clock skew"))
-                    })
-                    .is_ok_and(|age| age > Duration::from_secs(STATE_LOCK_STALE_SECS));
-                if stale {
-                    let _ = fs::remove_file(&lock_path);
-                    continue;
-                }
-                std::thread::sleep(Duration::from_millis(5));
-            }
-            Err(_) => break,
-        }
-    }
-
-    let result = f();
-    drop(_guard);
-    drop(proc_lock);
-    result
+    let _guard = acquire_state_lock(ota_dir);
+    f()
 }
 
 pub fn is_valid_release_id(id: &str) -> bool {
@@ -421,17 +366,114 @@ fn state_file_path(ota_dir: &Path) -> PathBuf {
     ota_dir.join("state.kv")
 }
 
+static TMP_SEQ: AtomicU64 = AtomicU64::new(1);
+
+#[cfg(unix)]
+mod sys_lock {
+    use super::*;
+    use std::fs::OpenOptions;
+    use std::io::ErrorKind;
+
+    const LOCK_EX: libc_int = 2;
+    const LOCK_UN: libc_int = 8;
+    #[allow(non_camel_case_types)]
+    type libc_int = i32;
+
+    extern "C" {
+        fn flock(fd: libc_int, operation: libc_int) -> libc_int;
+    }
+
+    pub struct StateLockGuard {
+        file: fs::File,
+    }
+
+    impl Drop for StateLockGuard {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = flock(self.file.as_raw_fd(), LOCK_UN);
+            }
+        }
+    }
+
+    fn lock_file_ex(file: &fs::File) -> std::io::Result<()> {
+        let fd = file.as_raw_fd();
+        loop {
+            let rc = unsafe { flock(fd, LOCK_EX) };
+            if rc == 0 {
+                return Ok(());
+            }
+            let err = std::io::Error::last_os_error();
+            if err.kind() != ErrorKind::Interrupted {
+                return Err(err);
+            }
+        }
+    }
+
+    pub fn acquire_state_lock(ota_dir: &Path) -> Option<StateLockGuard> {
+        fs::create_dir_all(ota_dir).ok()?;
+        let lock_path = ota_dir.join("state.lock");
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .ok()?;
+        lock_file_ex(&file).ok()?;
+        Some(StateLockGuard { file })
+    }
+
+    pub fn acquire_state_lock_raw(ota_dir: &Path) -> i64 {
+        let Some(guard) = acquire_state_lock(ota_dir) else {
+            return -1;
+        };
+        let file = unsafe { std::ptr::read(&guard.file) };
+        std::mem::forget(guard);
+        file.into_raw_fd() as i64
+    }
+
+    pub fn release_state_lock_raw(fd: i64) {
+        if fd < 0 {
+            return;
+        }
+        let raw_fd = fd as i32;
+        unsafe {
+            let _ = flock(raw_fd, LOCK_UN);
+            drop(fs::File::from_raw_fd(raw_fd));
+        }
+    }
+}
+
+#[cfg(not(unix))]
+mod sys_lock {
+    use super::*;
+    pub struct StateLockGuard;
+    pub fn acquire_state_lock(_ota_dir: &Path) -> Option<StateLockGuard> {
+        Some(StateLockGuard)
+    }
+    pub fn acquire_state_lock_raw(_ota_dir: &Path) -> i64 {
+        -1
+    }
+    pub fn release_state_lock_raw(_fd: i64) {}
+}
+
+pub use sys_lock::{acquire_state_lock, acquire_state_lock_raw, release_state_lock_raw};
+
 fn write_atomic(path: &Path, content: &[u8]) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let tmp = path.with_extension(format!("kv.tmp.{}", std::process::id()));
-    {
+    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = path.with_extension(format!("kv.tmp.{}.{}", std::process::id(), seq));
+    let write_res = (|| {
         let mut f = fs::File::create(&tmp)?;
         f.write_all(content)?;
         f.sync_all()?;
+        fs::rename(&tmp, path)
+    })();
+    if write_res.is_err() {
+        let _ = fs::remove_file(&tmp);
     }
-    fs::rename(&tmp, path)
+    write_res
 }
 
 fn has_embedded_identity(embedded: &EmbeddedMeta) -> bool {
@@ -987,7 +1029,54 @@ mod tests {
             .parse::<u32>()
             .unwrap();
         assert_eq!(final_val, 80);
-        assert!(!ota_dir.join("state.lock").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn concurrent_state_updates_preserve_valid_kv_without_torn_reads() {
+        let dir = temp_dir("concurrent_lock");
+        let ota_dir = ota_root_dir(&dir);
+        let emb = sample_embedded();
+        let hbc = make_hbc(96, b"concurrent-healthy");
+        let mut slot = write_release_file(&dir, "rel-concurrent", "hbc", &hbc);
+        slot.confirmed = true;
+
+        let mut init = reset_for_embedded(&emb);
+        init.active = Some(slot);
+        save_state_best_effort(&ota_dir, &init);
+
+        let mut handles = Vec::new();
+        for _ in 0..6 {
+            let d = dir.clone();
+            let e = emb.clone();
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..25 {
+                    let plan = resolve_boot_bundle(&d, &e);
+                    assert!(
+                        matches!(plan, BootPlan::Ota { ref release_id, confirmed: true, .. } if release_id == "rel-concurrent"),
+                        "unexpected plan during concurrent locked reads: {plan:?}"
+                    );
+                }
+            }));
+        }
+        for t in 0..4 {
+            let d = ota_dir.clone();
+            let e = emb.clone();
+            handles.push(std::thread::spawn(move || {
+                for i in 0..20u64 {
+                    let _guard = acquire_state_lock(&d).unwrap();
+                    let (mut st, _) = load_or_sync_state(&d, &e);
+                    st.last_checked_at = 1000 + t * 100 + i;
+                    save_state_best_effort(&d, &st);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        let reloaded = OtaState::from_kv(&fs::read_to_string(state_file_path(&ota_dir)).unwrap());
+        assert_eq!(reloaded.active.as_ref().map(|s| s.id.as_str()), Some("rel-concurrent"));
+        assert!(reloaded.last_checked_at >= 1000);
         let _ = fs::remove_dir_all(&dir);
     }
 }

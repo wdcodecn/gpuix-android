@@ -6,7 +6,7 @@ import type {
   GpuixRendererInstance,
   ViewportInsets,
 } from './types'
-import { getBridgeState, installHotLifecycleHooks } from './bridge-state'
+import { cancelOtaAutoConfirm, getBridgeState, installHotLifecycleHooks } from './bridge-state'
 import { installTextPolyfills } from './utf8'
 import { installUrlPolyfills } from './url'
 import { installWebApis } from './web-apis'
@@ -36,25 +36,69 @@ export function installAndroidRuntime(): void {
 
 installAndroidRuntime()
 
+function isRedBoxActive(): boolean {
+  const g = globalThis as {
+    __gpuixRedBoxActive?: boolean
+    __gpuixRenderHost?: { overlayShown?: boolean }
+  }
+  return Boolean(g.__gpuixRedBoxActive || g.__gpuixRenderHost?.overlayShown)
+}
+
+function isRedBoxBatchJson(batchJson: string): boolean {
+  if (isRedBoxActive()) return true
+  if (batchJson.includes('runtime-error-overlay')) return true
+  return (
+    batchJson.includes('990001') &&
+    (batchJson.includes('"createElement",990001') ||
+      batchJson.includes('"createElement", 990001') ||
+      batchJson.includes('"setRoot",990001') ||
+      batchJson.includes('"setRoot", 990001'))
+  )
+}
+
+function isRedBoxQueue(queue: GpuixBatchMutation[]): boolean {
+  if (isRedBoxActive()) return true
+  for (let i = 0; i < queue.length; i += 1) {
+    const op = queue[i]
+    if (!Array.isArray(op)) continue
+    if (op[1] === 990001) return true
+    for (let j = 2; j < op.length; j += 1) {
+      const arg = op[j]
+      if (typeof arg === 'string' && arg.includes('runtime-error-overlay')) return true
+      if (
+        arg &&
+        typeof arg === 'object' &&
+        (arg as { testId?: unknown }).testId === 'runtime-error-overlay'
+      ) {
+        return true
+      }
+    }
+  }
+  return false
+}
+
 function scheduleOtaAutoConfirm(): void {
   const state = getBridgeState()
-  if (state.otaManualConfirm || state.otaAutoConfirmed) return
+  if (state.otaManualConfirm || state.otaAutoConfirmed || state.otaAutoConfirmBlocked || isRedBoxActive()) {
+    return
+  }
   state.otaAutoConfirmed = true
   state.otaAutoConfirmTimer = setTimeout(() => {
     state.otaAutoConfirmTimer = null
-    if (state.otaManualConfirm) return
+    if (state.otaManualConfirm || state.otaAutoConfirmBlocked || isRedBoxActive()) return
     const sdk = (globalThis as { gpuix?: GpuixNativeSdk }).gpuix
     if (sdk?.ota && typeof sdk.ota.confirm === 'function') {
       sdk.ota.confirm().catch(() => {})
     }
-  }, 2000)
+  }, 1500)
 }
 
 function scheduleLaunchOtaCheck(): void {
   const state = getBridgeState()
   if (state.otaLaunchChecked) return
   state.otaLaunchChecked = true
-  setTimeout(() => {
+  state.otaLaunchCheckTimer = setTimeout(() => {
+    state.otaLaunchCheckTimer = null
     const sdk = (globalThis as { gpuix?: GpuixNativeSdk }).gpuix
     if (!sdk?.ota) return
     sdk.ota
@@ -156,20 +200,30 @@ export function GpuixRenderer(callback?: GpuixRendererEventCallback): GpuixRende
   if (typeof instance.applyBatch === 'function') {
     const origApplyBatch = instance.applyBatch.bind(instance)
     instance.applyBatch = (batchJson: string) => {
+      const redBox = isRedBoxBatchJson(batchJson)
       const res = origApplyBatch(batchJson)
-      scheduleOtaAutoConfirm()
+      if (redBox) {
+        cancelOtaAutoConfirm(true)
+      } else {
+        scheduleOtaAutoConfirm()
+      }
       return res
     }
   }
   if (typeof instance.applyBinaryBatch === 'function') {
     const styleCache = createStyleCache()
     instance.__applyBatchQueue = (queue: GpuixBatchMutation[]) => {
+      const redBox = isRedBoxQueue(queue)
       const bin = encodeBatch(queue, styleCache)
       const res =
         bin !== null
           ? instance.applyBinaryBatch!(bin)
           : instance.applyBatch(JSON.stringify(queue))
-      scheduleOtaAutoConfirm()
+      if (redBox) {
+        cancelOtaAutoConfirm(true)
+      } else {
+        scheduleOtaAutoConfirm()
+      }
       return res
     }
   }

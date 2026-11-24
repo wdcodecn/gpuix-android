@@ -902,8 +902,10 @@ pub fn run_event_loop(app: &AndroidApp) {
             last_heartbeat = now;
         }
 
+        let current_platform = platform();
+
         // Check if quit was requested.
-        if let Some(platform) = platform() {
+        if let Some(platform) = &current_platform {
             if platform.should_quit() {
                 log::info!("run_event_loop: platform requested quit");
                 dispose_all_platform_views();
@@ -916,7 +918,7 @@ pub fn run_event_loop(app: &AndroidApp) {
         // worker only enqueues an atomic request, so changing the selector
         // cannot block the input acknowledgement path.
         if let Some(frame_rate) = take_power_frame_rate_request() {
-            if let Some(platform) = platform() {
+            if let Some(platform) = &current_platform {
                 if let Some(window) = platform.primary_window() {
                     window.set_power_frame_rate(frame_rate);
                 }
@@ -926,16 +928,16 @@ pub fn run_event_loop(app: &AndroidApp) {
         // ── Poll for events ──
         //
         // Use high-rate polling only while a touch/momentum interaction is
-        // active. A dirty-frame wake is handled immediately; otherwise static
-        // content gets a coarse 1s watchdog and enters deep idle after one
-        // minute. The Android looper/input queue and GPUI frame waker still
-        // interrupt both waits immediately when work arrives.
-        let (frame_pending, interactive) = platform()
+        // actively moving or animating. A dirty-frame wake is handled immediately;
+        // otherwise static content gets a coarse 1s watchdog without repeatedly
+        // submitting duplicate frames into the BLAST BufferQueue.
+        let (frame_pending, has_motion) = current_platform
+            .as_ref()
             .and_then(|platform| platform.primary_window())
             .map(|window| {
                 (
                     window.has_frame_request() || has_pending_ime_events(),
-                    window.is_active() && window.is_interactive(),
+                    window.is_active() && window.has_pending_motion(),
                 )
             })
             .unwrap_or((has_pending_ime_events(), false));
@@ -943,7 +945,7 @@ pub fn run_event_loop(app: &AndroidApp) {
         let vsync_requested = crate::android::vsync::is_requested();
         let can_render = app_is_active && INIT_WINDOW_DONE.load(Ordering::Relaxed);
         let need_vsync =
-            can_render && (frame_pending || interactive || external_demand || vsync_requested);
+            can_render && (frame_pending || has_motion || external_demand || vsync_requested);
         let hw_vsync = if need_vsync {
             crate::android::vsync::arm_if_needed()
         } else {
@@ -962,7 +964,7 @@ pub fn run_event_loop(app: &AndroidApp) {
             Some(Duration::from_millis(50))
         } else if frame_pending {
             Some(Duration::ZERO)
-        } else if interactive || external_demand {
+        } else if has_motion || external_demand {
             Some(Duration::from_millis(8))
         } else {
             // Keep a finite NativeActivity poll so Android's InputDispatcher
@@ -1001,7 +1003,7 @@ pub fn run_event_loop(app: &AndroidApp) {
             INIT_WINDOW_DONE.store(false, Ordering::Relaxed);
             crate::android::vsync::reset();
             *LAST_CHROME_STYLE.lock().unwrap() = None;
-            if let Some(platform) = platform() {
+            if let Some(platform) = &current_platform {
                 if let Some(win) = platform.primary_window() {
                     win.term_window();
                 }
@@ -1013,7 +1015,7 @@ pub fn run_event_loop(app: &AndroidApp) {
         // 2. InitWindow — replace surface on existing renderer, or create new
         if INIT_WINDOW_PENDING.swap(false, Ordering::Relaxed) {
             log::info!("deferred: InitWindow (iter={})", iteration);
-            if let Some(platform) = platform() {
+            if let Some(platform) = &current_platform {
                 if let Some(native_window) = app.native_window() {
                     let width = native_window.width();
                     let height = native_window.height();
@@ -1074,7 +1076,7 @@ pub fn run_event_loop(app: &AndroidApp) {
         // 3. WindowResized
         if WINDOW_RESIZED_PENDING.swap(false, Ordering::Relaxed) {
             log::debug!("deferred: WindowResized");
-            if let Some(platform) = platform() {
+            if let Some(platform) = &current_platform {
                 if let Some(win) = platform.primary_window() {
                     win.handle_resize();
                     let cr = app.content_rect();
@@ -1086,7 +1088,7 @@ pub fn run_event_loop(app: &AndroidApp) {
         // 4. ConfigChanged
         if CONFIG_CHANGED_PENDING.swap(false, Ordering::Relaxed) {
             log::debug!("deferred: ConfigChanged");
-            if let Some(platform) = platform() {
+            if let Some(platform) = &current_platform {
                 platform.notify_keyboard_layout_change();
                 let is_dark = query_night_mode_via_jni();
                 if let Some(win) = platform.primary_window() {
@@ -1100,7 +1102,10 @@ pub fn run_event_loop(app: &AndroidApp) {
             }
         }
 
-        if let Some(window) = platform().and_then(|platform| platform.primary_window()) {
+        if let Some(window) = current_platform
+            .as_ref()
+            .and_then(|platform| platform.primary_window())
+        {
             let pending = WINDOW_INSETS_PENDING.lock().take();
             if let Some((safe_area, ime)) = pending {
                 let insets = |values: [i32; 4]| super::window::SafeAreaInsets {
@@ -1117,7 +1122,7 @@ pub fn run_event_loop(app: &AndroidApp) {
         if PAUSE_PENDING.swap(false, Ordering::Relaxed) {
             log::info!("deferred: Pause (iter={})", iteration);
             crate::android::vsync::reset();
-            if let Some(platform) = platform() {
+            if let Some(platform) = &current_platform {
                 platform.did_enter_background();
                 if let Some(win) = platform.primary_window() {
                     win.set_active(false);
@@ -1130,7 +1135,7 @@ pub fn run_event_loop(app: &AndroidApp) {
         // 6. Resume / foreground
         if RESUME_PENDING.swap(false, Ordering::Relaxed) {
             log::info!("deferred: Resume (iter={})", iteration);
-            if let Some(platform) = platform() {
+            if let Some(platform) = &current_platform {
                 platform.did_become_active();
                 if let Some(win) = platform.primary_window() {
                     win.set_active(true);
@@ -1141,7 +1146,7 @@ pub fn run_event_loop(app: &AndroidApp) {
         }
 
         // Track active/focused state.
-        if let Some(platform) = platform() {
+        if let Some(platform) = &current_platform {
             if let Some(win) = platform.primary_window() {
                 let is_active = win.is_active();
                 if is_active != app_is_active {
@@ -1161,7 +1166,7 @@ pub fn run_event_loop(app: &AndroidApp) {
 
         // Deferred initialisation callbacks (runs once).
         if !INIT_WINDOW_DONE.load(Ordering::Relaxed) {
-            if let Some(platform) = platform() {
+            if let Some(platform) = &current_platform {
                 if platform.primary_window().is_some() {
                     if let Some(finish_cb) = platform.take_finish_launching_callback() {
                         log::info!("invoking finish_launching callback (iter={})", iteration);
@@ -1189,7 +1194,7 @@ pub fn run_event_loop(app: &AndroidApp) {
         }
 
         // ── Render ──
-        if let Some(platform) = platform() {
+        if let Some(platform) = &current_platform {
             if INIT_WINDOW_DONE.load(Ordering::Relaxed) && app_is_active {
                 let fired_ns = crate::android::vsync::take_fired();
                 let external_now = crate::android::vsync::has_external_demand();
@@ -1204,12 +1209,13 @@ pub fn run_event_loop(app: &AndroidApp) {
                 if let Some(win) = platform.primary_window() {
                     if fired_ns.is_some() || !hw_vsync || iteration <= 4 {
                         let had_request = win.take_frame_request();
-                        let should_render =
-                            had_request || (fired_ns.is_some() && win.is_interactive());
+                        let has_motion = win.has_pending_motion();
+                        let should_render = had_request
+                            || (fired_ns.is_some() && (has_motion || has_pending_ime_events()));
                         if should_render {
                             // Arm next VSync on the dedicated VSync thread before rendering
                             // so 120Hz (8.33ms) edges are never missed.
-                            if win.is_interactive() || crate::android::vsync::has_external_demand() {
+                            if has_motion || crate::android::vsync::has_external_demand() {
                                 crate::android::vsync::arm_if_needed();
                             }
                             win.request_frame();

@@ -253,7 +253,7 @@ void dispatch(uv_async_t *handle) {
     bool ok = (st == napi_ok) && !has_ex;
     if (!ok && err_msg.empty()) {
       err_msg = "hermes eval failed (status=" + std::to_string(static_cast<int>(st)) + ")";
-      report_fatal(err_msg);
+      __android_log_print(ANDROID_LOG_ERROR, kTag, "%s", err_msg.c_str());
     }
     if (auto fn = hot_eval_handler.load(std::memory_order_acquire)) {
       fn(ok, item.url.c_str(), ok ? nullptr : err_msg.c_str());

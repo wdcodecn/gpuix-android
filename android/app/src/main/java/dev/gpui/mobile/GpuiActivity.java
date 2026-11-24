@@ -348,8 +348,8 @@ public class GpuiActivity extends NativeActivity {
     @Override
     protected void onDestroy() {
         DeviceSystemPlugin.stopNetworkMonitor(this);
+        GpuiAccessibilityBridge.detach(this);
         if (sInstance == this) {
-            GpuiAccessibilityBridge.detach(this);
             GpuiNativeBridge.cleanup();
             GpuiWebSocket.closeAll();
             GpuiPlatformView.disposeAll();

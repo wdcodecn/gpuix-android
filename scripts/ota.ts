@@ -405,19 +405,19 @@ export async function verifyOtaRelease(
     : null
 
   let manifestSignatureVerified = false
-  if (pubKey && manifest.manifestSignature) {
+  if (pubKey) {
+    if (!manifest.manifestSignature) {
+      fail('public key provided, but manifest.manifestSignature is missing')
+    }
     const sigBytes = Buffer.from(manifest.manifestSignature, 'base64')
     const payload = Buffer.from(buildManifestSigningPayload(manifest), 'utf8')
     if (!cryptoVerify('sha256', payload, pubKey, sigBytes)) {
-      fail('ECDSA SHA-256 manifestSignature verification failed')
+      fail('ECDSA SHA-256 manifest signature verification failed')
     }
     manifestSignatureVerified = true
   }
 
   if (action === 'rollback_to_embedded') {
-    if (pubKey && !manifest.manifestSignature) {
-      fail('public key provided, but rollback_to_embedded manifest lacks manifestSignature')
-    }
     return {
       manifestPath,
       bundlePath: '',
@@ -661,7 +661,7 @@ export async function runOtaCommand(args: string[], defaultCwd: string): Promise
       `  Manifest: ${res.manifestPath}\n` +
       `  SHA-256:  ${res.manifest.bundle?.sha256}\n` +
       `  Seq:      ${res.manifest.manifestSeq}\n` +
-      `  Signed:   ${res.manifest.bundle?.signature ? 'yes (ECDSA P-256)' : 'no'}\n`,
+      `  Signed:   ${res.manifest.manifestSignature && res.manifest.bundle?.signature ? 'yes (ECDSA P-256)' : 'no'}\n`,
     )
     return
   }

@@ -262,6 +262,8 @@ prune_native_cache() {
   '
 }
 
+jni_variant_stamp="$android_root/.build/.jni-variant"
+
 if (( js_only )); then
   for req_lib in libgpuix_android.so libgpuix_js.so libc++_shared.so; do
     if [[ ! -f "$package_jni_dir/$req_lib" ]]; then
@@ -269,6 +271,18 @@ if (( js_only )); then
       exit 1
     fi
   done
+  if [[ "${GPUIX_ALLOW_VARIANT_MISMATCH:-0}" != "1" ]]; then
+    if [[ -f "$jni_variant_stamp" ]]; then
+      recorded_variant="$(sed -n 's/^variant=\([^ ]*\).*/\1/p' "$jni_variant_stamp" | head -n 1)"
+      if [[ -n "$recorded_variant" && "$recorded_variant" != "$variant" ]]; then
+        echo "Variant mismatch for --js-only: jniLibs were built for '$recorded_variant', cannot package into '$variant'. Run a full build without --js-only (or set GPUIX_ALLOW_VARIANT_MISMATCH=1 to override)." >&2
+        exit 1
+      fi
+    elif [[ "$variant" == "release" ]]; then
+      echo "Missing $jni_variant_stamp; refusing --release --js-only without knowing native binary profile (run a full --release build first, or set GPUIX_ALLOW_VARIANT_MISMATCH=1)." >&2
+      exit 1
+    fi
+  fi
   if [[ ! -x "$android_root/.build/hermes-host/bin/hermesc" && ! -x "$android_root/.build/hermes-host/bin/hermesc.exe" ]]; then
     bash "$android_root/scripts/build-hermes.sh"
   fi
@@ -371,7 +385,7 @@ else
       echo "Building native Android library ($abi, API 26+, profile=$rust_profile, jobs=$CARGO_BUILD_JOBS)..."
       (
         cd "$android_root/rust"
-        if [[ "$rust_profile" == "android-dev" ]]; then
+        if [[ "${GPUIX_KEEP_RUSTC_WRAPPER:-0}" != "1" ]]; then
           case "$(basename "${RUSTC_WRAPPER:-}")" in
             sccache*) unset RUSTC_WRAPPER ;;
           esac
@@ -446,6 +460,8 @@ else
         ;;
     esac
   done
+  mkdir -p "$(dirname "$jni_variant_stamp")"
+  printf 'variant=%s profile=%s\n' "$variant" "$rust_profile" > "$jni_variant_stamp"
 fi
 
 if (( bundle )); then

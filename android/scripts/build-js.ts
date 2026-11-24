@@ -65,6 +65,10 @@ const DEBUG_WRAPPER_PREFIX = `;(function() {
     };
   }
   globalThis.__gpuixShowRedBox = function(title, message) {
+    globalThis.__gpuixRedBoxActive = true;
+    if (typeof globalThis.__gpuixCancelOtaAutoConfirm === 'function') {
+      globalThis.__gpuixCancelOtaAutoConfirm();
+    }
     var renderer = globalThis.__gpuixLastRenderer;
     if (!renderer || typeof renderer.applyBatch !== 'function') return;
     try {
@@ -83,7 +87,9 @@ const DEBUG_WRAPPER_PREFIX = `;(function() {
       ]));
     } catch (_) {}
   };
-  globalThis.__gpuixClearRedBox = function() {};
+  globalThis.__gpuixClearRedBox = function() {
+    globalThis.__gpuixRedBoxActive = false;
+  };
   if (typeof globalThis.__gpuixRunHotCleanup === 'function') {
     globalThis.__gpuixRunHotCleanup();
   }
@@ -338,6 +344,7 @@ if (import.meta.main) {
       }
       console.log(`Android HBC up to date (${hbcInputHash.slice(0, 12)})`)
     } else {
+      await mkdir(path.dirname(hbcPath), { recursive: true })
       const hermesInputPath = isRelease
         ? path.join(androidRoot, `.build/.hermes-input.${process.pid}.js`)
         : bundlePath

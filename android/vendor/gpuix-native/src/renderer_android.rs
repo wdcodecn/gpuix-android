@@ -3,6 +3,7 @@
 //! as the desktop threaded hosts.
 use super::*;
 use std::sync::{
+    atomic::AtomicU64,
     mpsc::{channel, Sender, TryRecvError},
     OnceLock,
 };
@@ -35,6 +36,23 @@ static ANDROID_INIT: OnceLock<Mutex<Option<Sender<AndroidInit>>>> = OnceLock::ne
 static ANDROID_EVENT_CALLBACK: OnceLock<Mutex<Option<EventCallback>>> = OnceLock::new();
 static ANDROID_SESSION_LOCK: Mutex<()> = Mutex::new(());
 static ACTIVE_ANDROID_SESSION: Mutex<Option<ActiveAndroidSession>> = Mutex::new(None);
+static SESSION_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+fn supersede_active_session() {
+    if let Some(prev) = ACTIVE_ANDROID_SESSION
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take()
+    {
+        log::info!("run_android_with_stop: superseding previous active Android session");
+        if let Some(slot) = ANDROID_INIT.get() {
+            slot.lock().unwrap().take();
+        }
+        (prev.stop_js)();
+        prev.platform.quit();
+        prev.app.create_waker().wake();
+    }
+}
 
 fn clear_active_session_if(platform: &Arc<gpui_mobile::android::AndroidPlatform>) {
     let mut active = ACTIVE_ANDROID_SESSION
@@ -266,22 +284,25 @@ pub fn run_android_with_stop(
     stop_js: impl Fn() + Send + Sync + 'static,
 ) -> anyhow::Result<()> {
     let stop_js: Arc<dyn Fn() + Send + Sync> = Arc::new(stop_js);
-    if let Some(prev) = ACTIVE_ANDROID_SESSION
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .take()
-    {
-        log::info!("run_android_with_stop: superseding previous active Android session");
-        if let Some(slot) = ANDROID_INIT.get() {
-            slot.lock().unwrap().take();
+    let my_gen = SESSION_GENERATION.fetch_add(1, Ordering::AcqRel) + 1;
+    let _session_guard = loop {
+        supersede_active_session();
+        if SESSION_GENERATION.load(Ordering::Acquire) != my_gen {
+            log::info!("run_android_with_stop: session gen {my_gen} superseded before acquiring lock");
+            return Ok(());
         }
-        (prev.stop_js)();
-        prev.platform.quit();
-        prev.app.create_waker().wake();
+        match ANDROID_SESSION_LOCK.try_lock() {
+            Ok(guard) => break guard,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => break poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+    };
+    if SESSION_GENERATION.load(Ordering::Acquire) != my_gen {
+        log::info!("run_android_with_stop: session gen {my_gen} superseded after acquiring lock");
+        return Ok(());
     }
-    let _session_guard = ANDROID_SESSION_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
     gpui_mobile::android::init_logger();
     gpui_mobile::android::jni::install_panic_hook();
     let platform = gpui_mobile::android::jni::init_platform(&app);

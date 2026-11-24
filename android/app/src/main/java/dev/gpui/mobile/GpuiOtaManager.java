@@ -58,13 +58,10 @@ public final class GpuiOtaManager {
     private static final String META_ASSET_PATH = "gpuix/ota-meta.kv";
     private static final String OTA_DIR_NAME = "gpuix_ota";
     private static final String STATE_FILE_NAME = "state.kv";
-    private static final String STATE_LOCK_NAME = "state.lock";
     private static final int MAX_BUNDLE_BYTES = 32 * 1024 * 1024;
     private static final int MAX_MANIFEST_BYTES = 1024 * 1024;
     private static final int MAX_FAILED_IDS = 32;
     private static final int RESCUE_CRASH_THRESHOLD = 2;
-    private static final long LOCK_WAIT_MS = 2000L;
-    private static final long LOCK_STALE_MS = 5000L;
     private static final long MIN_FREE_DISK_BYTES = 16L * 1024L * 1024L;
     private static final byte[] HERMES_MAGIC = new byte[] {
         (byte) 0xC6, (byte) 0x1F, (byte) 0xBC, (byte) 0x03,
@@ -483,6 +480,13 @@ public final class GpuiOtaManager {
         }
 
         String releaseId = manifest.getString("releaseId");
+        String manifestChannel = manifest.optString("channel", "").trim();
+        String targetChannel = args.optString("channel", "").trim();
+        if (targetChannel.isEmpty()) targetChannel = meta.channel;
+        if (!targetChannel.isEmpty() && !manifestChannel.isEmpty() && !targetChannel.equals(manifestChannel)) {
+            GpuiNativeBridge.reject(reqId, "OTA channel mismatch: " + manifestChannel + " != " + targetChannel);
+            return;
+        }
         String expectedSha = manifest.getJSONObject("bundle").getString("sha256").toLowerCase(Locale.US);
         long expectedSize = manifest.getJSONObject("bundle").optLong("size", -1);
 
@@ -494,6 +498,25 @@ public final class GpuiOtaManager {
         }
         if (current.failedIds.contains(releaseId)) {
             GpuiNativeBridge.reject(reqId, "Release " + releaseId + " is blocklisted after prior failure");
+            return;
+        }
+        if (current.active != null && releaseId.equals(current.active.id)) {
+            if (expectedSha.equalsIgnoreCase(current.active.sha256)
+                    && verifySlotFile(ctx, current.active, meta.hbcVersion)) {
+                emitProgress(releaseId, expectedSize > 0 ? expectedSize : 0, expectedSize, "ready");
+                JSONObject res = buildStateJson(meta, current);
+                res.put("downloaded", false);
+                res.put("reused", true);
+                res.put("releaseId", releaseId);
+                GpuiNativeBridge.resolve(reqId, res);
+                return;
+            }
+            GpuiNativeBridge.reject(reqId, "Cannot overwrite active OTA release " + releaseId + " with different digest");
+            return;
+        }
+        if (current.prev != null && releaseId.equals(current.prev.id)
+                && !expectedSha.equalsIgnoreCase(current.prev.sha256)) {
+            GpuiNativeBridge.reject(reqId, "Cannot overwrite rollback OTA release " + releaseId + " with different digest");
             return;
         }
         if (current.staged != null && releaseId.equals(current.staged.id)
@@ -578,7 +601,7 @@ public final class GpuiOtaManager {
         if (!tmpDir.exists() && !tmpDir.mkdirs()) {
             throw new IllegalStateException("Cannot create OTA tmp directory");
         }
-        File tmpFile = new File(tmpDir, releaseId + "." + System.currentTimeMillis() + ".part");
+        File tmpFile = new File(tmpDir, releaseId + "." + Thread.currentThread().getId() + "." + System.nanoTime() + ".part");
         try {
             DownloadDigest digest = downloadToTempFile(bundleUrl, headers, timeoutMs, tmpFile, releaseId, expectedSize);
             emitProgress(releaseId, digest.bytesWritten, expectedSize > 0 ? expectedSize : digest.bytesWritten, "verifying");
@@ -602,9 +625,6 @@ public final class GpuiOtaManager {
             if (destParent != null && !destParent.exists() && !destParent.mkdirs()) {
                 throw new IllegalStateException("Cannot create release directory");
             }
-            if (!tmpFile.renameTo(destFile)) {
-                copyFileAtomic(tmpFile, destFile);
-            }
 
             long seq = Math.max(0L, manifest.optLong("manifestSeq", 0L));
             BundleSlot staged = new BundleSlot();
@@ -617,6 +637,19 @@ public final class GpuiOtaManager {
 
             withStateLock(ctx, () -> {
                 OtaState updated = loadOrSyncStateLocked(ctx, meta);
+                if (updated.active != null && releaseId.equals(updated.active.id)
+                        && !staged.sha256.equalsIgnoreCase(updated.active.sha256)) {
+                    throw new IllegalStateException("Cannot overwrite active OTA release " + releaseId + " with different digest");
+                }
+                if (updated.prev != null && releaseId.equals(updated.prev.id)
+                        && !staged.sha256.equalsIgnoreCase(updated.prev.sha256)) {
+                    throw new IllegalStateException("Cannot overwrite rollback OTA release " + releaseId + " with different digest");
+                }
+                if (!destFile.exists() || !verifySlotFile(ctx, staged, meta.hbcVersion)) {
+                    if (!tmpFile.renameTo(destFile)) {
+                        copyFileAtomic(tmpFile, destFile);
+                    }
+                }
                 updated.staged = staged;
                 if (seq > updated.minManifestSeq) {
                     updated.minManifestSeq = seq;
@@ -778,6 +811,9 @@ public final class GpuiOtaManager {
             return s;
         });
         safeMarkBootHealthy();
+        if (slotConfirmed[0]) {
+            safeNotifyOtaConfirmed();
+        }
 
         JSONObject res = buildStateJson(meta, state);
         res.put("confirmedNow", slotConfirmed[0]);
@@ -940,12 +976,10 @@ public final class GpuiOtaManager {
         EmbeddedMeta meta = loadEmbeddedMeta(ctx);
         String manifestSig = raw.optString("manifestSignature", "").trim();
         if (!meta.publicKey.isEmpty()) {
-            if ("rollback_to_embedded".equals(action) && manifestSig.isEmpty()) {
-                throw new SecurityException("rollback_to_embedded requires signed manifestSignature");
+            if (manifestSig.isEmpty()) {
+                throw new SecurityException("OTA publicKey is configured, but manifestSignature is missing");
             }
-            if (!manifestSig.isEmpty()) {
-                verifyEcdsaBytes(buildManifestSigningPayload(raw).getBytes(StandardCharsets.UTF_8), meta.publicKey, manifestSig);
-            }
+            verifyEcdsaBytes(buildManifestSigningPayload(raw).getBytes(StandardCharsets.UTF_8), meta.publicKey, manifestSig);
         }
 
         JSONObject normalized = new JSONObject(raw.toString());
@@ -1144,42 +1178,13 @@ public final class GpuiOtaManager {
 
     // ── Metadata, cross-language lock & state persistence ────────────────────
 
-    private static <T> T withStateLock(Context ctx, StateAction<T> action) throws Exception {
+    private static <T> T withStateLock(Context ignoredCtx, StateAction<T> action) throws Exception {
         synchronized (STATE_LOCK) {
-            File otaDir = getOtaDir(ctx);
-            if (!otaDir.exists() && !otaDir.mkdirs()) {
-                return action.run();
-            }
-            File lockFile = new File(otaDir, STATE_LOCK_NAME);
-            boolean acquired = false;
-            long deadline = System.currentTimeMillis() + LOCK_WAIT_MS;
-            while (System.currentTimeMillis() < deadline) {
-                try {
-                    if (lockFile.createNewFile()) {
-                        acquired = true;
-                        break;
-                    }
-                    long age = System.currentTimeMillis() - lockFile.lastModified();
-                    if (age > LOCK_STALE_MS) {
-                        //noinspection ResultOfMethodCallIgnored
-                        lockFile.delete();
-                        continue;
-                    }
-                    Thread.sleep(5);
-                } catch (InterruptedException ie) {
-                    Thread.currentThread().interrupt();
-                    break;
-                } catch (Throwable ignored) {
-                    break;
-                }
-            }
+            long lockFd = acquireCrossLangLock();
             try {
                 return action.run();
             } finally {
-                if (acquired) {
-                    //noinspection ResultOfMethodCallIgnored
-                    lockFile.delete();
-                }
+                releaseCrossLangLock(lockFd);
             }
         }
     }
@@ -1272,23 +1277,43 @@ public final class GpuiOtaManager {
         }
     }
 
+    private static long acquireCrossLangLock() {
+        try {
+            return nativeAcquireStateLock();
+        } catch (UnsatisfiedLinkError ignored) {
+            return -1L;
+        }
+    }
+
+    private static void releaseCrossLangLock(long fd) {
+        if (fd < 0) return;
+        try {
+            nativeReleaseStateLock(fd);
+        } catch (UnsatisfiedLinkError ignored) {
+        }
+    }
+
     private static void saveStateLocked(Context ctx, OtaState state) throws Exception {
         File otaDir = getOtaDir(ctx);
         if (!otaDir.exists() && !otaDir.mkdirs()) {
             throw new IllegalStateException("Cannot create gpuix_ota directory");
         }
         File target = new File(otaDir, STATE_FILE_NAME);
-        File tmp = new File(otaDir, STATE_FILE_NAME + ".tmp." + Thread.currentThread().getId());
+        File tmp = new File(otaDir, STATE_FILE_NAME + ".tmp." + Thread.currentThread().getId() + "." + System.nanoTime());
         String encoded = serializeStateKv(state);
-        try (FileOutputStream fos = new FileOutputStream(tmp)) {
-            fos.write(encoded.getBytes(StandardCharsets.UTF_8));
-            fos.getFD().sync();
-        }
-        // POSIX rename atomically replaces target without a deletion window.
-        if (!tmp.renameTo(target)) {
-            copyFileAtomic(tmp, target);
-            //noinspection ResultOfMethodCallIgnored
-            tmp.delete();
+        try {
+            try (FileOutputStream fos = new FileOutputStream(tmp)) {
+                fos.write(encoded.getBytes(StandardCharsets.UTF_8));
+                fos.getFD().sync();
+            }
+            if (!tmp.renameTo(target)) {
+                copyFileAtomic(tmp, target);
+            }
+        } finally {
+            if (tmp.exists()) {
+                //noinspection ResultOfMethodCallIgnored
+                tmp.delete();
+            }
         }
     }
 
@@ -1497,6 +1522,7 @@ public final class GpuiOtaManager {
 
     private static void scheduleProcessRestart(Context ctx) {
         SCHEDULER.schedule(() -> MAIN_HANDLER.post(() -> {
+            boolean started = false;
             try {
                 PackageManager pm = ctx.getPackageManager();
                 Intent launch = pm.getLaunchIntentForPackage(ctx.getPackageName());
@@ -1504,12 +1530,18 @@ public final class GpuiOtaManager {
                     Intent restart = Intent.makeRestartActivityTask(launch.getComponent());
                     restart.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TASK);
                     ctx.startActivity(restart);
+                    started = true;
+                } else {
+                    Log.e(TAG, "Failed to resolve launch intent for OTA restart");
                 }
             } catch (Throwable t) {
                 Log.e(TAG, "Failed to relaunch activity on OTA restart", t);
-            } finally {
-                android.os.Process.killProcess(android.os.Process.myPid());
-                System.exit(0);
+            }
+            if (started) {
+                SCHEDULER.schedule(() -> {
+                    android.os.Process.killProcess(android.os.Process.myPid());
+                    System.exit(0);
+                }, 400, TimeUnit.MILLISECONDS);
             }
         }), 150, TimeUnit.MILLISECONDS);
     }
@@ -1599,14 +1631,28 @@ public final class GpuiOtaManager {
     }
 
     private static void copyFileAtomic(File src, File dst) throws Exception {
-        try (InputStream in = new FileInputStream(src);
-             FileOutputStream out = new FileOutputStream(dst)) {
-            byte[] buf = new byte[16384];
-            int n;
-            while ((n = in.read(buf)) >= 0) {
-                out.write(buf, 0, n);
+        File parent = dst.getParentFile();
+        File tmp = new File(
+                parent != null ? parent : src.getParentFile(),
+                dst.getName() + ".copy." + Thread.currentThread().getId() + "." + System.nanoTime());
+        try {
+            try (InputStream in = new FileInputStream(src);
+                 FileOutputStream out = new FileOutputStream(tmp)) {
+                byte[] buf = new byte[16384];
+                int n;
+                while ((n = in.read(buf)) >= 0) {
+                    out.write(buf, 0, n);
+                }
+                out.getFD().sync();
             }
-            out.getFD().sync();
+            if (!tmp.renameTo(dst)) {
+                throw new IllegalStateException("Failed to rename temp file to " + dst.getAbsolutePath());
+            }
+        } finally {
+            if (tmp.exists()) {
+                //noinspection ResultOfMethodCallIgnored
+                tmp.delete();
+            }
         }
     }
 
@@ -1648,6 +1694,13 @@ public final class GpuiOtaManager {
         }
     }
 
+    private static void safeNotifyOtaConfirmed() {
+        try {
+            nativeNotifyOtaConfirmed();
+        } catch (UnsatisfiedLinkError ignored) {
+        }
+    }
+
     // ── JNI hooks implemented by android/rust/src/lib.rs ─────────────────────
 
     private static native void nativeSetBootGateReady(boolean ready);
@@ -1659,4 +1712,10 @@ public final class GpuiOtaManager {
     private static native boolean nativeTriggerHotApply();
 
     private static native boolean nativeTriggerHotRollback();
+
+    private static native void nativeNotifyOtaConfirmed();
+
+    private static native long nativeAcquireStateLock();
+
+    private static native void nativeReleaseStateLock(long fd);
 }

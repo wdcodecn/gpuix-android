@@ -843,6 +843,12 @@ impl AndroidWindow {
         self.interactive.load(Ordering::Acquire)
     }
 
+    /// Whether a touch drag delta or fling animation currently needs a frame.
+    pub fn has_pending_motion(&self) -> bool {
+        let ms = self.momentum.lock();
+        ms.has_pending_scroll || ms.scroller.is_active()
+    }
+
     /// Switch between power-balanced idle refresh and high-refresh input
     /// pacing. The native-window call is issued only when the mode changes.
     pub fn set_interactive(&self, interactive: bool) {
@@ -2514,6 +2520,12 @@ mod tests {
     #[test]
     fn gpu_info_none_for_headless() {
         let w = AndroidWindow::headless(1080, 1920, 2.0);
-        assert!(w.gpu_info().is_none());
+        assert!(w.gpu_specs().is_none());
+    }
+
+    #[test]
+    fn has_pending_motion_defaults_false() {
+        let w = AndroidWindow::headless(1080, 1920, 2.0);
+        assert!(!w.has_pending_motion());
     }
 }

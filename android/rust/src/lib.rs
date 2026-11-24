@@ -427,6 +427,41 @@ fn start_boot_watchdog(hot_stop: Arc<AtomicBool>) {
         });
 }
 
+#[no_mangle]
+pub unsafe extern "C" fn Java_dev_gpui_mobile_GpuiOtaManager_nativeNotifyOtaConfirmed(
+    _env: *mut c_void,
+    _class: *mut c_void,
+) {
+    let mut ctx = ota_ctx().lock().unwrap();
+    if ctx.running_ota_id.is_some() {
+        ctx.running_ota_confirmed = true;
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn Java_dev_gpui_mobile_GpuiOtaManager_nativeAcquireStateLock(
+    _env: *mut c_void,
+    _class: *mut c_void,
+) -> i64 {
+    let data_dir = {
+        let ctx = ota_ctx().lock().unwrap();
+        ctx.data_dir.clone()
+    };
+    let Some(dir) = data_dir else {
+        return -1;
+    };
+    ota::acquire_state_lock_raw(&ota::ota_root_dir(&dir))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn Java_dev_gpui_mobile_GpuiOtaManager_nativeReleaseStateLock(
+    _env: *mut c_void,
+    _class: *mut c_void,
+    fd: i64,
+) {
+    ota::release_state_lock_raw(fd);
+}
+
 fn parse_dev_port(raw: &[u8]) -> u16 {
     let text = std::str::from_utf8(raw).unwrap_or("");
     for token in text.split(|c: char| !c.is_ascii_digit()) {
@@ -535,14 +570,10 @@ fn android_main(app: android_activity::AndroidApp) {
         .unwrap_or_default();
     {
         let mut ctx = ota_ctx().lock().unwrap();
-        ctx.data_dir = data_dir.clone();
+        if ctx.data_dir.is_none() {
+            ctx.data_dir = data_dir.clone();
+        }
         ctx.embedded = embedded_meta.clone();
-        ctx.running_ota_id = None;
-        ctx.running_ota_confirmed = false;
-        ctx.boot_healthy = false;
-        ctx.boot_fatal_seen = false;
-        ctx.rollback_queued = false;
-        ctx.hot_stop = Some(Arc::clone(&hot_stop));
     }
 
     let result = gpuix_native::run_android_with_stop(
@@ -552,18 +583,23 @@ fn android_main(app: android_activity::AndroidApp) {
             if hot_stop_for_js.load(Ordering::Acquire) {
                 return;
             }
+            {
+                let mut ctx = ota_ctx().lock().unwrap();
+                ctx.data_dir = data_dir.clone();
+                ctx.embedded = embedded_meta.clone();
+                ctx.running_ota_id = None;
+                ctx.running_ota_confirmed = false;
+                ctx.boot_healthy = false;
+                ctx.boot_fatal_seen = false;
+                ctx.rollback_queued = false;
+                ctx.hot_stop = Some(Arc::clone(&hot_stop_for_js));
+            }
             if let Some(mut dev_cfg) = assets.open(c"gpuix/dev.json") {
                 if let Ok(bytes) = dev_cfg.buffer() {
                     spawn_hot_reload_poller(parse_dev_port(bytes), Arc::clone(&hot_stop_for_js));
                 }
             }
 
-            {
-                let mut ctx = ota_ctx().lock().unwrap();
-                ctx.boot_healthy = false;
-                ctx.boot_fatal_seen = false;
-                ctx.rollback_queued = false;
-            }
             start_boot_watchdog(Arc::clone(&hot_stop_for_js));
 
             let run_embedded = || -> i32 {

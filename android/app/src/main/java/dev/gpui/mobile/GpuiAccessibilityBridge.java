@@ -41,6 +41,7 @@ public final class GpuiAccessibilityBridge {
     }
 
     private static final Handler MAIN_HANDLER = new Handler(Looper.getMainLooper());
+    private static volatile Activity sAttachedActivity = null;
     private static volatile GpuiA11yHostView sHostView = null;
     private static volatile AccessibilityManager.AccessibilityStateChangeListener sListener = null;
     private static volatile List<A11yNode> sNodes = Collections.emptyList();
@@ -49,10 +50,37 @@ public final class GpuiAccessibilityBridge {
     private GpuiAccessibilityBridge() {
     }
 
+    private static void detachInternal(Activity expected) {
+        if (sHostView == null && sListener == null && sAttachedActivity == null) {
+            return;
+        }
+        if (expected != null && sAttachedActivity != expected) {
+            return;
+        }
+        Activity listenerOwner = expected != null ? expected : sAttachedActivity;
+        if (listenerOwner != null && sListener != null) {
+            AccessibilityManager am = (AccessibilityManager) listenerOwner.getSystemService(Context.ACCESSIBILITY_SERVICE);
+            if (am != null) {
+                am.removeAccessibilityStateChangeListener(sListener);
+            }
+        }
+        sListener = null;
+        if (sHostView != null && sHostView.getParent() instanceof ViewGroup) {
+            ((ViewGroup) sHostView.getParent()).removeView(sHostView);
+        }
+        sHostView = null;
+        sAttachedActivity = null;
+        sNodes = Collections.emptyList();
+    }
+
     public static void attach(final Activity activity) {
         if (activity == null) return;
         MAIN_HANDLER.post(() -> {
-            if (sHostView != null) return;
+            if (activity.isFinishing() || activity.isDestroyed()) return;
+            if (sAttachedActivity == activity && sHostView != null) return;
+            if (sHostView != null || sListener != null || sAttachedActivity != null) {
+                detachInternal(null);
+            }
             AccessibilityManager am = (AccessibilityManager) activity.getSystemService(Context.ACCESSIBILITY_SERVICE);
             sEnabled = am != null && am.isEnabled();
             notifyStateChanged(sEnabled);
@@ -71,22 +99,12 @@ public final class GpuiAccessibilityBridge {
                     ViewGroup.LayoutParams.MATCH_PARENT
             ));
             sHostView = host;
+            sAttachedActivity = activity;
         });
     }
 
     public static void detach(final Activity activity) {
-        MAIN_HANDLER.post(() -> {
-            if (activity != null && sListener != null) {
-                AccessibilityManager am = (AccessibilityManager) activity.getSystemService(Context.ACCESSIBILITY_SERVICE);
-                if (am != null) am.removeAccessibilityStateChangeListener(sListener);
-            }
-            sListener = null;
-            if (sHostView != null && sHostView.getParent() instanceof ViewGroup) {
-                ((ViewGroup) sHostView.getParent()).removeView(sHostView);
-            }
-            sHostView = null;
-            sNodes = Collections.emptyList();
-        });
+        MAIN_HANDLER.post(() -> detachInternal(activity));
     }
 
     public static boolean isEnabled() {

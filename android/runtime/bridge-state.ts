@@ -23,9 +23,11 @@ export type GpuixBridgeState = {
   wsRegistry: Map<number, ManagedWebSocketLike>
   hotCleanups: Array<() => void>
   otaAutoConfirmed: boolean
+  otaAutoConfirmBlocked: boolean
   otaManualConfirm: boolean
   otaLaunchChecked: boolean
   otaAutoConfirmTimer: ReturnType<typeof setTimeout> | null
+  otaLaunchCheckTimer: ReturnType<typeof setTimeout> | null
 }
 
 type BridgeGlobals = {
@@ -37,6 +39,8 @@ type BridgeGlobals = {
   __gpuixRegisterHotCleanup?: (fn: () => void) => void
   __gpuixRunHotCleanup?: () => void
   __gpuixHotCleanup?: () => void
+  __gpuixRedBoxActive?: boolean
+  __gpuixCancelOtaAutoConfirm?: () => void
 }
 
 export function getBridgeState(): GpuixBridgeState {
@@ -53,13 +57,26 @@ export function getBridgeState(): GpuixBridgeState {
       wsRegistry: new Map(),
       hotCleanups: [],
       otaAutoConfirmed: false,
+      otaAutoConfirmBlocked: false,
       otaManualConfirm: false,
       otaLaunchChecked: false,
       otaAutoConfirmTimer: null,
+      otaLaunchCheckTimer: null,
     }
   }
   g.__gpuixHotCleanups = g.__gpuixBridgeState.hotCleanups
   return g.__gpuixBridgeState
+}
+
+export function cancelOtaAutoConfirm(block = true): void {
+  const state = getBridgeState()
+  if (state.otaAutoConfirmTimer) {
+    clearTimeout(state.otaAutoConfirmTimer)
+    state.otaAutoConfirmTimer = null
+  }
+  if (block) {
+    state.otaAutoConfirmBlocked = true
+  }
 }
 
 export function runHotCleanups(): void {
@@ -104,15 +121,28 @@ export function performHotCleanup(): void {
     }
   })
   state.wsRegistry.clear()
+  state.pendingBridge.forEach((entry) => {
+    clearTimeout(entry.timer)
+    try {
+      entry.reject(new Error('Native bridge request cancelled by hot reload'))
+    } catch {
+      // Ignore rejection callback failures during hot cleanup
+    }
+  })
+  state.pendingBridge.clear()
   state.backHandlers.length = 0
   state.eventChannels.clear()
   state.deepLinkListeners.clear()
 
-  if (state.otaAutoConfirmTimer) {
-    clearTimeout(state.otaAutoConfirmTimer)
-    state.otaAutoConfirmTimer = null
+  cancelOtaAutoConfirm(false)
+  if (state.otaLaunchCheckTimer) {
+    clearTimeout(state.otaLaunchCheckTimer)
+    state.otaLaunchCheckTimer = null
   }
   state.otaAutoConfirmed = false
+  state.otaAutoConfirmBlocked = false
+  state.otaLaunchChecked = false
+  g.__gpuixRedBoxActive = false
 
   if (typeof g.__gpuixViewport?.__resetListeners === 'function') {
     g.__gpuixViewport.__resetListeners()
@@ -127,4 +157,5 @@ export function installHotLifecycleHooks(): void {
   }
   g.__gpuixRunHotCleanup = runHotCleanups
   g.__gpuixHotCleanup = performHotCleanup
+  g.__gpuixCancelOtaAutoConfirm = () => cancelOtaAutoConfirm(true)
 }

@@ -315,6 +315,7 @@ pub struct AndroidPlatform {
 pub struct DiscoveredFonts {
     pub core: Vec<String>,
     pub locale_priority: Vec<String>,
+    pub symbols: Vec<String>,
     pub extra: Vec<String>,
     pub emoji: Vec<String>,
 }
@@ -369,21 +370,36 @@ fn push_unique_font(dst: &mut Vec<String>, seen: &mut std::collections::HashSet<
     }
 }
 
+fn split_lang_and_script(tag: &str) -> (&str, Option<&str>) {
+    let mut parts = tag.split('-');
+    let primary = parts.next().unwrap_or("");
+    let script = parts.next().filter(|seg| seg.len() == 4 && seg.chars().all(|c| c.is_ascii_alphabetic()));
+    (primary, script)
+}
+
 fn locale_matches_family(family_lang: &str, device_locale: &str) -> bool {
     if family_lang.is_empty() || device_locale.is_empty() {
         return false;
     }
     let loc_lower = device_locale.to_ascii_lowercase().replace('_', "-");
-    let primary = loc_lower.split('-').next().unwrap_or("");
+    let (primary, dev_script) = split_lang_and_script(&loc_lower);
     for tag in family_lang.split([',', ' ']) {
-        let tag_lower = tag.trim().to_ascii_lowercase();
+        let tag_lower = tag.trim().to_ascii_lowercase().replace('_', "-");
         if tag_lower.is_empty() {
             continue;
         }
-        if loc_lower.starts_with(&tag_lower)
-            || (!primary.is_empty() && (tag_lower == primary || tag_lower.starts_with(&format!("{primary}-"))))
-        {
+        if loc_lower == tag_lower || loc_lower.starts_with(&format!("{tag_lower}-")) {
             return true;
+        }
+        let (tag_primary, tag_script) = split_lang_and_script(&tag_lower);
+        if !primary.is_empty() && tag_primary == primary {
+            match (dev_script, tag_script) {
+                (Some(ds), Some(ts)) if ds == ts => return true,
+                (Some(_), Some(_)) => continue,
+                (None, None) => return true,
+                (_, None) if tag_lower == primary => return true,
+                _ => continue,
+            }
         }
     }
     false
@@ -412,10 +428,13 @@ pub fn parse_android_fonts_xml(xml: &str, locale: &str) -> DiscoveredFonts {
 
         let fam_name = extract_attr(attrs, "name").unwrap_or("");
         let fam_lang = extract_attr(attrs, "lang").unwrap_or("");
+        let fallback_for = extract_attr(attrs, "fallbackFor").unwrap_or("");
         let is_sans_core = fam_name == "sans-serif";
-        let is_emoji = fam_lang.contains("Zsye") || fam_lang.contains("Zsym");
-        let is_locale_match = !is_emoji && locale_matches_family(fam_lang, locale);
-        let is_cjk = !is_emoji && (fam_lang.starts_with("zh") || fam_lang.starts_with("ja") || fam_lang.starts_with("ko"));
+        let is_serif_family = fam_name == "serif" || fallback_for == "serif";
+        let is_emoji = fam_lang.contains("Zsye");
+        let is_fam_symbol = fam_lang.contains("Zsym");
+        let is_locale_match = !is_emoji && !is_fam_symbol && locale_matches_family(fam_lang, locale);
+        let is_cjk = !is_emoji && !is_fam_symbol && (fam_lang.starts_with("zh") || fam_lang.starts_with("ja") || fam_lang.starts_with("ko"));
 
         let mut fpos = 0;
         while let Some(font_rel) = body[fpos..].find("<font") {
@@ -438,14 +457,24 @@ pub fn parse_android_fonts_xml(xml: &str, locale: &str) -> DiscoveredFonts {
             }
             let weight = extract_attr(fattrs, "weight").unwrap_or("400");
             let style = extract_attr(fattrs, "style").unwrap_or("normal");
+            let is_serif_file = filename.contains("Serif");
+            let is_symbol = is_fam_symbol || filename.contains("Symbols");
 
             if is_emoji || filename.contains("Emoji") {
                 push_unique_font(&mut out.emoji, &mut seen, filename);
+            } else if is_symbol && style == "normal" && weight == "400" {
+                push_unique_font(&mut out.symbols, &mut seen, filename);
             } else if is_sans_core && style == "normal" && matches!(weight, "400" | "700") && out.core.len() < 4 {
                 push_unique_font(&mut out.core, &mut seen, filename);
-            } else if is_locale_match && style == "normal" && matches!(weight, "400" | "500" | "700") {
+            } else if is_locale_match
+                && !is_serif_family
+                && !is_serif_file
+                && style == "normal"
+                && matches!(weight, "400" | "500")
+                && out.locale_priority.len() < 2
+            {
                 push_unique_font(&mut out.locale_priority, &mut seen, filename);
-            } else if is_cjk && style == "normal" && weight == "400" {
+            } else if is_cjk && !is_serif_family && !is_serif_file && style == "normal" && weight == "400" {
                 push_unique_font(&mut out.extra, &mut seen, filename);
             } else if (is_sans_core || fam_name == "monospace" || fam_name == "serif") && out.extra.len() < 24 {
                 push_unique_font(&mut out.extra, &mut seen, filename);
@@ -478,6 +507,20 @@ fn read_android_locale() -> String {
 #[cfg(not(target_os = "android"))]
 fn read_android_locale() -> String {
     "en-US".to_string()
+}
+
+fn is_large_cjk_font_path(path: &str) -> bool {
+    !path.contains("Emoji")
+        && (path.contains("CJK")
+            || path.contains("Hans")
+            || path.contains("Hant")
+            || path.contains("SysSans")
+            || path.contains("MiSans")
+            || path.contains("HarmonyOS"))
+}
+
+fn is_large_cjk_font(path: &str, bytes_len: usize) -> bool {
+    !path.contains("Emoji") && bytes_len >= 4 * 1024 * 1024 && (is_large_cjk_font_path(path) || bytes_len >= 10 * 1024 * 1024)
 }
 
 /// Check whether a TrueType/OpenType font file contains CBDT (Color Bitmap
@@ -567,10 +610,11 @@ impl AndroidPlatform {
                 let discovered = if let Ok(xml) = std::fs::read_to_string("/system/etc/fonts.xml") {
                     let parsed = parse_android_fonts_xml(&xml, &locale);
                     log::info!(
-                        "fonts.xml parsed for locale={}: core={}, locale_priority={}, extra={}, emoji={}",
+                        "fonts.xml parsed for locale={}: core={}, locale_priority={}, symbols={}, extra={}, emoji={}",
                         locale,
                         parsed.core.len(),
                         parsed.locale_priority.len(),
+                        parsed.symbols.len(),
                         parsed.extra.len(),
                         parsed.emoji.len()
                     );
@@ -616,15 +660,39 @@ impl AndroidPlatform {
         // Phase 2 (background thread, non-headless):
         // Batch 0: locale-priority font (e.g. zh-Hans CJK/OEM Sans) loaded first and painted immediately.
         // Batch 1 & 2: remaining weights, monospace, extended scripts, and CBDT emoji.
+        // Deduplicates overlapping multi-megabyte CJK fonts once a primary CJK face is active.
         {
             let bg_text_system = Arc::clone(&text_system);
             std::thread::Builder::new()
                 .name("gpuix-fonts".into())
                 .spawn(move || {
-                    let load_paths = |paths: &[String], tag: &str| {
+                    let mut loaded_paths = std::collections::HashSet::new();
+                    let mut has_primary_cjk = false;
+
+                    let load_paths = |paths: &[String],
+                                      tag: &str,
+                                      loaded: &mut std::collections::HashSet<String>,
+                                      primary_cjk: &mut bool| {
                         let mut data: Vec<std::borrow::Cow<'static, [u8]>> = Vec::new();
                         for path in paths {
+                            if !loaded.insert(path.clone()) {
+                                continue;
+                            }
+                            if *primary_cjk && is_large_cjk_font_path(path) {
+                                log::debug!("skipping redundant CJK font {tag}: {path}");
+                                continue;
+                            }
                             if let Ok(bytes) = std::fs::read(path) {
+                                if *primary_cjk && is_large_cjk_font(path, bytes.len()) {
+                                    log::debug!(
+                                        "skipping redundant large CJK font {tag}: {path} ({} bytes)",
+                                        bytes.len()
+                                    );
+                                    continue;
+                                }
+                                if is_large_cjk_font(path, bytes.len()) {
+                                    *primary_cjk = true;
+                                }
                                 log::info!("loaded bg font {tag}: {path} ({} bytes)", bytes.len());
                                 data.push(std::borrow::Cow::Owned(bytes));
                             }
@@ -645,9 +713,9 @@ impl AndroidPlatform {
                     if batch0.is_empty() {
                         batch0.push("/system/fonts/NotoSansCJK-Regular.ttc".to_string());
                     }
-                    load_paths(&batch0, "batch0");
+                    load_paths(&batch0, "batch0", &mut loaded_paths, &mut has_primary_cjk);
 
-                    // Batch 1: core extras, monospace, Roboto weights
+                    // Batch 1: core extras, symbols, monospace, Roboto weights
                     let mut batch1: Vec<String> = vec![
                         "/system/fonts/Roboto-Italic.ttf".to_string(),
                         "/system/fonts/Roboto-BoldItalic.ttf".to_string(),
@@ -655,22 +723,46 @@ impl AndroidPlatform {
                         "/system/fonts/Roboto-Light.ttf".to_string(),
                         "/system/fonts/DroidSansMono.ttf".to_string(),
                         "/system/fonts/RobotoMono-Regular.ttf".to_string(),
-                        "/system/fonts/NotoSansCJK-Regular.ttc".to_string(),
                     ];
+                    for p in discovered.symbols {
+                        if !batch1.contains(&p) {
+                            batch1.push(p);
+                        }
+                    }
+                    for sym_fallback in [
+                        "/system/fonts/NotoSansSymbols-Regular-Subsetted.ttf",
+                        "/system/fonts/NotoSansSymbols-Regular-Subsetted2.ttf",
+                    ] {
+                        let s = sym_fallback.to_string();
+                        if !batch1.contains(&s) {
+                            batch1.push(s);
+                        }
+                    }
+                    if !has_primary_cjk {
+                        batch1.push("/system/fonts/NotoSansCJK-Regular.ttc".to_string());
+                    }
                     for p in discovered.core.into_iter().skip(2) {
                         if !batch1.contains(&p) {
                             batch1.push(p);
                         }
                     }
                     for p in discovered.extra.iter().take(12) {
+                        if has_primary_cjk && is_large_cjk_font_path(p) {
+                            continue;
+                        }
                         if !batch1.contains(p) {
                             batch1.push(p.clone());
                         }
                     }
-                    load_paths(&batch1, "batch1");
+                    load_paths(&batch1, "batch1", &mut loaded_paths, &mut has_primary_cjk);
 
                     // Batch 2: remaining extended scripts + CBDT emoji
-                    let mut batch2_paths: Vec<String> = discovered.extra.into_iter().skip(12).collect();
+                    let mut batch2_paths: Vec<String> = discovered
+                        .extra
+                        .into_iter()
+                        .skip(12)
+                        .filter(|p| !(has_primary_cjk && is_large_cjk_font_path(p)))
+                        .collect();
                     for fallback in [
                         "/system/fonts/NotoSans-Regular.ttf",
                         "/system/fonts/NotoSans-Bold.ttf",
@@ -688,7 +780,19 @@ impl AndroidPlatform {
                     }
                     let mut batch2: Vec<std::borrow::Cow<'static, [u8]>> = Vec::new();
                     for path in &batch2_paths {
+                        if !loaded_paths.insert(path.clone()) {
+                            continue;
+                        }
+                        if has_primary_cjk && is_large_cjk_font_path(path) {
+                            continue;
+                        }
                         if let Ok(bytes) = std::fs::read(path) {
+                            if has_primary_cjk && is_large_cjk_font(path, bytes.len()) {
+                                continue;
+                            }
+                            if is_large_cjk_font(path, bytes.len()) {
+                                has_primary_cjk = true;
+                            }
                             log::info!("loaded bg font batch2: {path} ({} bytes)", bytes.len());
                             batch2.push(std::borrow::Cow::Owned(bytes));
                         }
@@ -2090,5 +2194,63 @@ mod tests {
         let raw = b"hello-gpuix-keystore!\x00\xff";
         let b64 = encode_base64(raw);
         assert_eq!(decode_base64(&b64).as_deref(), Some(raw.as_slice()));
+    }
+
+    #[test]
+    fn fonts_xml_deduplicates_script_and_skips_serif_cjk_in_locale_priority() {
+        let xml = r#"
+            <familyset version="23">
+              <family lang="zh-Hans">
+                <font weight="400" style="normal">SysSans-Hans-Regular.ttf</font>
+                <font weight="500" style="normal">SysSans-Hans-Medium.ttf</font>
+                <font weight="700" style="normal">SysSans-Hans-Bold.ttf</font>
+              </family>
+              <family lang="zh-Hant">
+                <font weight="400" style="normal">SysSans-Hant-Regular.ttf</font>
+              </family>
+              <family lang="zh-Hans" fallbackFor="serif">
+                <font weight="400" style="normal">NotoSerifCJK-Regular.ttc</font>
+              </family>
+            </familyset>
+        "#;
+        let hans = parse_android_fonts_xml(xml, "zh-Hans-CN");
+        assert_eq!(
+            hans.locale_priority,
+            vec![
+                "/system/fonts/SysSans-Hans-Regular.ttf",
+                "/system/fonts/SysSans-Hans-Medium.ttf",
+            ]
+        );
+        assert!(!hans.extra.contains(&"/system/fonts/NotoSerifCJK-Regular.ttc".to_string()));
+        assert!(hans.extra.contains(&"/system/fonts/SysSans-Hant-Regular.ttf".to_string()));
+
+        let hant = parse_android_fonts_xml(xml, "zh-Hant-TW");
+        assert_eq!(hant.locale_priority, vec!["/system/fonts/SysSans-Hant-Regular.ttf"]);
+    }
+
+    #[test]
+    fn fonts_xml_collects_symbols_without_lang_and_und_zsym_outside_emoji() {
+        let xml = r#"
+            <familyset version="23">
+              <family>
+                <font weight="400" style="normal">NotoSansSymbols-Regular-Subsetted.ttf</font>
+              </family>
+              <family lang="und-Zsym">
+                <font weight="400" style="normal">NotoSansSymbols-Regular-Subsetted2.ttf</font>
+              </family>
+              <family lang="und-Zsye">
+                <font weight="400" style="normal">NotoColorEmojiFlags.ttf</font>
+              </family>
+            </familyset>
+        "#;
+        let parsed = parse_android_fonts_xml(xml, "zh-Hans-CN");
+        assert_eq!(
+            parsed.symbols,
+            vec![
+                "/system/fonts/NotoSansSymbols-Regular-Subsetted.ttf",
+                "/system/fonts/NotoSansSymbols-Regular-Subsetted2.ttf",
+            ]
+        );
+        assert_eq!(parsed.emoji, vec!["/system/fonts/NotoColorEmojiFlags.ttf"]);
     }
 }
