@@ -62,6 +62,14 @@ impl IosDisplay {
             scale as f32
         }
     }
+
+    /// Get the maximum refresh rate supported by this screen in Hz.
+    pub fn maximum_frames_per_second(&self) -> f32 {
+        unsafe {
+            let fps: isize = msg_send![self.screen, maximumFramesPerSecond];
+            if fps >= 60 { fps as f32 } else { 60.0 }
+        }
+    }
 }
 
 impl PlatformDisplay for IosDisplay {

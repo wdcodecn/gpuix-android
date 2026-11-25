@@ -621,6 +621,7 @@ async function build(parsed: ParsedArgs, projectRoot: string): Promise<void> {
   if (target === 'ios') {
     const args: string[] = ['--project', projectRoot]
     if (hasFlag(parsed, 'release')) args.push('--release')
+    if (hasFlag(parsed, 'fast')) args.push('--fast')
     if (hasFlag(parsed, 'js-only')) args.push('--js-only')
     if (hasFlag(parsed, 'no-hbc')) args.push('--no-hbc')
     const entry = option(parsed, 'entry')
@@ -664,6 +665,7 @@ async function runTarget(parsed: ParsedArgs, projectRoot: string): Promise<void>
     const entry = option(parsed, 'entry')
     if (entry) args.push('--entry', entry)
     if (hasFlag(parsed, 'release')) args.push('--release')
+    if (hasFlag(parsed, 'fast')) args.push('--fast')
     if (hasFlag(parsed, 'js-only')) args.push('--js-only')
     if (hasFlag(parsed, 'no-hbc')) args.push('--no-hbc')
     const scriptPath = path.join(templateIosRoot, 'scripts/run-ios-sim.sh')

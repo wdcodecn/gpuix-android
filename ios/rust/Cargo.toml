@@ -45,3 +45,16 @@ codegen-units = 16
 [profile.ios-dev.package.gpui-mobile]
 opt-level = 1
 codegen-units = 16
+
+[profile.release-fast]
+inherits = "release"
+lto = "thin"
+codegen-units = 4
+
+[profile.release]
+opt-level = "z"
+debug = 0
+strip = "symbols"
+lto = "fat"
+codegen-units = 1
+panic = "abort"

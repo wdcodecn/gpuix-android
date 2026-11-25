@@ -518,6 +518,10 @@ impl IosWindow {
         unsafe {
             // Create UIWindow (attach to active UIWindowScene on iOS 13+ when present)
             let screen_obj: *mut AnyObject = msg_send![class!(UIScreen), mainScreen];
+            if !screen_obj.is_null() {
+                let max_fps: isize = msg_send![screen_obj, maximumFramesPerSecond];
+                super::ffi::set_display_max_fps(if max_fps >= 60 { max_fps as u32 } else { 60 });
+            }
             let screen_bounds_cg: ObjcCGRect = msg_send![screen_obj, bounds];
             let app: *mut AnyObject = msg_send![class!(UIApplication), sharedApplication];
             let scenes: *mut AnyObject = msg_send![app, connectedScenes];
@@ -823,7 +827,7 @@ impl IosWindow {
     /// near a button or tab doesn't accidentally trigger navigation.
     /// Interactive screens use `MouseMove` to track the finger during drags
     /// and `MouseUp` to detect the end of a throw/drag gesture.
-    pub fn handle_touch(&self, touch: *mut AnyObject, _event: *mut AnyObject) {
+    pub fn handle_touch(&self, touch: *mut AnyObject, event: *mut AnyObject) {
         let position = touch_location_in_view(touch, self.view);
         let phase = touch_phase(touch);
         let tap_count = touch_tap_count(touch);
@@ -845,6 +849,7 @@ impl IosWindow {
         match phase {
             UITouchPhase::Began => {
                 self.touch_pressed.set(true);
+                super::ffi::set_touch_interactive(true);
                 // Cancel any active momentum fling — the user touched the
                 // screen again, so inertia scrolling must stop immediately.
                 self.momentum_scroller.borrow_mut().cancel();
@@ -854,22 +859,53 @@ impl IosWindow {
                     start_x: logical_x,
                     start_y: logical_y,
                 };
-                // Do NOT emit MouseDown here — wait until we know whether
-                // this is a tap or a scroll.  Emitting MouseDown immediately
-                // causes accidental navigation when the user starts scrolling
-                // near a button/tab.
-                //
-                // - Tap (finger lifts within slop) → emit MouseDown + MouseUp
-                //   together in Ended phase.
-                // - Scroll (finger exceeds slop) → emit only MouseMove +
-                //   ScrollWheel, no MouseDown.
             }
 
             UITouchPhase::Moved => {
-                // Record every move for velocity estimation.
-                self.velocity_tracker
-                    .borrow_mut()
-                    .record(logical_x, logical_y);
+                super::ffi::set_touch_interactive(true);
+                // Sample ProMotion coalesced touches when available for accurate fling velocity.
+                {
+                    let mut tracker = self.velocity_tracker.borrow_mut();
+                    let mut recorded_coalesced = false;
+                    if !event.is_null() {
+                        unsafe {
+                            let coalesced: *mut AnyObject =
+                                msg_send![event, coalescedTouchesForTouch: touch];
+                            if !coalesced.is_null() {
+                                let count: usize = msg_send![coalesced, count];
+                                if count > 0 {
+                                    let latest_ts: f64 = msg_send![touch, timestamp];
+                                    let now = std::time::Instant::now();
+                                    for i in 0..count {
+                                        let sample_touch: *mut AnyObject =
+                                            msg_send![coalesced, objectAtIndex: i];
+                                        if sample_touch.is_null() {
+                                            continue;
+                                        }
+                                        let sample_pos =
+                                            touch_location_in_view(sample_touch, self.view);
+                                        let sample_ts: f64 = msg_send![sample_touch, timestamp];
+                                        let delta_secs = (latest_ts - sample_ts).clamp(0.0, 0.25);
+                                        let at = now
+                                            .checked_sub(std::time::Duration::from_secs_f64(
+                                                delta_secs,
+                                            ))
+                                            .unwrap_or(now);
+                                        tracker.record_at(
+                                            sample_pos.x.into(),
+                                            sample_pos.y.into(),
+                                            at,
+                                        );
+                                        recorded_coalesced = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if !recorded_coalesced {
+                        tracker.record(logical_x, logical_y);
+                    }
+                }
 
                 match ts {
                     TouchState::Pending { start_x, start_y } => {
@@ -956,6 +992,7 @@ impl IosWindow {
                             modifiers,
                             click_count: tap_count as usize,
                         }));
+                        super::ffi::set_touch_interactive(false);
                     }
                     TouchState::Scrolling { prev_x, prev_y } => {
                         // End the active touch-scroll gesture.
@@ -987,11 +1024,13 @@ impl IosWindow {
                         // threshold.
                         let (vx, vy) = self.velocity_tracker.borrow().velocity();
                         self.velocity_tracker.borrow_mut().reset();
-                        self.momentum_scroller
-                            .borrow_mut()
-                            .fling(vx, vy, logical_x, logical_y);
+                        let mut scroller = self.momentum_scroller.borrow_mut();
+                        scroller.fling(vx, vy, logical_x, logical_y);
+                        super::ffi::set_touch_interactive(scroller.is_active());
                     }
-                    TouchState::Idle => {}
+                    TouchState::Idle => {
+                        super::ffi::set_touch_interactive(false);
+                    }
                 }
                 ts = TouchState::Idle;
             }
@@ -1081,15 +1120,19 @@ impl IosWindow {
 
                 // If this was the last momentum frame, send Ended now.
                 if fling_ended {
+                    super::ffi::set_touch_interactive(false);
                     callback(PlatformInput::ScrollWheel(gpui::ScrollWheelEvent {
                         position,
                         delta: gpui::ScrollDelta::Pixels(gpui::point(gpui::px(0.0), gpui::px(0.0))),
                         modifiers,
                         touch_phase: gpui::TouchPhase::Ended,
                     }));
+                } else {
+                    super::ffi::set_touch_interactive(true);
                 }
             }
         } else {
+            super::ffi::set_touch_interactive(false);
             // Fling finished — emit one final Ended event so GPUI knows
             // the scroll gesture is truly complete.
             let position = gpui::point(
@@ -1707,6 +1750,8 @@ impl PlatformWindow for IosWindow {
         if let Some(renderer) = guard.as_mut() {
             if !renderer.draw(scene) {
                 log::warn!("GPUI iOS: wgpu draw returned false");
+            } else {
+                super::ffi::mark_interaction_activity();
             }
         } else {
             log::trace!("GPUI iOS: draw called but no renderer available");

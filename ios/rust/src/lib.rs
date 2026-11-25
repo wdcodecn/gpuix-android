@@ -47,7 +47,8 @@ fn init_logging() {
 }
 
 unsafe extern "C" fn on_js_request_vsync() {
-    // CADisplayLink pumps every active display frame on iOS and drains rAF ticks.
+    // Signal activity so CADisplayLink promotes to active ProMotion refresh rate when JS updates arrive.
+    gpui_mobile::ios::ffi::mark_interaction_activity();
 }
 
 unsafe extern "C" fn on_js_fatal_error(message: *const c_char) {
@@ -136,14 +137,35 @@ pub unsafe extern "C" fn gpuix_ios_start(bundle_path: *const c_char) -> i32 {
 /// Drive one CADisplayLink vsync tick for Hermes rAF and GPUI Metal presentation.
 #[no_mangle]
 pub extern "C" fn gpuix_ios_tick_frame(timestamp_ms: f64) {
-    unsafe {
-        if gpuix_js_has_raf_callbacks() {
-            gpuix_js_on_vsync(timestamp_ms);
-        }
+    let has_raf = unsafe { gpuix_js_has_raf_callbacks() };
+    if has_raf {
+        gpui_mobile::ios::ffi::mark_interaction_activity();
+        unsafe { gpuix_js_on_vsync(timestamp_ms) };
     }
     let window_ptr = gpui_mobile::ios::ffi::gpui_ios_get_window();
     if !window_ptr.is_null() {
         gpui_mobile::ios::ffi::gpui_ios_request_frame(window_ptr);
+    }
+}
+
+/// Query desired CADisplayLink CAFrameRateRange (minimum, maximum, preferred Hz).
+#[no_mangle]
+pub unsafe extern "C" fn gpuix_ios_desired_fps(
+    out_min: *mut f32,
+    out_max: *mut f32,
+    out_preferred: *mut f32,
+) {
+    let has_raf = unsafe { gpuix_js_has_raf_callbacks() };
+    let (min_fps, max_fps, pref_fps) =
+        gpui_mobile::ios::ffi::compute_desired_frame_rate_range(has_raf);
+    if !out_min.is_null() {
+        unsafe { *out_min = min_fps };
+    }
+    if !out_max.is_null() {
+        unsafe { *out_max = max_fps };
+    }
+    if !out_preferred.is_null() {
+        unsafe { *out_preferred = pref_fps };
     }
 }
 

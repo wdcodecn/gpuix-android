@@ -9,6 +9,7 @@ export DEVELOPER_DIR="${DEVELOPER_DIR:-/Applications/Xcode.app/Contents/Develope
 project_root="${GPUIX_PROJECT_ROOT:-$(cd "$repo_root/../gpuix-base-ui" && pwd)}"
 entry_override="${GPUIX_ENTRY:-}"
 variant="debug"
+fast_release=0
 js_only=0
 skip_hbc=0
 
@@ -26,6 +27,10 @@ while [[ $# -gt 0 ]]; do
       variant="release"
       shift
       ;;
+    --fast)
+      fast_release=1
+      shift
+      ;;
     --debug)
       variant="debug"
       shift
@@ -39,7 +44,7 @@ while [[ $# -gt 0 ]]; do
       shift
       ;;
     *)
-      echo "Usage: bash ios/scripts/build-ios.sh [--project DIR] [--entry FILE] [--debug|--release] [--js-only] [--no-hbc]" >&2
+      echo "Usage: bash ios/scripts/build-ios.sh [--project DIR] [--entry FILE] [--debug|--release] [--fast] [--js-only] [--no-hbc]" >&2
       exit 1
       ;;
   esac
@@ -133,8 +138,15 @@ if [[ ! -d "$zed_source/.git" && -d "$cache_root/deps/zed/.git" ]]; then
 fi
 
 rust_profile="ios-dev"
+cargo_profile_flag=(--profile ios-dev)
 if [[ "$variant" == "release" ]]; then
-  rust_profile="release"
+  if (( fast_release )); then
+    rust_profile="release-fast"
+    cargo_profile_flag=(--profile release-fast)
+  else
+    rust_profile="release"
+    cargo_profile_flag=(--release)
+  fi
 fi
 rust_lib="$CARGO_TARGET_DIR/aarch64-apple-ios-sim/$rust_profile/libgpuix_ios.a"
 
@@ -164,11 +176,7 @@ if (( ! js_only )) || [[ ! -f "$rust_lib" ]]; then
         sccache*) unset RUSTC_WRAPPER ;;
       esac
     fi
-    if [[ "$rust_profile" == "release" ]]; then
-      nice -n 10 cargo +1.100.0 build --target aarch64-apple-ios-sim --release "${cargo_features_arg[@]}"
-    else
-      nice -n 10 cargo +1.100.0 build --target aarch64-apple-ios-sim --profile "$rust_profile" "${cargo_features_arg[@]}"
-    fi
+    nice -n 10 cargo +1.100.0 build --target aarch64-apple-ios-sim "${cargo_profile_flag[@]}" "${cargo_features_arg[@]}"
   )
 fi
 
@@ -182,6 +190,7 @@ xcrun --sdk iphonesimulator clang \
   -isysroot "$sim_sdk" \
   -fobjc-arc \
   -ObjC \
+  -Wl,-dead_strip \
   "$ios_root/app/main.m" \
   "$rust_lib" \
   -L"$(dirname "$hermes_dylib")" \
@@ -201,6 +210,10 @@ xcrun --sdk iphonesimulator clang \
   -lz \
   -lresolv \
   -o "$app_bundle/$exec_name"
+
+if [[ "$variant" == "release" ]]; then
+  strip -x "$app_bundle/$exec_name" 2>/dev/null || true
+fi
 
 GPUIX_PLIST_TEMPLATE="$ios_root/app/Info.plist.template" \
 GPUIX_PLIST_OUT="$app_bundle/Info.plist" \

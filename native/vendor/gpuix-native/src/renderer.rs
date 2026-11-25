@@ -1507,7 +1507,7 @@ impl GpuixRenderer {
 
         #[cfg(target_os = "ios")]
         {
-            let _ = frame_rate;
+            gpui_mobile::ios::ffi::request_power_frame_rate(frame_rate as f32);
             return Ok(());
         }
 
@@ -1515,12 +1515,12 @@ impl GpuixRenderer {
         {
             let _ = frame_rate;
             Err(Error::from_reason(
-                "Power frame-rate policy is only available on Android",
+                "Power frame-rate policy is only available on Android/iOS",
             ))
         }
     }
 
-    /// Return the refresh-rate modes reported by the current Android display.
+    /// Return the refresh-rate modes reported by the current display.
     /// The settings UI uses this to disable unavailable common choices.
     #[napi]
     pub fn get_supported_refresh_rates(&self) -> Result<Vec<f64>> {
@@ -1532,18 +1532,29 @@ impl GpuixRenderer {
                 .collect(),
         );
 
-        #[cfg(not(target_os = "android"))]
+        #[cfg(target_os = "ios")]
+        return Ok(
+            gpui_mobile::ios::ffi::query_supported_refresh_rates()
+                .into_iter()
+                .map(f64::from)
+                .collect(),
+        );
+
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
         Ok(Vec::new())
     }
 
     /// Return the effective high-refresh ceiling after the system's peak-rate
-    /// setting is applied (for example 60 when the user disabled 90 Hz).
+    /// setting is applied (for example 60 when the user disabled 90 Hz, or 120 on ProMotion).
     #[napi]
     pub fn get_interaction_frame_rate_cap(&self) -> Result<f64> {
         #[cfg(target_os = "android")]
         return Ok(gpui_mobile::android::jni::query_interaction_frame_rate_cap() as f64);
 
-        #[cfg(not(target_os = "android"))]
+        #[cfg(target_os = "ios")]
+        return Ok(gpui_mobile::ios::ffi::query_interaction_frame_rate_cap() as f64);
+
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
         Ok(90.0)
     }
 
@@ -6075,6 +6086,12 @@ impl gpui::Render for GpuixView {
                     android_win.set_interactive(motion_active);
                 }
             }
+        }
+
+        #[cfg(target_os = "ios")]
+        if motion_active != self.motion_was_active {
+            self.motion_was_active = motion_active;
+            gpui_mobile::ios::ffi::set_motion_active(motion_active);
         }
 
         if motion_active {

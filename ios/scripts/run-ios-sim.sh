@@ -24,12 +24,12 @@ while [[ $# -gt 0 ]]; do
       device_query="$2"
       shift 2
       ;;
-    --release|--debug|--js-only|--no-hbc)
+    --release|--debug|--fast|--js-only|--no-hbc)
       build_flags+=("$1")
       shift
       ;;
     *)
-      echo "Usage: bash ios/scripts/run-ios-sim.sh [--project DIR] [--entry FILE] [--device NAME_OR_UDID] [--release] [--js-only]" >&2
+      echo "Usage: bash ios/scripts/run-ios-sim.sh [--project DIR] [--entry FILE] [--device NAME_OR_UDID] [--release] [--fast] [--js-only]" >&2
       exit 1
       ;;
   esac
@@ -83,7 +83,13 @@ udid="$(
 echo "Target simulator UDID: $udid ($bundle_id)"
 xcrun simctl boot "$udid" >/dev/null 2>&1 || true
 xcrun simctl bootstatus "$udid" -b
-open -a "$DEVELOPER_DIR/Applications/Simulator.app" >/dev/null 2>&1 || true
+if [[ -d "$DEVELOPER_DIR/Applications/Simulator.app" ]]; then
+  open -a "$DEVELOPER_DIR/Applications/Simulator.app" >/dev/null 2>&1 || true
+elif [[ -d "/Applications/Xcode.app/Contents/Applications/DeviceHub.app" ]]; then
+  open -a "/Applications/Xcode.app/Contents/Applications/DeviceHub.app" >/dev/null 2>&1 || true
+else
+  open -a Simulator >/dev/null 2>&1 || true
+fi
 
 xcrun simctl install "$udid" "$app_bundle"
 launch_log="$ios_root/.build/launch.log"

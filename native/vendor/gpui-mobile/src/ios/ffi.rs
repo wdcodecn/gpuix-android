@@ -15,7 +15,116 @@
 use gpui::{App, AppContext, Application, RequestFrameOptions, WindowOptions};
 use std::ffi::c_void;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::OnceLock;
+use std::time::Instant;
+
+static IOS_MAX_FPS: AtomicU32 = AtomicU32::new(60);
+static IOS_MAX_FPS_LOGGED: AtomicBool = AtomicBool::new(false);
+static IOS_POWER_FRAME_RATE: AtomicU32 = AtomicU32::new(120);
+static IOS_TOUCH_OR_MOMENTUM_ACTIVE: AtomicBool = AtomicBool::new(false);
+static IOS_MOTION_ACTIVE: AtomicBool = AtomicBool::new(false);
+static IOS_LAST_ACTIVITY_MS: AtomicU64 = AtomicU64::new(0);
+static IOS_FRAME_EPOCH: OnceLock<Instant> = OnceLock::new();
+
+fn relative_now_ms() -> u64 {
+    IOS_FRAME_EPOCH.get_or_init(Instant::now).elapsed().as_millis() as u64
+}
+
+/// Mark recent UI/input/JS activity so ProMotion elevates refresh rate immediately.
+pub fn mark_interaction_activity() {
+    IOS_LAST_ACTIVITY_MS.store(relative_now_ms(), Ordering::Release);
+}
+
+/// Record the screen hardware refresh-rate ceiling reported by UIKit on the main thread.
+pub fn set_display_max_fps(fps: u32) {
+    let clamped = fps.clamp(60, 240);
+    let prev = IOS_MAX_FPS.swap(clamped, Ordering::AcqRel);
+    if prev != clamped || !IOS_MAX_FPS_LOGGED.swap(true, Ordering::AcqRel) {
+        log::info!("GPUI iOS: Display maximumFramesPerSecond={}", clamped);
+    }
+}
+
+/// Return discrete refresh-rate choices supported by this iOS display.
+pub fn query_supported_refresh_rates() -> Vec<f32> {
+    let max_fps = IOS_MAX_FPS.load(Ordering::Acquire).max(60);
+    let mut rates: Vec<f32> = vec![20.0, 30.0, 40.0, 50.0, 60.0];
+    if max_fps >= 120 {
+        rates.extend_from_slice(&[80.0, 90.0, 120.0]);
+    } else if max_fps > 60 {
+        if max_fps >= 80 {
+            rates.push(80.0);
+        }
+        if max_fps >= 90 {
+            rates.push(90.0);
+        }
+        if max_fps != 80 && max_fps != 90 {
+            rates.push(max_fps as f32);
+        }
+    }
+    rates
+}
+
+/// Return the effective hardware interaction frame-rate cap in Hz.
+pub fn query_interaction_frame_rate_cap() -> f32 {
+    IOS_MAX_FPS.load(Ordering::Acquire).max(60) as f32
+}
+
+/// Set the preferred interaction ceiling requested from JS settings.
+pub fn request_power_frame_rate(frame_rate: f32) {
+    let rounded = if frame_rate.is_finite() {
+        frame_rate.round().clamp(20.0, 240.0) as u32
+    } else {
+        120
+    };
+    IOS_POWER_FRAME_RATE.store(rounded, Ordering::Release);
+    mark_interaction_activity();
+}
+
+/// Update whether native spring/motion animations are active this frame.
+pub fn set_motion_active(active: bool) {
+    IOS_MOTION_ACTIVE.store(active, Ordering::Release);
+    if active {
+        mark_interaction_activity();
+    }
+}
+
+/// Update whether a touch drag or momentum fling gesture is active.
+pub fn set_touch_interactive(active: bool) {
+    IOS_TOUCH_OR_MOMENTUM_ACTIVE.store(active, Ordering::Release);
+    if active {
+        mark_interaction_activity();
+    }
+}
+
+/// Compute desired `(min_fps, max_fps, preferred_fps)` for `CADisplayLink.preferredFrameRateRange`.
+pub fn compute_desired_frame_rate_range(has_js_raf: bool) -> (f32, f32, f32) {
+    let cap = IOS_MAX_FPS.load(Ordering::Acquire).max(60) as f32;
+    let target = (IOS_POWER_FRAME_RATE.load(Ordering::Acquire).clamp(20, 240) as f32).min(cap);
+    let now_ms = relative_now_ms();
+    let last_ms = IOS_LAST_ACTIVITY_MS.load(Ordering::Acquire);
+    let idle_ms = now_ms.saturating_sub(last_ms);
+
+    let active = IOS_TOUCH_OR_MOMENTUM_ACTIVE.load(Ordering::Acquire)
+        || IOS_MOTION_ACTIVE.load(Ordering::Acquire)
+        || has_js_raf
+        || idle_ms < 350;
+
+    if active {
+        let min_fps = if target >= 80.0 {
+            80.0
+        } else if target >= 60.0 {
+            60.0
+        } else {
+            target
+        };
+        (min_fps, target, target)
+    } else if idle_ms < 5000 {
+        (10.0, target, 30.0_f32.min(target))
+    } else {
+        (10.0, target, 10.0_f32.min(target))
+    }
+}
 
 /// Global storage for the GPUI application state.
 /// This is set during initialization and used by FFI callbacks.
@@ -70,6 +179,10 @@ pub extern "C" fn gpui_ios_initialize() -> *mut c_void {
 
     // Initialize the window list
     let _ = IOS_WINDOW_LIST.set(WindowListWrapper(std::cell::UnsafeCell::new(Vec::new())));
+
+    let max_fps = super::display::IosDisplay::main().maximum_frames_per_second();
+    set_display_max_fps(max_fps as u32);
+    mark_interaction_activity();
 
     // Return a non-null pointer to indicate success
     // The actual state is stored in the static

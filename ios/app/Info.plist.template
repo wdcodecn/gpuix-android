@@ -24,6 +24,8 @@
   <string>__GPUIX_STATUS_BAR_STYLE__</string>
   <key>LSRequiresIPhoneOS</key>
   <true/>
+  <key>CADisableMinimumFrameDurationOnPhone</key>
+  <true/>
   <key>MinimumOSVersion</key>
   <string>__GPUIX_DEPLOYMENT_TARGET__</string>
   <key>UIStatusBarStyle</key>
