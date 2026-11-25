@@ -1,10 +1,11 @@
-# gpuix-android
+# gpuix-mobile
 
 [简体中文](README.zh-CN.md)
 
-The native Android framework and delivery toolchain for React on GPUIX.
-React runs in standalone Hermes, while GPUI and wgpu render directly to an
-Android surface. The main UI does not use WebView or React Native's view system.
+The native mobile framework and delivery toolchain for React on GPUIX (Android
+& iOS Simulator). React runs in standalone Hermes, while GPUI and wgpu render
+directly to Vulkan (Android) or Metal (iOS). The main UI does not use WebView
+or React Native's view system.
 
 ## Start from the public template
 
@@ -19,50 +20,59 @@ bun install
 ## Create an app with the CLI
 
 ```sh
-bunx gpuix-android create my-app \
+bunx gpuix-mobile create my-app \
   --app-id com.example.myapp \
   --name "My App" \
-  --version 0.1.0 \
+  --version 1.0.0 \
   --version-code 1
 
 cd my-app
 bun install
 bun run gpuix:doctor
 bun run gpuix:run -- <ADB_SERIAL>
+bun run gpuix -- run ios
 ```
 
 The `bunx` form applies after installing the package from npm. Until an npm
 release is published, use the GitHub template or install this repository as a
 Git dependency in an existing project.
 
-## Add Android to an existing GPUIX app
+## Add mobile hosts to an existing GPUIX app
 
 ```sh
-bunx gpuix-android init \
+bunx gpuix-mobile init \
   --entry src/main.tsx \
   --app-id com.example.myapp \
-  --name "My App"
+  --name "My App" \
+  --version 1.0.0
 
 gpuix doctor
-gpuix build
+gpuix build android
+gpuix build ios
 gpuix install <ADB_SERIAL>
+gpuix run ios
 ```
 
 ## CLI
 
 | Command | Result |
 | --- | --- |
-| `gpuix create DIR` | New React + GPUIX app and Android host |
-| `gpuix init` | Android host for an existing project |
-| `gpuix doctor` | Bun, Rust, cargo-ndk, SDK, NDK, Java, ADB and config checks |
-| `gpuix info` | App identity, runtime and artifact paths |
-| `gpuix build` | Debug APK |
-| `gpuix build --release` | Local release APK |
-| `gpuix build --aab` | Google Play Android App Bundle |
-| `gpuix run SERIAL` | Build, install and launch on one explicit device |
-| `gpuix ota <keygen\|build\|verify\|serve>` | Production OTA release signing, verification and local serving |
+| `gpuix create DIR` | New React + GPUIX app (`gpuix.config.json`) |
+| `gpuix init` | Managed config for an existing project (optional `--eject`) |
+| `gpuix doctor` | Bun, Rust, cargo-ndk, SDK, NDK, Java, ADB, Xcode Simulator & config checks |
+| `gpuix info` | App identity, `versionName`, iOS/Android config, runtime and artifact paths |
+| `gpuix build [android]` | Debug APK |
+| `gpuix build android --release` | Local release APK |
+| `gpuix build android --aab` | Google Play Android App Bundle |
+| `gpuix build ios` | iOS Simulator `.app` (`dist/ios/<project>.app`) |
+| `gpuix run [android] SERIAL` | Build, install and launch on one explicit Android device |
+| `gpuix run ios [SIMULATOR_UDID]` | Build, install and launch on iOS Simulator |
+| `gpuix ota <keygen\|build\|verify\|chain\|proof\|locate\|serve>` | Production OTA release signing, hash-chain & Merkle proof verification |
 
-Artifacts are copied to `dist/android/` with stable names.
+Artifacts are copied to `dist/android/` and `dist/ios/` with stable names.
+Shared runtime and native layers live in `runtime/`, `native/hermes/`, and
+`native/vendor/`, reused by both `android/` and `ios/`. Legacy
+`gpuix.android.json` files remain fully supported.
 
 ## Runtime architecture
 
@@ -70,16 +80,16 @@ Artifacts are copied to `dist/android/` with stable names.
 React application
       │ retained UI mutations
       ▼
-standalone Hermes
+standalone Hermes (runtime/)
       │ N-API
       ▼
-gpuix-native
+native/vendor/gpuix-native
       │ GPUI layout and paint
       ▼
-gpui-mobile + wgpu
-      │ Android native surface
+native/vendor/gpui-mobile + wgpu
+      │ Vulkan (Android) / Metal (iOS)
       ▼
-SurfaceFlinger / Vulkan
+SurfaceFlinger / UIKit MetalView
 ```
 
 The native host owns touch input, momentum scrolling, system-bar and display
@@ -92,13 +102,11 @@ See [Architecture](docs/ARCHITECTURE.md) and
 
 ## Platform and release status
 
-- Android API 31+ and arm64-v8a are the currently validated target.
-- Windows desktop uses the published `@gpuix/native-win32-x64-msvc` binding;
-  Android builds run through Git Bash and the installed Windows NDK toolchain.
-- Debug APK, local release APK and AAB generation are implemented.
-- Release artifacts use the debug keystore by default for local verification.
-  Configure a real upload key before store distribution.
-- iOS and macOS hosts are not claimed as completed targets.
+- Android API 31+ (`arm64-v8a`), debug APK, local release APK, AAB and ADB install/run are validated.
+- iOS Simulator (`arm64-apple-ios-sim`), templated `Info.plist`, Metal surface and `simctl` install/run are validated.
+- Unified `gpuix.config.json` (and backward-compatible `gpuix.android.json`) manages `versionName`, `versionCode`, Android/iOS platform overrides, and OTA configuration.
+- Windows desktop uses the published `@gpuix/native-win32-x64-msvc` binding; Android builds run through Git Bash and the installed Windows NDK toolchain.
+- Android release artifacts use the debug keystore by default for local verification. Configure a real upload key before Play Store distribution, and configure Apple signing/provisioning before physical iOS App Store distribution.
 
 This separation follows the delivery discipline used by projects such as
 [Tauri](https://github.com/tauri-apps/tauri),
@@ -115,4 +123,4 @@ have distinct ownership.
 ## License
 
 MIT for this repository. Vendored upstream code keeps its original licenses;
-see the license files inside `android/vendor/`.
+see the license files inside `native/vendor/`.

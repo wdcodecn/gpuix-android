@@ -9,7 +9,7 @@ name = "gpuix_android"
 crate-type = ["cdylib"]
 
 [dependencies]
-gpuix-native = { path = "../vendor/gpuix-native", default-features = false }
+gpuix-native = { path = "../../native/vendor/gpuix-native", default-features = false }
 android-activity = { version = "0.6", features = ["native-activity"] }
 android_logger = "0.15"
 log = "0.4"

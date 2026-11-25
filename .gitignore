@@ -3,6 +3,11 @@ dist/
 .DS_Store
 *.bun-build
 screenshots/
+native/.deps/
+native/.build/
+native/target/
+native/vendor/**/target/
+!native/vendor/
 android/.deps/
 android/.build/
 android/target/
@@ -11,5 +16,5 @@ android/app/build/
 android/build/
 android/local.properties
 android/app/src/main/jniLibs/
-!android/vendor/
-android/vendor/**/target/
+ios/.build/
+ios/target/

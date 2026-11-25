@@ -1,5 +1,21 @@
 export type Unsubscribe = () => void
 
+export type GpuixPlatform = 'android' | 'ios' | 'desktop'
+
+export type GpuixAppInfo = {
+  appId: string
+  appName: string
+  versionName: string
+  versionCode: number
+  platform: GpuixPlatform
+  channel: string
+  runtimeVersion: string
+  buildHash: string
+  releaseId?: string
+  merkleRoot?: string
+  releaseHash?: string
+}
+
 export type ViewportSize = {
   width: number
   height: number
@@ -106,11 +122,24 @@ export type OtaState = {
   lastCheckedAt: number
 }
 
+export type OtaManifestIntegrity = {
+  algorithm: 'sha256'
+  chunkSize: number
+  chunkCount: number
+  merkleRoot: string
+  prevReleaseHash: string
+  releaseHash: string
+  chainIndex: number
+  chainMerkleRoot: string
+}
+
 export type OtaManifest = {
   schemaVersion: number
   action?: 'update' | 'rollback_to_embedded'
   appId: string
   channel?: string
+  platform?: 'android' | 'ios' | 'all'
+  versionName?: string
   runtimeVersion: string
   releaseId: string
   minVersionCode?: number
@@ -119,6 +148,7 @@ export type OtaManifest = {
   notes?: string
   publishedAt?: string
   manifestSignature?: string
+  integrity?: OtaManifestIntegrity
   bundle?: {
     format: 'hbc' | 'js'
     url: string

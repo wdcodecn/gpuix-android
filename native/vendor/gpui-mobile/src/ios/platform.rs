@@ -21,6 +21,7 @@ use objc2::runtime::AnyObject;
 use objc2::{class, msg_send};
 use parking_lot::Mutex;
 use std::{
+    ffi::OsString,
     path::{Path, PathBuf},
     rc::Rc,
     sync::Arc,
@@ -33,9 +34,10 @@ pub(crate) struct IosPlatformState {
     foreground_executor: ForegroundExecutor,
     text_system: Arc<dyn PlatformTextSystem>,
     finish_launching: Option<Box<dyn FnOnce()>>,
-    quit_callback: Option<Box<dyn FnMut()>>,
+    quit_callback: Option<Box<dyn FnMut() -> bool>>,
     open_urls_callback: Option<Box<dyn FnMut(Vec<String>)>>,
     thermal_state_callback: Option<Box<dyn FnMut()>>,
+    system_wake_callback: Option<Box<dyn FnMut()>>,
 }
 
 impl Default for IosPlatform {
@@ -58,6 +60,7 @@ impl IosPlatform {
             quit_callback: None,
             open_urls_callback: None,
             thermal_state_callback: None,
+            system_wake_callback: None,
         }))
     }
 }
@@ -119,7 +122,7 @@ impl Platform for IosPlatform {
         log::warn!("iOS apps cannot programmatically quit");
     }
 
-    fn restart(&self, _binary_path: Option<PathBuf>) {
+    fn restart(&self, _binary_path: Option<PathBuf>, _arguments: Vec<OsString>) {
         // iOS apps cannot restart themselves
         log::warn!("iOS apps cannot restart themselves");
     }
@@ -239,12 +242,16 @@ impl Platform for IosPlatform {
         // Would use UIDocumentInteractionController or UIActivityViewController
     }
 
-    fn on_quit(&self, callback: Box<dyn FnMut()>) {
+    fn on_quit(&self, callback: Box<dyn FnMut() -> bool>) {
         self.0.lock().quit_callback = Some(callback);
     }
 
     fn on_reopen(&self, _callback: Box<dyn FnMut()>) {
         // iOS handles app reopening through scene lifecycle
+    }
+
+    fn on_system_wake(&self, callback: Box<dyn FnMut()>) {
+        self.0.lock().system_wake_callback = Some(callback);
     }
 
     fn set_menus(&self, _menus: Vec<Menu>, _keymap: &Keymap) {
@@ -288,6 +295,14 @@ impl Platform for IosPlatform {
 
     fn set_cursor_style(&self, _style: CursorStyle) {
         // iOS doesn't have visible cursors (except for Apple Pencil hover on iPad)
+    }
+
+    fn hide_cursor_until_mouse_moves(&self) {
+        // Not applicable on iOS
+    }
+
+    fn is_cursor_visible(&self) -> bool {
+        false
     }
 
     fn should_auto_hide_scrollbars(&self) -> bool {

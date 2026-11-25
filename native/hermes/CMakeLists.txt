@@ -54,5 +54,16 @@ get_directory_property(HERMES_VM_DEFINITIONS DIRECTORY "${HERMES_SOURCE}" COMPIL
 target_compile_definitions(gpuix_js PRIVATE ${HERMES_VM_DEFINITIONS})
 target_compile_options(gpuix_js PRIVATE -fno-rtti -fno-exceptions -ffunction-sections -fdata-sections)
 # Link NAPI as objects so every ABI entrypoint is exported for napi-rs.
-target_link_libraries(gpuix_js PRIVATE hermesNapi_obj hermesvm_a uv_a log)
-target_link_options(gpuix_js PRIVATE -Wl,-z,max-page-size=16384 -Wl,--gc-sections)
+if(ANDROID)
+  target_link_libraries(gpuix_js PRIVATE hermesNapi_obj hermesvm_a uv_a log)
+  target_link_options(gpuix_js PRIVATE -Wl,-z,max-page-size=16384 -Wl,--gc-sections)
+elseif(APPLE)
+  target_link_libraries(gpuix_js PRIVATE hermesNapi_obj hermesvm_a uv_a)
+  set_target_properties(gpuix_js PROPERTIES
+    INSTALL_NAME_DIR "@rpath"
+    BUILD_WITH_INSTALL_RPATH ON
+  )
+  target_link_options(gpuix_js PRIVATE -Wl,-dead_strip)
+else()
+  target_link_libraries(gpuix_js PRIVATE hermesNapi_obj hermesvm_a uv_a)
+endif()

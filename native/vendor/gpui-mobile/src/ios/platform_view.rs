@@ -146,6 +146,7 @@ impl IosPlatformView {
         let _: () = msg_send![view, setBackgroundColor: black_color];
 
         // If a player_id is provided, try to get the AVPlayer and create AVPlayerLayer
+        #[cfg(feature = "video_player")]
         if let Some(player_id_str) = params.creation_params.get("player_id") {
             if let Ok(player_id) = player_id_str.parse::<u32>() {
                 // Get AVPlayer from the video_player package's PLAYERS map
@@ -164,6 +165,8 @@ impl IosPlatformView {
                 }
             }
         }
+        #[cfg(not(feature = "video_player"))]
+        let _ = params;
 
         Ok(view)
     }
@@ -240,6 +243,7 @@ impl IosPlatformView {
         let _: () = msg_send![view, setBackgroundColor: black_color];
 
         // If a session_id is provided, try to get the AVCaptureSession and create preview layer
+        #[cfg(feature = "camera")]
         if let Some(session_id_str) = params.creation_params.get("session_id") {
             if let Ok(session_id) = session_id_str.parse::<usize>() {
                 if let Some(session_ptr) = crate::packages::camera::ios_get_session(session_id) {
@@ -257,6 +261,8 @@ impl IosPlatformView {
                 }
             }
         }
+        #[cfg(not(feature = "camera"))]
+        let _ = params;
 
         Ok(view)
     }

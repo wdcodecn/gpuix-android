@@ -3,8 +3,18 @@ import path from 'node:path'
 import { tmpdir } from 'node:os'
 import { existsSync } from 'node:fs'
 import { mkdtemp, mkdir, rm } from 'node:fs/promises'
-import { loadGpuixAndroidConfig, syncGeneratedManifest, writeGradleProperties } from '../android/scripts/config'
-import { DEBUG_WRAPPER_LINE_OFFSET, wrapDebugBundle } from '../android/scripts/build-js'
+import {
+  loadGpuixAndroidConfig,
+  loadGpuixConfig,
+  resolveAndroidAppId,
+  resolveIosBuildNumber,
+  resolveIosBundleId,
+  resolveIosDeploymentTarget,
+  resolveIosStatusBarStyle,
+  syncGeneratedManifest,
+  writeGradleProperties,
+} from '../scripts/config'
+import { DEBUG_WRAPPER_LINE_OFFSET, wrapDebugBundle } from '../scripts/bundler'
 import { extractCandidateSurfaceLayers } from '../scripts/gpuix'
 import { decodeVlq, parseSourceMap, resolveOriginalPosition, symbolicateStack } from '../scripts/sourcemap'
 
@@ -151,11 +161,11 @@ describe('scripts/gpuix CLI managed host & eject flow', () => {
     await Bun.write(path.join(project, 'src/main.tsx'), 'export const main = true\n')
 
     const initProc = Bun.spawnSync(
-      ['bun', path.join(repoRoot, 'scripts/gpuix.ts'), 'init', '--cwd', project, '--app-id', 'dev.gpuix.managed', '--name', 'Managed Test'],
+      ['bun', path.join(repoRoot, 'scripts/gpuix.ts'), 'init', '--cwd', project, '--app-id', 'dev.gpuix.managed', '--name', 'Managed Test', '--version', '2.7.0'],
       { stdout: 'pipe', stderr: 'pipe' },
     )
     expect(initProc.exitCode).toBe(0)
-    expect(existsSync(path.join(project, 'gpuix.android.json'))).toBe(true)
+    expect(existsSync(path.join(project, 'gpuix.config.json'))).toBe(true)
     expect(existsSync(path.join(project, 'android'))).toBe(false)
 
     const infoProc = Bun.spawnSync(
@@ -164,11 +174,18 @@ describe('scripts/gpuix CLI managed host & eject flow', () => {
     )
     expect(infoProc.exitCode).toBe(0)
     const infoJson = JSON.parse(new TextDecoder().decode(infoProc.stdout)) as {
+      cliVersion: string
       hostMode: string
       appId: string
+      versionName: string
+      ios: { bundleId: string; statusBarStyle: string; deploymentTarget: string }
     }
     expect(infoJson.hostMode).toBe('managed')
     expect(infoJson.appId).toBe('dev.gpuix.managed')
+    expect(infoJson.versionName).toBe('2.7.0')
+    expect(infoJson.ios.bundleId).toBe('dev.gpuix.managed')
+    expect(infoJson.ios.statusBarStyle).toBe('light')
+    expect(infoJson.ios.deploymentTarget).toBe('17.0')
 
     const ejectProc = Bun.spawnSync(
       ['bun', path.join(repoRoot, 'scripts/gpuix.ts'), 'eject', '--cwd', project],
@@ -177,6 +194,8 @@ describe('scripts/gpuix CLI managed host & eject flow', () => {
     expect(ejectProc.exitCode).toBe(0)
     expect(existsSync(path.join(project, 'android/scripts/build-android.sh'))).toBe(true)
     expect(existsSync(path.join(project, 'android/app/src/main/java/dev/gpui/mobile/GpuiNativeBridge.java'))).toBe(true)
+    expect(existsSync(path.join(project, 'native/vendor/gpuix-native/Cargo.toml'))).toBe(true)
+    expect(existsSync(path.join(project, 'runtime/index.ts'))).toBe(true)
     expect(existsSync(path.join(project, 'android/.build'))).toBe(false)
     expect(existsSync(path.join(project, 'android/app/src/main/jniLibs'))).toBe(false)
 
@@ -198,8 +217,9 @@ describe('scripts/gpuix CLI managed host & eject flow', () => {
       { stdout: 'pipe', stderr: 'pipe' },
     )
     expect(proc.exitCode).toBe(0)
-    expect(existsSync(path.join(project, 'gpuix.android.json'))).toBe(true)
+    expect(existsSync(path.join(project, 'gpuix.config.json'))).toBe(true)
     expect(existsSync(path.join(project, 'android/scripts/build-android.sh'))).toBe(true)
+    expect(existsSync(path.join(project, 'native/vendor/gpuix-native/Cargo.toml'))).toBe(true)
   })
 
   test('extractCandidateSurfaceLayers filters InputSink/leash and unwraps Android 16/17 VRI layers', () => {
@@ -268,5 +288,39 @@ describe('scripts/gpuix CLI managed host & eject flow', () => {
     const removed = await syncGeneratedManifest(path.join(project, 'android'), cfg)
     expect(removed).toBeNull()
     expect(existsSync(generated!)).toBe(false)
+  })
+
+  test('loads unified gpuix.config.json with platform-specific android/ios overrides and falls back cleanly', async () => {
+    const project = await createTempDir('gpuix-unified-cfg-')
+    await mkdir(path.join(project, 'src'), { recursive: true })
+    await Bun.write(path.join(project, 'src/main.tsx'), 'export const ok = 1\n')
+    await Bun.write(
+      path.join(project, 'gpuix.config.json'),
+      JSON.stringify({
+        entrypoint: 'src/main.tsx',
+        appId: 'dev.gpuix.unified',
+        appName: 'Unified App',
+        versionName: '2.7.0',
+        versionCode: 27,
+        android: {
+          applicationId: 'dev.gpuix.unified.android',
+          abis: ['arm64-v8a'],
+        },
+        ios: {
+          bundleId: 'dev.gpuix.unified-ios',
+          buildNumber: '27.1',
+          deploymentTarget: '18.0',
+          statusBarStyle: 'dark',
+        },
+      }),
+    )
+
+    const cfg = await loadGpuixConfig(project)
+    expect(cfg.versionName).toBe('2.7.0')
+    expect(resolveAndroidAppId(cfg)).toBe('dev.gpuix.unified.android')
+    expect(resolveIosBundleId(cfg)).toBe('dev.gpuix.unified-ios')
+    expect(resolveIosBuildNumber(cfg)).toBe('27.1')
+    expect(resolveIosDeploymentTarget(cfg)).toBe('18.0')
+    expect(resolveIosStatusBarStyle(cfg)).toBe('dark')
   })
 })

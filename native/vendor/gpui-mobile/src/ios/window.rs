@@ -76,9 +76,10 @@ static VC_CLASS_REGISTERED: std::sync::Once = std::sync::Once::new();
 static TEXT_INPUT_VIEW_CLASS_REGISTERED: std::sync::Once = std::sync::Once::new();
 
 /// Global storage for the current status bar style.
-/// 0 = default (dark content), 1 = light content.
+/// 0 = dark content (black icons/text), 1 = light content (white icons/text).
+/// Defaults to 1 (light content) so dark-mode canvases remain legible.
 /// Accessed from the main thread only.
-static STATUS_BAR_STYLE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+static STATUS_BAR_STYLE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(1);
 
 /// Register a custom UIViewController subclass that allows overriding
 /// `preferredStatusBarStyle` at runtime.
@@ -478,6 +479,10 @@ pub(crate) struct IosWindow {
     close_callback: RefCell<Option<Box<dyn FnOnce()>>>,
     /// Callback for appearance changes
     appearance_changed_callback: RefCell<Option<Box<dyn FnMut()>>>,
+    /// Callback for safe-area / IME insets changes
+    insets_callback: RefCell<Option<Box<dyn FnMut(gpui::WindowInsets)>>>,
+    /// Last notified insets snapshot so layout passes can detect safe-area updates
+    last_insets: Cell<(f32, f32, f32, f32, f32)>,
     /// Current mouse position (from touch)
     mouse_position: Cell<Point<Pixels>>,
     /// Current modifiers
@@ -511,11 +516,34 @@ impl IosWindow {
         let scale_factor = screen.scale();
 
         unsafe {
-            // Create UIWindow
+            // Create UIWindow (attach to active UIWindowScene on iOS 13+ when present)
             let screen_obj: *mut AnyObject = msg_send![class!(UIScreen), mainScreen];
             let screen_bounds_cg: ObjcCGRect = msg_send![screen_obj, bounds];
+            let app: *mut AnyObject = msg_send![class!(UIApplication), sharedApplication];
+            let scenes: *mut AnyObject = msg_send![app, connectedScenes];
+            let all_scenes: *mut AnyObject = msg_send![scenes, allObjects];
+            let scene_count: usize = if all_scenes.is_null() {
+                0
+            } else {
+                msg_send![all_scenes, count]
+            };
+            let mut active_scene: *mut AnyObject = ptr::null_mut();
+            if let Some(window_scene_cls) = AnyClass::get(c"UIWindowScene") {
+                for i in 0..scene_count {
+                    let scene: *mut AnyObject = msg_send![all_scenes, objectAtIndex: i];
+                    let is_ws: Bool = msg_send![scene, isKindOfClass: window_scene_cls];
+                    if is_ws.as_bool() {
+                        active_scene = scene;
+                        break;
+                    }
+                }
+            }
             let window: *mut AnyObject = msg_send![class!(UIWindow), alloc];
-            let window: *mut AnyObject = msg_send![window, initWithFrame: screen_bounds_cg];
+            let window: *mut AnyObject = if !active_scene.is_null() {
+                msg_send![window, initWithWindowScene: active_scene]
+            } else {
+                msg_send![window, initWithFrame: screen_bounds_cg]
+            };
 
             // Create our custom UIViewController subclass that supports
             // dynamic `preferredStatusBarStyle` overrides.
@@ -586,6 +614,8 @@ impl IosWindow {
                 hit_test_callback: RefCell::new(None),
                 close_callback: RefCell::new(None),
                 appearance_changed_callback: RefCell::new(None),
+                insets_callback: RefCell::new(None),
+                last_insets: Cell::new((0.0, 0.0, 0.0, 0.0, 0.0)),
                 mouse_position: Cell::new(Point::default()),
                 modifiers: Cell::new(Modifiers::default()),
                 touch_pressed: Cell::new(false),
@@ -607,17 +637,17 @@ impl IosWindow {
                 preferred_present_mode: None,
             };
 
+            let raw_window = RawIosWindow {
+                view: ios_window.view as *mut c_void,
+            };
+
             let metal_instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
                 backends: wgpu::Backends::METAL,
                 flags: wgpu::InstanceFlags::default(),
                 backend_options: wgpu::BackendOptions::default(),
                 memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
-                display: None,
+                display: Some(Box::new(raw_window)),
             });
-
-            let raw_window = RawIosWindow {
-                view: ios_window.view as *mut c_void,
-            };
 
             // Build a temporary surface for WgpuContext initialisation
             // (adapter selection needs a surface to test compatibility).
@@ -734,11 +764,27 @@ impl IosWindow {
                 let height = frame.height as f32;
                 log::info!("GPUI iOS: Keyboard will show, height={}", height);
                 crate::set_keyboard_height(height);
+                if let Some(wrapper) = super::ffi::IOS_WINDOW_LIST.get() {
+                    let windows = &*wrapper.0.get();
+                    for &window_ptr in windows.iter() {
+                        if !window_ptr.is_null() {
+                            (*window_ptr).notify_insets_changed();
+                        }
+                    }
+                }
             });
 
             let hide_block = block2::RcBlock::new(move |_notification: *mut AnyObject| {
                 log::info!("GPUI iOS: Keyboard will hide");
                 crate::set_keyboard_height(0.0);
+                if let Some(wrapper) = super::ffi::IOS_WINDOW_LIST.get() {
+                    let windows = &*wrapper.0.get();
+                    for &window_ptr in windows.iter() {
+                        if !window_ptr.is_null() {
+                            (*window_ptr).notify_insets_changed();
+                        }
+                    }
+                }
             });
 
             let _: *mut AnyObject = msg_send![notification_center,
@@ -1266,6 +1312,64 @@ impl IosWindow {
         }
     }
 
+    pub fn window_insets(&self) -> gpui::WindowInsets {
+        let (top, bottom, left, right) = self.safe_area_insets();
+        let kb = crate::keyboard_height();
+        gpui::WindowInsets {
+            safe_area: gpui::Edges {
+                top: gpui::px(top),
+                right: gpui::px(right),
+                bottom: gpui::px(bottom),
+                left: gpui::px(left),
+            },
+            ime: gpui::Edges {
+                top: gpui::px(0.0),
+                right: gpui::px(0.0),
+                bottom: gpui::px(kb),
+                left: gpui::px(0.0),
+            },
+        }
+    }
+
+    pub(crate) fn notify_insets_changed(&self) {
+        let insets_now = {
+            let (top, bottom, left, right) = self.safe_area_insets();
+            (top, bottom, left, right, crate::keyboard_height())
+        };
+        self.last_insets.set(insets_now);
+        let cb = self.insets_callback.borrow_mut().take();
+        if let Some(mut cb) = cb {
+            cb(self.window_insets());
+            let mut slot = self.insets_callback.borrow_mut();
+            if slot.is_none() {
+                *slot = Some(cb);
+            }
+        }
+        // Trigger GPUI bounds observers so retained hosts (which sync both size
+        // and insets inside observe_window_bounds) pick up safe-area/IME updates.
+        let size = self.bounds.get().size;
+        let scale = self.scale_factor.get();
+        let resize_cb = self.resize_callback.borrow_mut().take();
+        if let Some(mut resize_cb) = resize_cb {
+            resize_cb(size, scale);
+            let mut slot = self.resize_callback.borrow_mut();
+            if slot.is_none() {
+                *slot = Some(resize_cb);
+            }
+        }
+    }
+
+    fn scene_is_empty(scene: &Scene) -> bool {
+        scene.shadows.is_empty()
+            && scene.quads.is_empty()
+            && scene.paths.is_empty()
+            && scene.underlines.is_empty()
+            && scene.monochrome_sprites.is_empty()
+            && scene.subpixel_sprites.is_empty()
+            && scene.polychrome_sprites.is_empty()
+            && scene.surfaces.is_empty()
+    }
+
     /// Handle a layout change (e.g. rotation, split-screen resize).
     ///
     /// Called from `viewDidLayoutSubviews` on the GPUIViewController.
@@ -1285,52 +1389,67 @@ impl IosWindow {
             let old_scale = self.scale_factor.get();
 
             let new_size = size(px(new_w), px(new_h));
+            let size_changed =
+                old_bounds.size != new_size || (old_scale - new_scale).abs() >= 0.01;
+            let (top, bottom, left, right) = self.safe_area_insets();
+            let next_insets = (top, bottom, left, right, crate::keyboard_height());
+            let prev_insets = self.last_insets.get();
+            let insets_changed = (next_insets.0 - prev_insets.0).abs() >= 0.5
+                || (next_insets.1 - prev_insets.1).abs() >= 0.5
+                || (next_insets.2 - prev_insets.2).abs() >= 0.5
+                || (next_insets.3 - prev_insets.3).abs() >= 0.5
+                || (next_insets.4 - prev_insets.4).abs() >= 0.5;
 
-            // Only process if something actually changed.
-            if old_bounds.size == new_size && (old_scale - new_scale).abs() < 0.01 {
+            if !size_changed && !insets_changed {
                 return;
             }
 
-            log::info!(
-                "GPUI iOS: Layout changed — {:?} @{:.1}x → {:?} @{:.1}x",
-                old_bounds.size,
-                old_scale,
-                new_size,
-                new_scale,
-            );
+            if size_changed {
+                log::info!(
+                    "GPUI iOS: Layout changed — {:?} @{:.1}x → {:?} @{:.1}x",
+                    old_bounds.size,
+                    old_scale,
+                    new_size,
+                    new_scale,
+                );
 
-            // Update stored bounds (in logical pixels, matching GPUI convention).
-            let new_bounds = Bounds {
-                origin: Default::default(),
-                size: new_size,
-            };
-            self.bounds.set(new_bounds);
-            self.scale_factor.set(new_scale);
+                // Update stored bounds (in logical pixels, matching GPUI convention).
+                let new_bounds = Bounds {
+                    origin: Default::default(),
+                    size: new_size,
+                };
+                self.bounds.set(new_bounds);
+                self.scale_factor.set(new_scale);
 
-            // Update the Metal layer's contentsScale so the drawable has the
-            // correct pixel dimensions.
-            let layer: *mut AnyObject = msg_send![self.view, layer];
-            let _: () = msg_send![layer, setContentsScale: scale];
+                // Update the Metal layer's contentsScale so the drawable has the
+                // correct pixel dimensions.
+                let layer: *mut AnyObject = msg_send![self.view, layer];
+                let _: () = msg_send![layer, setContentsScale: scale];
 
-            // Update the wgpu renderer's surface configuration.
-            let pixel_w = (new_w * new_scale) as i32;
-            let pixel_h = (new_h * new_scale) as i32;
-            {
-                let mut guard = self.renderer.lock();
-                if let Some(renderer) = guard.as_mut() {
-                    renderer
-                        .update_drawable_size(size(DevicePixels(pixel_w), DevicePixels(pixel_h)));
+                // Update the wgpu renderer's surface configuration.
+                let pixel_w = (new_w * new_scale) as i32;
+                let pixel_h = (new_h * new_scale) as i32;
+                {
+                    let mut guard = self.renderer.lock();
+                    if let Some(renderer) = guard.as_mut() {
+                        renderer
+                            .update_drawable_size(size(DevicePixels(pixel_w), DevicePixels(pixel_h)));
+                    }
                 }
             }
 
-            // Fire the resize callback so GPUI re-layouts at the new size.
-            let cb = self.resize_callback.borrow_mut().take();
-            if let Some(mut cb) = cb {
-                cb(new_size, new_scale);
-                // Restore the callback for future resize events.
-                let mut slot = self.resize_callback.borrow_mut();
-                if slot.is_none() {
-                    *slot = Some(cb);
+            if insets_changed {
+                self.notify_insets_changed();
+            }
+            if size_changed {
+                // Fire the resize callback so GPUI re-layouts at the new size.
+                let cb = self.resize_callback.borrow_mut().take();
+                if let Some(mut cb) = cb {
+                    cb(new_size, new_scale);
+                    let mut slot = self.resize_callback.borrow_mut();
+                    if slot.is_none() {
+                        *slot = Some(cb);
+                    }
                 }
             }
         }
@@ -1360,6 +1479,14 @@ impl HasDisplayHandle for IosWindow {
 }
 
 impl PlatformWindow for IosWindow {
+    fn insets(&self) -> gpui::WindowInsets {
+        self.window_insets()
+    }
+
+    fn on_insets_changed(&self, callback: Box<dyn FnMut(gpui::WindowInsets)>) {
+        *self.insets_callback.borrow_mut() = Some(callback);
+    }
+
     fn bounds(&self) -> Bounds<Pixels> {
         self.bounds.get()
     }
@@ -1418,6 +1545,10 @@ impl PlatformWindow for IosWindow {
 
     fn take_input_handler(&mut self) -> Option<PlatformInputHandler> {
         self.input_handler.borrow_mut().take()
+    }
+
+    fn request_text_input(&self) {
+        self.show_keyboard_with_type(crate::KeyboardType::Default);
     }
 
     fn prompt(
@@ -1569,9 +1700,14 @@ impl PlatformWindow for IosWindow {
     }
 
     fn draw(&self, scene: &Scene) {
+        if Self::scene_is_empty(scene) {
+            return;
+        }
         let mut guard = self.renderer.lock();
         if let Some(renderer) = guard.as_mut() {
-            renderer.draw(scene);
+            if !renderer.draw(scene) {
+                log::warn!("GPUI iOS: wgpu draw returned false");
+            }
         } else {
             log::trace!("GPUI iOS: draw called but no renderer available");
         }

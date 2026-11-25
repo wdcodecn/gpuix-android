@@ -4,10 +4,10 @@
 
 ## Goal
 
-`gpuix-android` places a narrow project contract in front of the native runtime:
+`gpuix-mobile` places a narrow project contract in front of the native mobile runtime:
 an application supplies one React entry point and one configuration file. The
 framework hides Hermes startup, retained-tree transport, GPUI layout and paint,
-wgpu surface management, Android input and artifact assembly.
+wgpu surface management, mobile input and artifact assembly across Android and iOS.
 
 ```text
 Application TSX
@@ -16,16 +16,16 @@ Application TSX
 gpuix-base-ui / application components
       │ @gpuix/react retained tree
       ▼
-standalone Hermes
+standalone Hermes (runtime/)
       │ N-API mutation and event protocol
       ▼
-gpuix-native + gpui-mobile
+gpuix-native + gpui-mobile (native/vendor/)
       │ GPUI layout/paint + wgpu
       ▼
-Android SurfaceFlinger / Vulkan
+Android SurfaceFlinger (Vulkan) / iOS UIKit (Metal)
 ```
 
-The Android host contains no WebView and does not use React Native's view
+The native hosts contain no WebView and do not use React Native's view
 system. JavaScript state commits still have a cost; native rendering is not a
 claim that JavaScript work is free.
 
@@ -33,13 +33,14 @@ claim that JavaScript work is free.
 
 | Path | Responsibility | Application ownership |
 | --- | --- | --- |
-| `scripts/gpuix.ts` | Stable project CLI | Call only |
+| `scripts/gpuix.ts` | Unified mobile project CLI | Call only |
+| `scripts/config.ts`, `bundler.ts`, `ota*.ts` | Config schema, JS/HBC bundler, OTA hash chain & Merkle toolchain | Call only |
+| `runtime/` | Shared mobile JS runtime & `GpuixNativeSdk` | Framework maintained |
+| `native/hermes`, `native/vendor/` | Shared Hermes host, `gpuix-native`, `gpui-mobile` | Framework maintained |
 | `templates/react-gpui` | Generated app skeleton | Customize after generation |
-| `android/vendor/gpuix-native` | Retained tree, N-API renderer, GPUI bridge | Framework maintained |
-| `android/vendor/gpui-mobile` | Android window, input, insets, scrolling, frame policy | Framework maintained |
-| `android/rust`, `android/hermes` | App entry and standalone Hermes host | Generated host |
-| `android/scripts` | JS, Hermes, Rust, Gradle and artifact orchestration | CLI controlled |
-| `gpuix.android.json` | App identity, entry point and version | Application maintained |
+| `android/` | Android host entry, Gradle/Java plugins and build adapter | Managed or `--eject` |
+| `ios/` | iOS host entry (`Info.plist.template`, `main.m`, Rust bridge) and Simulator runner | Managed |
+| `gpuix.config.json` | App identity, entry point, `versionName`/`versionCode` and platform/OTA config | Application maintained |
 
 ## Project contract
 

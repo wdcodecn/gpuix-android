@@ -35,7 +35,7 @@ mod text;
 mod theme;
 // Desktop only. HTTP goes through reqwest_client, not crates.io reqwest.
 #[cfg(all(
-    not(any(target_family = "wasm", target_os = "android")),
+    not(any(target_family = "wasm", target_os = "android", target_os = "ios")),
     feature = "http-client"
 ))]
 mod updater;

@@ -1,0 +1,47 @@
+[package]
+name = "gpuix-ios"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "gpuix_ios"
+crate-type = ["staticlib"]
+
+[dependencies]
+gpuix-native = { path = "../../native/vendor/gpuix-native", default-features = false }
+gpui-mobile = { path = "../../native/vendor/gpui-mobile", default-features = false }
+log = "0.4"
+
+[features]
+default = ["http-client"]
+http-client = ["gpuix-native/http-client"]
+rich-content = ["gpuix-native/rich-content"]
+
+[patch.crates-io]
+async-task = { git = "https://github.com/smol-rs/async-task.git", rev = "b4486cd71e4e94fbda54ce6302444de14f4d190e" }
+
+[profile.dev]
+debug = 0
+incremental = true
+
+[profile.ios-dev]
+inherits = "release"
+opt-level = 1
+debug = 0
+strip = "none"
+lto = false
+codegen-units = 16
+incremental = true
+panic = "abort"
+
+[profile.ios-dev.package."*"]
+opt-level = 2
+
+[profile.ios-dev.package.gpuix-native]
+opt-level = 1
+codegen-units = 16
+
+[profile.ios-dev.package.gpui-mobile]
+opt-level = 1
+codegen-units = 16

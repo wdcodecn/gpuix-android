@@ -4,7 +4,15 @@
 #include "hermes/Public/RuntimeConfig.h"
 #include "hermes/VM/Runtime.h"
 #include "napi/hermes_napi.h"
+#ifdef __ANDROID__
 #include <android/log.h>
+#define GPUIX_LOGI(fmt, ...) __android_log_print(ANDROID_LOG_INFO, kTag, fmt, ##__VA_ARGS__)
+#define GPUIX_LOGE(fmt, ...) __android_log_print(ANDROID_LOG_ERROR, kTag, fmt, ##__VA_ARGS__)
+#else
+#include <cstdio>
+#define GPUIX_LOGI(fmt, ...) std::fprintf(stderr, "[%s] " fmt "\n", kTag, ##__VA_ARGS__)
+#define GPUIX_LOGE(fmt, ...) std::fprintf(stderr, "[%s][ERR] " fmt "\n", kTag, ##__VA_ARGS__)
+#endif
 #include <uv.h>
 #include <atomic>
 #include <cstring>
@@ -75,7 +83,7 @@ std::string text(napi_env env, napi_value value) {
 }
 
 void report_fatal(const std::string &message) {
-  __android_log_print(ANDROID_LOG_ERROR, kTag, "%s", message.c_str());
+  GPUIX_LOGE("%s", message.c_str());
   if (auto fn = fatal_handler.load(std::memory_order_acquire)) {
     fn(message.c_str());
   }
@@ -106,7 +114,7 @@ bool capture_exception_text(napi_env env, std::string &out, bool report_to_fatal
   if (report_to_fatal_handler) {
     report_fatal(out);
   } else {
-    __android_log_print(ANDROID_LOG_ERROR, kTag, "%s", out.c_str());
+    GPUIX_LOGE("%s", out.c_str());
   }
   return true;
 }
@@ -216,7 +224,7 @@ void dispatch(uv_async_t *handle) {
       hermes_bytecode_flags bc_flags{};
       bc_flags.struct_size = sizeof(hermes_bytecode_flags);
       bc_flags.persistent = true;
-      __android_log_print(ANDROID_LOG_INFO, kTag, "Hot-evaluating Hermes HBC %s (%zu bytes)", item.url.c_str(), bc_size);
+      GPUIX_LOGI("Hot-evaluating Hermes HBC %s (%zu bytes)", item.url.c_str(), bc_size);
       st = hermes_run_bytecode(
           runner->env,
           bc_data,
@@ -230,7 +238,7 @@ void dispatch(uv_async_t *handle) {
       if (item.bytes.empty() || item.bytes.back() != 0) {
         item.bytes.push_back(0);
       }
-      __android_log_print(ANDROID_LOG_INFO, kTag, "Hot-evaluating JS %s (%zu bytes)", item.url.c_str(), item.bytes.size());
+      GPUIX_LOGI("Hot-evaluating JS %s (%zu bytes)", item.url.c_str(), item.bytes.size());
       st = hermes_run_script(
           runner->env,
           item.bytes.data(),
@@ -253,7 +261,7 @@ void dispatch(uv_async_t *handle) {
     bool ok = (st == napi_ok) && !has_ex;
     if (!ok && err_msg.empty()) {
       err_msg = "hermes eval failed (status=" + std::to_string(static_cast<int>(st)) + ")";
-      __android_log_print(ANDROID_LOG_ERROR, kTag, "%s", err_msg.c_str());
+      GPUIX_LOGE("%s", err_msg.c_str());
     }
     if (auto fn = hot_eval_handler.load(std::memory_order_acquire)) {
       fn(ok, item.url.c_str(), ok ? nullptr : err_msg.c_str());
@@ -434,7 +442,7 @@ napi_value log(napi_env env, napi_callback_info info) {
   napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
   std::string message;
   for (size_t i = 0; i < argc; ++i) { if (i) message += ' '; message += text(env, args[i]); }
-  __android_log_print(ANDROID_LOG_INFO, kTag, "%s", message.c_str()); return nullptr;
+  GPUIX_LOGI("%s", message.c_str()); return nullptr;
 }
 
 void install(Runner *runner) {
@@ -505,7 +513,7 @@ extern "C" int gpuix_js_run(const uint8_t *bundle, size_t length, gpuix_register
         hermes_bytecode_flags bc_flags{};
         bc_flags.struct_size = sizeof(hermes_bytecode_flags);
         bc_flags.persistent = true;
-        __android_log_print(ANDROID_LOG_INFO, kTag, "Hermes Node-API registered GPUIX, running HBC %zu bytes", length);
+        GPUIX_LOGI("Hermes Node-API registered GPUIX, running HBC %zu bytes", length);
         status = hermes_run_bytecode(runner.env, bundle, length, nullptr, nullptr, "gpuix-app.hbc", &bc_flags, &result);
       } else {
         std::vector<uint8_t> js_buf;
@@ -517,7 +525,7 @@ extern "C" int gpuix_js_run(const uint8_t *bundle, size_t length, gpuix_register
           js_ptr = js_buf.data();
           js_len = js_buf.size();
         }
-        __android_log_print(ANDROID_LOG_INFO, kTag, "Hermes Node-API registered GPUIX, compiling JS %zu bytes", length);
+        GPUIX_LOGI("Hermes Node-API registered GPUIX, compiling JS %zu bytes", length);
         status = hermes_run_script(runner.env, js_ptr, js_len, nullptr, nullptr, "gpuix-app.js", nullptr, &result);
       }
     }
@@ -536,7 +544,7 @@ extern "C" int gpuix_js_run(const uint8_t *bundle, size_t length, gpuix_register
   uv_close(reinterpret_cast<uv_handle_t *>(&runner.async), nullptr);
   uv_run(&runner.loop, UV_RUN_DEFAULT);
   uv_loop_close(&runner.loop);
-  __android_log_print(ANDROID_LOG_INFO, kTag, "JS worker exited status=%d", status);
+  GPUIX_LOGI("JS worker exited status=%d", status);
   return status == napi_ok ? 0 : 2;
 }
 

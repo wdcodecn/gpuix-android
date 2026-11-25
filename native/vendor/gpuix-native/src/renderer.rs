@@ -15,7 +15,8 @@ use futures::channel::oneshot;
     target_os = "windows",
     target_os = "linux",
     target_os = "freebsd",
-    target_os = "android"
+    target_os = "android",
+    target_os = "ios"
 ))]
 use futures::{channel::mpsc, StreamExt as _};
 use gpui::AppContext as _;
@@ -34,14 +35,16 @@ use std::rc::Rc;
     target_os = "windows",
     target_os = "linux",
     target_os = "freebsd",
-    target_os = "android"
+    target_os = "android",
+    target_os = "ios"
 ))]
 use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(any(
     target_os = "windows",
     target_os = "linux",
     target_os = "freebsd",
-    target_os = "android"
+    target_os = "android",
+    target_os = "ios"
 ))]
 use std::sync::mpsc::{sync_channel, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex};
@@ -64,6 +67,12 @@ mod android_host;
 pub use android_host::{run_android, run_android_with_stop};
 #[cfg(target_os = "android")]
 pub use gpui_mobile::android::{jni as android_jni, vsync as android_vsync};
+
+#[cfg(target_os = "ios")]
+#[path = "renderer_ios.rs"]
+mod ios_host;
+#[cfg(target_os = "ios")]
+pub use ios_host::{start_ios_host, stop_ios_host};
 
 /// The Window menu items act on the focused window, and the root element is the
 /// only place in GPUIX that has one. `crate::app_menu` owns everything else.
@@ -345,7 +354,8 @@ pub(crate) fn debug_frame_overlay_stats_js(
     target_os = "windows",
     target_os = "linux",
     target_os = "freebsd",
-    target_os = "android"
+    target_os = "android",
+    target_os = "ios"
 ))]
 fn recv_ui_response<T>(receiver: std::sync::mpsc::Receiver<T>, operation: &str) -> Result<T> {
     match receiver.recv_timeout(Duration::from_secs(2)) {
@@ -414,7 +424,8 @@ fn invalidate_window() -> Result<()> {
     target_os = "windows",
     target_os = "linux",
     target_os = "freebsd",
-    target_os = "android"
+    target_os = "android",
+    target_os = "ios"
 ))]
 enum MouseInput {
     Click {
@@ -454,7 +465,8 @@ enum MouseInput {
     target_os = "windows",
     target_os = "linux",
     target_os = "freebsd",
-    target_os = "android"
+    target_os = "android",
+    target_os = "ios"
 ))]
 enum KeyInput {
     Keystrokes(String),
@@ -466,7 +478,8 @@ enum KeyInput {
     target_os = "windows",
     target_os = "linux",
     target_os = "freebsd",
-    target_os = "android"
+    target_os = "android",
+    target_os = "ios"
 ))]
 enum ClockControl {
     Pause,
@@ -479,7 +492,8 @@ enum ClockControl {
     target_os = "windows",
     target_os = "linux",
     target_os = "freebsd",
-    target_os = "android"
+    target_os = "android",
+    target_os = "ios"
 ))]
 enum UiCommand {
     Invalidate,
@@ -595,7 +609,8 @@ enum UiCommand {
     target_os = "windows",
     target_os = "linux",
     target_os = "freebsd",
-    target_os = "android"
+    target_os = "android",
+    target_os = "ios"
 ))]
 fn refresh_ui_window(
     window: gpui::WindowHandle<GpuixView>,
@@ -611,7 +626,8 @@ fn refresh_ui_window(
     target_os = "windows",
     target_os = "linux",
     target_os = "freebsd",
-    target_os = "android"
+    target_os = "android",
+    target_os = "ios"
 ))]
 async fn run_ui_commands(
     mut commands: mpsc::UnboundedReceiver<UiCommand>,
@@ -1007,7 +1023,8 @@ async fn run_ui_commands(
     target_os = "windows",
     target_os = "linux",
     target_os = "freebsd",
-    target_os = "android"
+    target_os = "android",
+    target_os = "ios"
 ))]
 fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
     payload
@@ -1216,7 +1233,8 @@ pub struct GpuixRenderer {
         target_os = "windows",
         target_os = "linux",
         target_os = "freebsd",
-        target_os = "android"
+        target_os = "android",
+        target_os = "ios"
     ))]
     ui_commands: Mutex<Option<mpsc::UnboundedSender<UiCommand>>>,
     /// False after `Platform::run` returns. `tick()` reports that so JS can
@@ -1227,7 +1245,8 @@ pub struct GpuixRenderer {
         target_os = "windows",
         target_os = "linux",
         target_os = "freebsd",
-        target_os = "android"
+        target_os = "android",
+        target_os = "ios"
     ))]
     ui_running: Arc<AtomicBool>,
 }
@@ -1247,7 +1266,8 @@ impl GpuixRenderer {
         target_os = "windows",
         target_os = "linux",
         target_os = "freebsd",
-        target_os = "android"
+        target_os = "android",
+        target_os = "ios"
     ))]
     fn send_ui_command(&self, command: UiCommand) -> Result<()> {
         self.ui_commands
@@ -1320,7 +1340,8 @@ impl GpuixRenderer {
         target_os = "windows",
         target_os = "linux",
         target_os = "freebsd",
-        target_os = "android"
+        target_os = "android",
+        target_os = "ios"
     ))]
     fn dispatch_mouse_input(&self, input: MouseInput) -> Result<()> {
         let (response_sender, response_receiver) = sync_channel(1);
@@ -1335,7 +1356,8 @@ impl GpuixRenderer {
         target_os = "windows",
         target_os = "linux",
         target_os = "freebsd",
-        target_os = "android"
+        target_os = "android",
+        target_os = "ios"
     ))]
     fn dispatch_key_input(&self, input: KeyInput) -> Result<()> {
         let (response_sender, response_receiver) = sync_channel(1);
@@ -1354,7 +1376,8 @@ impl GpuixRenderer {
             target_os = "windows",
             target_os = "linux",
             target_os = "freebsd",
-            target_os = "android"
+            target_os = "android",
+            target_os = "ios"
         ))]
         {
             let (response, receiver) = sync_channel(1);
@@ -1367,7 +1390,8 @@ impl GpuixRenderer {
             target_os = "windows",
             target_os = "linux",
             target_os = "freebsd",
-            target_os = "android"
+            target_os = "android",
+            target_os = "ios"
         )))]
         Err(Error::from_reason("Unsupported operating system"))
     }
@@ -1406,7 +1430,8 @@ impl GpuixRenderer {
             target_os = "windows",
             target_os = "linux",
             target_os = "freebsd",
-            target_os = "android"
+            target_os = "android",
+            target_os = "ios"
         ))]
         {
             let (response, receiver) = sync_channel(1);
@@ -1419,7 +1444,8 @@ impl GpuixRenderer {
             target_os = "windows",
             target_os = "linux",
             target_os = "freebsd",
-            target_os = "android"
+            target_os = "android",
+            target_os = "ios"
         )))]
         {
             let _ = id;
@@ -1431,7 +1457,8 @@ impl GpuixRenderer {
         target_os = "windows",
         target_os = "linux",
         target_os = "freebsd",
-        target_os = "android"
+        target_os = "android",
+        target_os = "ios"
     ))]
     fn control_clock(&self, control: ClockControl) -> Result<f64> {
         let (response, receiver) = sync_channel(1);
@@ -1447,7 +1474,8 @@ impl GpuixRenderer {
             target_os = "windows",
             target_os = "linux",
             target_os = "freebsd",
-            target_os = "android"
+            target_os = "android",
+            target_os = "ios"
         ))]
         return self.send_ui_command(UiCommand::Invalidate);
 
@@ -1456,7 +1484,8 @@ impl GpuixRenderer {
             target_os = "windows",
             target_os = "linux",
             target_os = "freebsd",
-            target_os = "android"
+            target_os = "android",
+            target_os = "ios"
         )))]
         Err(Error::from_reason(
             "The production GPUIX renderer does not support this operating system",
@@ -1476,7 +1505,13 @@ impl GpuixRenderer {
             return Ok(());
         }
 
-        #[cfg(not(target_os = "android"))]
+        #[cfg(target_os = "ios")]
+        {
+            let _ = frame_rate;
+            return Ok(());
+        }
+
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
         {
             let _ = frame_rate;
             Err(Error::from_reason(
@@ -1525,14 +1560,16 @@ impl GpuixRenderer {
                 target_os = "windows",
                 target_os = "linux",
                 target_os = "freebsd",
-                target_os = "android"
+                target_os = "android",
+                target_os = "ios"
             ))]
             ui_commands: Mutex::new(None),
             #[cfg(any(
                 target_os = "windows",
                 target_os = "linux",
                 target_os = "freebsd",
-                target_os = "android"
+                target_os = "android",
+                target_os = "ios"
             ))]
             ui_running: Arc::new(AtomicBool::new(false)),
         }
@@ -1546,7 +1583,8 @@ impl GpuixRenderer {
             target_os = "windows",
             target_os = "linux",
             target_os = "freebsd",
-            target_os = "android"
+            target_os = "android",
+            target_os = "ios"
         )))]
         {
             let _ = options;
@@ -1560,6 +1598,9 @@ impl GpuixRenderer {
 
         #[cfg(target_os = "android")]
         return self.init_android(options);
+
+        #[cfg(target_os = "ios")]
+        return self.init_ios(options);
 
         #[cfg(any(target_os = "windows", target_os = "linux", target_os = "freebsd"))]
         return self.init_threaded(options);
@@ -1950,7 +1991,8 @@ impl GpuixRenderer {
             target_os = "windows",
             target_os = "linux",
             target_os = "freebsd",
-            target_os = "android"
+            target_os = "android",
+            target_os = "ios"
         ))]
         {
             let running = self.ui_running.load(Ordering::Acquire);
@@ -1965,7 +2007,8 @@ impl GpuixRenderer {
             target_os = "windows",
             target_os = "linux",
             target_os = "freebsd",
-            target_os = "android"
+            target_os = "android",
+            target_os = "ios"
         )))]
         Err(Error::from_reason(
             "The production GPUIX renderer does not support this operating system",
@@ -2043,7 +2086,8 @@ impl GpuixRenderer {
             target_os = "windows",
             target_os = "linux",
             target_os = "freebsd",
-            target_os = "android"
+            target_os = "android",
+            target_os = "ios"
         ))
     }
 
@@ -2066,7 +2110,8 @@ impl GpuixRenderer {
             target_os = "windows",
             target_os = "linux",
             target_os = "freebsd",
-            target_os = "android"
+            target_os = "android",
+            target_os = "ios"
         ))]
         {
             if let Some((ref size, _)) = *self.window_metrics.read() {
@@ -2082,7 +2127,8 @@ impl GpuixRenderer {
             target_os = "windows",
             target_os = "linux",
             target_os = "freebsd",
-            target_os = "android"
+            target_os = "android",
+            target_os = "ios"
         )))]
         Err(Error::from_reason(
             "The production GPUIX renderer does not support this operating system",
@@ -2098,7 +2144,8 @@ impl GpuixRenderer {
             target_os = "windows",
             target_os = "linux",
             target_os = "freebsd",
-            target_os = "android"
+            target_os = "android",
+            target_os = "ios"
         ))]
         {
             if let Some((_, ref insets)) = *self.window_metrics.read() {
@@ -2114,7 +2161,8 @@ impl GpuixRenderer {
             target_os = "windows",
             target_os = "linux",
             target_os = "freebsd",
-            target_os = "android"
+            target_os = "android",
+            target_os = "ios"
         )))]
         Ok(WindowInsets::default())
     }
@@ -2133,7 +2181,8 @@ impl GpuixRenderer {
             target_os = "windows",
             target_os = "linux",
             target_os = "freebsd",
-            target_os = "android"
+            target_os = "android",
+            target_os = "ios"
         ))]
         {
             self.send_ui_command(UiCommand::SetDebugFrameOverlay(mode))?;
@@ -2145,7 +2194,8 @@ impl GpuixRenderer {
             target_os = "windows",
             target_os = "linux",
             target_os = "freebsd",
-            target_os = "android"
+            target_os = "android",
+            target_os = "ios"
         )))]
         Err(Error::from_reason("Unsupported operating system"))
     }
@@ -2163,7 +2213,8 @@ impl GpuixRenderer {
             target_os = "windows",
             target_os = "linux",
             target_os = "freebsd",
-            target_os = "android"
+            target_os = "android",
+            target_os = "ios"
         ))]
         {
             let (response, receiver) = sync_channel(1);
@@ -2176,7 +2227,8 @@ impl GpuixRenderer {
             target_os = "windows",
             target_os = "linux",
             target_os = "freebsd",
-            target_os = "android"
+            target_os = "android",
+            target_os = "ios"
         )))]
         Err(Error::from_reason("Unsupported operating system"))
     }
@@ -2196,7 +2248,8 @@ impl GpuixRenderer {
             target_os = "windows",
             target_os = "linux",
             target_os = "freebsd",
-            target_os = "android"
+            target_os = "android",
+            target_os = "ios"
         ))]
         {
             let (response, receiver) = sync_channel(1);
@@ -2209,7 +2262,8 @@ impl GpuixRenderer {
             target_os = "windows",
             target_os = "linux",
             target_os = "freebsd",
-            target_os = "android"
+            target_os = "android",
+            target_os = "ios"
         )))]
         Err(Error::from_reason("Unsupported operating system"))
     }
@@ -2226,7 +2280,8 @@ impl GpuixRenderer {
             target_os = "windows",
             target_os = "linux",
             target_os = "freebsd",
-            target_os = "android"
+            target_os = "android",
+            target_os = "ios"
         ))]
         return self.send_ui_command(UiCommand::ResetDebugFrameOverlayStats);
 
@@ -2235,7 +2290,8 @@ impl GpuixRenderer {
             target_os = "windows",
             target_os = "linux",
             target_os = "freebsd",
-            target_os = "android"
+            target_os = "android",
+            target_os = "ios"
         )))]
         Err(Error::from_reason("Unsupported operating system"))
     }
@@ -2252,7 +2308,8 @@ impl GpuixRenderer {
             target_os = "windows",
             target_os = "linux",
             target_os = "freebsd",
-            target_os = "android"
+            target_os = "android",
+            target_os = "ios"
         ))]
         {
             let (response, receiver) = sync_channel(1);
@@ -2273,7 +2330,8 @@ impl GpuixRenderer {
             target_os = "windows",
             target_os = "linux",
             target_os = "freebsd",
-            target_os = "android"
+            target_os = "android",
+            target_os = "ios"
         )))]
         Err(Error::from_reason("Unsupported operating system"))
     }
@@ -2292,7 +2350,8 @@ impl GpuixRenderer {
             target_os = "windows",
             target_os = "linux",
             target_os = "freebsd",
-            target_os = "android"
+            target_os = "android",
+            target_os = "ios"
         ))]
         return self.send_ui_command(UiCommand::ActivateWindow);
 
@@ -2301,7 +2360,8 @@ impl GpuixRenderer {
             target_os = "windows",
             target_os = "linux",
             target_os = "freebsd",
-            target_os = "android"
+            target_os = "android",
+            target_os = "ios"
         )))]
         Err(Error::from_reason(
             "The production GPUIX renderer does not support this operating system",
@@ -2381,7 +2441,8 @@ impl GpuixRenderer {
             target_os = "windows",
             target_os = "linux",
             target_os = "freebsd",
-            target_os = "android"
+            target_os = "android",
+            target_os = "ios"
         ))]
         return self.send_ui_command(UiCommand::SetWindowTitle(title));
 
@@ -2390,7 +2451,8 @@ impl GpuixRenderer {
             target_os = "windows",
             target_os = "linux",
             target_os = "freebsd",
-            target_os = "android"
+            target_os = "android",
+            target_os = "ios"
         )))]
         Err(Error::from_reason(
             "The production GPUIX renderer does not support this operating system",
@@ -2425,7 +2487,8 @@ impl GpuixRenderer {
             target_os = "windows",
             target_os = "linux",
             target_os = "freebsd",
-            target_os = "android"
+            target_os = "android",
+            target_os = "ios"
         ))]
         return self.send_ui_command(UiCommand::FocusElement(id));
 
@@ -2434,7 +2497,8 @@ impl GpuixRenderer {
             target_os = "windows",
             target_os = "linux",
             target_os = "freebsd",
-            target_os = "android"
+            target_os = "android",
+            target_os = "ios"
         )))]
         Err(Error::from_reason("Unsupported operating system"))
     }
@@ -2449,7 +2513,8 @@ impl GpuixRenderer {
             target_os = "windows",
             target_os = "linux",
             target_os = "freebsd",
-            target_os = "android"
+            target_os = "android",
+            target_os = "ios"
         ))]
         return self.send_ui_command(UiCommand::FocusNext);
 
@@ -2458,7 +2523,8 @@ impl GpuixRenderer {
             target_os = "windows",
             target_os = "linux",
             target_os = "freebsd",
-            target_os = "android"
+            target_os = "android",
+            target_os = "ios"
         )))]
         Err(Error::from_reason("Unsupported operating system"))
     }
@@ -2473,7 +2539,8 @@ impl GpuixRenderer {
             target_os = "windows",
             target_os = "linux",
             target_os = "freebsd",
-            target_os = "android"
+            target_os = "android",
+            target_os = "ios"
         ))]
         return self.send_ui_command(UiCommand::FocusPrevious);
 
@@ -2482,7 +2549,8 @@ impl GpuixRenderer {
             target_os = "windows",
             target_os = "linux",
             target_os = "freebsd",
-            target_os = "android"
+            target_os = "android",
+            target_os = "ios"
         )))]
         Err(Error::from_reason("Unsupported operating system"))
     }
@@ -2499,7 +2567,8 @@ impl GpuixRenderer {
             target_os = "windows",
             target_os = "linux",
             target_os = "freebsd",
-            target_os = "android"
+            target_os = "android",
+            target_os = "ios"
         ))]
         {
             let (response, receiver) = sync_channel(1);
@@ -2513,7 +2582,8 @@ impl GpuixRenderer {
             target_os = "windows",
             target_os = "linux",
             target_os = "freebsd",
-            target_os = "android"
+            target_os = "android",
+            target_os = "ios"
         )))]
         Err(Error::from_reason("Unsupported operating system"))
     }
@@ -2533,7 +2603,8 @@ impl GpuixRenderer {
             target_os = "windows",
             target_os = "linux",
             target_os = "freebsd",
-            target_os = "android"
+            target_os = "android",
+            target_os = "ios"
         ))]
         return self.send_ui_command(UiCommand::FocusNextWithin(id));
 
@@ -2542,7 +2613,8 @@ impl GpuixRenderer {
             target_os = "windows",
             target_os = "linux",
             target_os = "freebsd",
-            target_os = "android"
+            target_os = "android",
+            target_os = "ios"
         )))]
         Err(Error::from_reason("Unsupported operating system"))
     }
@@ -2562,7 +2634,8 @@ impl GpuixRenderer {
             target_os = "windows",
             target_os = "linux",
             target_os = "freebsd",
-            target_os = "android"
+            target_os = "android",
+            target_os = "ios"
         ))]
         return self.send_ui_command(UiCommand::FocusPreviousWithin(id));
 
@@ -2571,7 +2644,8 @@ impl GpuixRenderer {
             target_os = "windows",
             target_os = "linux",
             target_os = "freebsd",
-            target_os = "android"
+            target_os = "android",
+            target_os = "ios"
         )))]
         Err(Error::from_reason("Unsupported operating system"))
     }
@@ -2593,7 +2667,8 @@ impl GpuixRenderer {
             target_os = "windows",
             target_os = "linux",
             target_os = "freebsd",
-            target_os = "android"
+            target_os = "android",
+            target_os = "ios"
         ))]
         return self.send_ui_command(UiCommand::SetWindowKeyEvents {
             key_down,
@@ -2606,7 +2681,8 @@ impl GpuixRenderer {
             target_os = "windows",
             target_os = "linux",
             target_os = "freebsd",
-            target_os = "android"
+            target_os = "android",
+            target_os = "ios"
         )))]
         Err(Error::from_reason("Unsupported operating system"))
     }
@@ -2620,7 +2696,8 @@ impl GpuixRenderer {
             target_os = "windows",
             target_os = "linux",
             target_os = "freebsd",
-            target_os = "android"
+            target_os = "android",
+            target_os = "ios"
         ))]
         return self.send_ui_command(UiCommand::Blur);
 
@@ -2629,7 +2706,8 @@ impl GpuixRenderer {
             target_os = "windows",
             target_os = "linux",
             target_os = "freebsd",
-            target_os = "android"
+            target_os = "android",
+            target_os = "ios"
         )))]
         Err(Error::from_reason("Unsupported operating system"))
     }
@@ -2649,7 +2727,8 @@ impl GpuixRenderer {
             target_os = "windows",
             target_os = "linux",
             target_os = "freebsd",
-            target_os = "android"
+            target_os = "android",
+            target_os = "ios"
         ))]
         return self.send_ui_command(UiCommand::SetWindowSelectionChange { enabled, event_id });
 
@@ -2658,7 +2737,8 @@ impl GpuixRenderer {
             target_os = "windows",
             target_os = "linux",
             target_os = "freebsd",
-            target_os = "android"
+            target_os = "android",
+            target_os = "ios"
         )))]
         Err(Error::from_reason("Unsupported operating system"))
     }
@@ -2709,7 +2789,8 @@ impl GpuixRenderer {
             target_os = "windows",
             target_os = "linux",
             target_os = "freebsd",
-            target_os = "android"
+            target_os = "android",
+            target_os = "ios"
         ))]
         return self.send_ui_command(UiCommand::ScrollTo {
             id,
@@ -2722,7 +2803,8 @@ impl GpuixRenderer {
             target_os = "windows",
             target_os = "linux",
             target_os = "freebsd",
-            target_os = "android"
+            target_os = "android",
+            target_os = "ios"
         )))]
         Err(Error::from_reason("Unsupported operating system"))
     }
@@ -2766,7 +2848,8 @@ impl GpuixRenderer {
             target_os = "windows",
             target_os = "linux",
             target_os = "freebsd",
-            target_os = "android"
+            target_os = "android",
+            target_os = "ios"
         ))]
         return self.send_ui_command(UiCommand::ScrollToItem { id, index, offset });
 
@@ -2775,7 +2858,8 @@ impl GpuixRenderer {
             target_os = "windows",
             target_os = "linux",
             target_os = "freebsd",
-            target_os = "android"
+            target_os = "android",
+            target_os = "ios"
         )))]
         {
             let _ = offset;
@@ -2808,7 +2892,8 @@ impl GpuixRenderer {
             target_os = "windows",
             target_os = "linux",
             target_os = "freebsd",
-            target_os = "android"
+            target_os = "android",
+            target_os = "ios"
         ))]
         {
             let (response, receiver) = sync_channel(1);
@@ -2823,7 +2908,8 @@ impl GpuixRenderer {
             target_os = "windows",
             target_os = "linux",
             target_os = "freebsd",
-            target_os = "android"
+            target_os = "android",
+            target_os = "ios"
         )))]
         Err(Error::from_reason("Unsupported operating system"))
     }
@@ -2861,7 +2947,8 @@ impl GpuixRenderer {
             target_os = "windows",
             target_os = "linux",
             target_os = "freebsd",
-            target_os = "android"
+            target_os = "android",
+            target_os = "ios"
         ))]
         {
             let (response, receiver) = sync_channel(1);
@@ -2876,7 +2963,8 @@ impl GpuixRenderer {
             target_os = "windows",
             target_os = "linux",
             target_os = "freebsd",
-            target_os = "android"
+            target_os = "android",
+            target_os = "ios"
         )))]
         Err(Error::from_reason("Unsupported operating system"))
     }
@@ -3091,7 +3179,8 @@ impl GpuixRenderer {
             target_os = "windows",
             target_os = "linux",
             target_os = "freebsd",
-            target_os = "android"
+            target_os = "android",
+            target_os = "ios"
         ))]
         return self.dispatch_key_input(KeyInput::Keystrokes(keystrokes));
 
@@ -3100,7 +3189,8 @@ impl GpuixRenderer {
             target_os = "windows",
             target_os = "linux",
             target_os = "freebsd",
-            target_os = "android"
+            target_os = "android",
+            target_os = "ios"
         )))]
         {
             let _ = keystrokes;
@@ -3122,7 +3212,8 @@ impl GpuixRenderer {
             target_os = "windows",
             target_os = "linux",
             target_os = "freebsd",
-            target_os = "android"
+            target_os = "android",
+            target_os = "ios"
         ))]
         return self.dispatch_key_input(KeyInput::Down { keystroke, is_held });
 
@@ -3131,7 +3222,8 @@ impl GpuixRenderer {
             target_os = "windows",
             target_os = "linux",
             target_os = "freebsd",
-            target_os = "android"
+            target_os = "android",
+            target_os = "ios"
         )))]
         {
             let _ = (keystroke, is_held);
@@ -3151,7 +3243,8 @@ impl GpuixRenderer {
             target_os = "windows",
             target_os = "linux",
             target_os = "freebsd",
-            target_os = "android"
+            target_os = "android",
+            target_os = "ios"
         ))]
         return self.dispatch_key_input(KeyInput::Up(keystroke));
 
@@ -3160,7 +3253,8 @@ impl GpuixRenderer {
             target_os = "windows",
             target_os = "linux",
             target_os = "freebsd",
-            target_os = "android"
+            target_os = "android",
+            target_os = "ios"
         )))]
         {
             let _ = keystroke;
@@ -3189,7 +3283,8 @@ impl GpuixRenderer {
             target_os = "windows",
             target_os = "linux",
             target_os = "freebsd",
-            target_os = "android"
+            target_os = "android",
+            target_os = "ios"
         ))]
         return self.dispatch_mouse_input(MouseInput::Click {
             x,
@@ -3203,7 +3298,8 @@ impl GpuixRenderer {
             target_os = "windows",
             target_os = "linux",
             target_os = "freebsd",
-            target_os = "android"
+            target_os = "android",
+            target_os = "ios"
         )))]
         {
             let _ = (x, y, button);
@@ -3233,7 +3329,8 @@ impl GpuixRenderer {
             target_os = "windows",
             target_os = "linux",
             target_os = "freebsd",
-            target_os = "android"
+            target_os = "android",
+            target_os = "ios"
         ))]
         return self.dispatch_mouse_input(MouseInput::Down {
             x,
@@ -3247,7 +3344,8 @@ impl GpuixRenderer {
             target_os = "windows",
             target_os = "linux",
             target_os = "freebsd",
-            target_os = "android"
+            target_os = "android",
+            target_os = "ios"
         )))]
         {
             let _ = (x, y, button);
@@ -3277,7 +3375,8 @@ impl GpuixRenderer {
             target_os = "windows",
             target_os = "linux",
             target_os = "freebsd",
-            target_os = "android"
+            target_os = "android",
+            target_os = "ios"
         ))]
         return self.dispatch_mouse_input(MouseInput::Up {
             x,
@@ -3291,7 +3390,8 @@ impl GpuixRenderer {
             target_os = "windows",
             target_os = "linux",
             target_os = "freebsd",
-            target_os = "android"
+            target_os = "android",
+            target_os = "ios"
         )))]
         {
             let _ = (x, y, button);
@@ -3320,7 +3420,8 @@ impl GpuixRenderer {
             target_os = "windows",
             target_os = "linux",
             target_os = "freebsd",
-            target_os = "android"
+            target_os = "android",
+            target_os = "ios"
         ))]
         return self.dispatch_mouse_input(MouseInput::Move {
             x,
@@ -3334,7 +3435,8 @@ impl GpuixRenderer {
             target_os = "windows",
             target_os = "linux",
             target_os = "freebsd",
-            target_os = "android"
+            target_os = "android",
+            target_os = "ios"
         )))]
         {
             let _ = (x, y, pressed_button);
@@ -3367,7 +3469,8 @@ impl GpuixRenderer {
             target_os = "windows",
             target_os = "linux",
             target_os = "freebsd",
-            target_os = "android"
+            target_os = "android",
+            target_os = "ios"
         ))]
         return self.dispatch_mouse_input(MouseInput::Wheel {
             x,
@@ -3382,7 +3485,8 @@ impl GpuixRenderer {
             target_os = "windows",
             target_os = "linux",
             target_os = "freebsd",
-            target_os = "android"
+            target_os = "android",
+            target_os = "ios"
         )))]
         {
             let _ = (x, y, delta_x, delta_y, modifiers);
@@ -3405,7 +3509,8 @@ impl GpuixRenderer {
             target_os = "windows",
             target_os = "linux",
             target_os = "freebsd",
-            target_os = "android"
+            target_os = "android",
+            target_os = "ios"
         ))]
         return self.control_clock(ClockControl::Pause);
 
@@ -3414,7 +3519,8 @@ impl GpuixRenderer {
             target_os = "windows",
             target_os = "linux",
             target_os = "freebsd",
-            target_os = "android"
+            target_os = "android",
+            target_os = "ios"
         )))]
         Err(Error::from_reason("Unsupported operating system"))
     }
@@ -3432,7 +3538,8 @@ impl GpuixRenderer {
             target_os = "windows",
             target_os = "linux",
             target_os = "freebsd",
-            target_os = "android"
+            target_os = "android",
+            target_os = "ios"
         ))]
         return self.control_clock(ClockControl::Set(now_ms));
 
@@ -3441,7 +3548,8 @@ impl GpuixRenderer {
             target_os = "windows",
             target_os = "linux",
             target_os = "freebsd",
-            target_os = "android"
+            target_os = "android",
+            target_os = "ios"
         )))]
         {
             let _ = now_ms;
@@ -3462,7 +3570,8 @@ impl GpuixRenderer {
             target_os = "windows",
             target_os = "linux",
             target_os = "freebsd",
-            target_os = "android"
+            target_os = "android",
+            target_os = "ios"
         ))]
         return self.control_clock(ClockControl::FastForward(delta_ms));
 
@@ -3471,7 +3580,8 @@ impl GpuixRenderer {
             target_os = "windows",
             target_os = "linux",
             target_os = "freebsd",
-            target_os = "android"
+            target_os = "android",
+            target_os = "ios"
         )))]
         {
             let _ = delta_ms;
@@ -3492,7 +3602,8 @@ impl GpuixRenderer {
             target_os = "windows",
             target_os = "linux",
             target_os = "freebsd",
-            target_os = "android"
+            target_os = "android",
+            target_os = "ios"
         ))]
         return self.control_clock(ClockControl::Resume);
 
@@ -3501,7 +3612,8 @@ impl GpuixRenderer {
             target_os = "windows",
             target_os = "linux",
             target_os = "freebsd",
-            target_os = "android"
+            target_os = "android",
+            target_os = "ios"
         )))]
         Err(Error::from_reason("Unsupported operating system"))
     }
@@ -4267,7 +4379,8 @@ impl Drop for GpuixRenderer {
             target_os = "windows",
             target_os = "linux",
             target_os = "freebsd",
-            target_os = "android"
+            target_os = "android",
+            target_os = "ios"
         ))]
         self.ui_commands.lock().unwrap().take();
     }

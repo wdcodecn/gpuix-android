@@ -2,9 +2,23 @@ import { describe, expect, test } from 'bun:test'
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
-import { loadGpuixAndroidConfig, normalizeOtaPublicKey, resolveOtaConfig } from '../../android/scripts/config'
-import { formatOtaMetaKv } from '../../android/scripts/build-js'
-import { buildManifestSigningPayload, buildOtaRelease, keygenOta, verifyOtaRelease } from '../ota'
+import { loadGpuixAndroidConfig, loadGpuixConfig, normalizeOtaPublicKey, resolveOtaConfig } from '../../scripts/config'
+import { formatOtaMetaKv } from '../../scripts/bundler'
+import {
+  buildByteMerkleTree,
+  buildMerkleProof,
+  locateChainEntries,
+  verifyMerkleProof,
+  verifyReleaseChain,
+} from '../ota-integrity'
+import {
+  buildManifestSigningPayload,
+  buildOtaRelease,
+  generateOtaProof,
+  keygenOta,
+  readOtaChain,
+  verifyOtaRelease,
+} from '../ota'
 
 function makeTempProject(): string {
   const dir = mkdtempSync(path.join(tmpdir(), 'gpuix-ota-test-'))
@@ -301,9 +315,138 @@ public class VerifyOtaSig {
   test('formatOtaMetaKv includes hbc_version line', async () => {
     const dir = makeTempProject()
     try {
-      const config = await loadGpuixAndroidConfig(dir)
+      const config = await loadGpuixConfig(dir)
       const meta = formatOtaMetaKv(config, 'hbc', 'b'.repeat(64), 96)
       expect(meta).toContain('hbc_version=96\n')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('OTA hash chain, Merkle tree integrity & release locating', () => {
+  test('buildByteMerkleTree and RFC 6962 inclusion proofs detect byte tampering', () => {
+    const payload = new Uint8Array(1000)
+    for (let i = 0; i < payload.length; i += 1) payload[i] = i & 0xff
+
+    const tree = buildByteMerkleTree(payload, 256)
+    expect(tree.chunkCount).toBe(4)
+    expect(tree.leafHashes.length).toBe(4)
+
+    for (let idx = 0; idx < tree.chunkCount; idx += 1) {
+      const proof = buildMerkleProof(tree.leafHashes, idx)
+      expect(verifyMerkleProof(tree.leafHashes[idx], idx, proof, tree.merkleRoot)).toBe(true)
+      const flipped = `${tree.leafHashes[idx].startsWith('0') ? '1' : '0'}${tree.leafHashes[idx].slice(1)}`
+      expect(verifyMerkleProof(flipped, idx, proof, tree.merkleRoot)).toBe(false)
+    }
+  })
+
+  test('links sequential releases into a verified hash chain with chunk & chain proofs and locate queries', async () => {
+    const dir = makeTempProject()
+    const keysDir = path.join(dir, 'keys')
+    const outDir = path.join(dir, 'dist/ota')
+    try {
+      const keys = await keygenOta({ outDir: keysDir })
+
+      // Release #0: v1.0.0 (custom small chunkSize so multi-chunk Merkle proof is exercised)
+      const r0 = await buildOtaRelease({
+        projectRoot: dir,
+        outDir,
+        versionName: '1.0.0',
+        releaseId: 'rel-1.0.0',
+        manifestSeq: 1001,
+        chunkSize: 256,
+        privateKey: keys.privateKeyPath,
+        skipHbc: true,
+      })
+
+      expect(r0.manifest.integrity?.chainIndex).toBe(0)
+      expect(r0.manifest.integrity?.prevReleaseHash).toBe('0'.repeat(64))
+      expect(buildManifestSigningPayload(r0.manifest).startsWith('gpuix-ota-manifest-v2\n')).toBe(true)
+      expect(buildManifestSigningPayload({ ...r0.manifest, integrity: undefined }).startsWith('gpuix-ota-manifest-v1\n')).toBe(true)
+
+      // Release #1: v1.1.1 updated source
+      writeFileSync(
+        path.join(dir, 'src/main.tsx'),
+        `export function App() { return "hello ota v1.1.1 ${'x'.repeat(300)}" }\nconsole.log(App());\n`,
+      )
+      const r1 = await buildOtaRelease({
+        projectRoot: dir,
+        outDir,
+        versionName: '1.1.1',
+        releaseId: 'rel-1.1.1',
+        manifestSeq: 1002,
+        chunkSize: 256,
+        privateKey: keys.privateKeyPath,
+        skipHbc: true,
+      })
+
+      expect(r1.manifest.integrity?.chainIndex).toBe(1)
+      expect(r1.manifest.integrity?.prevReleaseHash).toBe(r0.manifest.integrity?.releaseHash)
+
+      // Release #2: kill switch linked on top of r1
+      const r2 = await buildOtaRelease({
+        projectRoot: dir,
+        outDir,
+        versionName: '1.1.2',
+        releaseId: 'kill-1.1.2',
+        manifestSeq: 1003,
+        action: 'rollback_to_embedded',
+        privateKey: keys.privateKeyPath,
+      })
+      expect(r2.manifest.integrity?.chainIndex).toBe(2)
+      expect(r2.manifest.integrity?.prevReleaseHash).toBe(r1.manifest.integrity?.releaseHash)
+
+      const chain = await readOtaChain(r2.chainPath)
+      expect(chain.entries.length).toBe(3)
+      expect(chain.headHash).toBe(r2.manifest.integrity!.releaseHash)
+      expect(verifyReleaseChain(chain).valid).toBe(true)
+
+      // Locate by releaseId, v-prefixed versionName, #index, and SHA-256 hash prefix
+      expect(locateChainEntries(chain, 'rel-1.0.0').map((e) => e.releaseId)).toEqual(['rel-1.0.0'])
+      expect(locateChainEntries(chain, 'v1.1.1').map((e) => e.releaseId)).toEqual(['rel-1.1.1'])
+      expect(locateChainEntries(chain, '#2').map((e) => e.releaseId)).toEqual(['kill-1.1.2'])
+      expect(
+        locateChainEntries(chain, r1.manifest.integrity!.releaseHash.slice(0, 10)).map((e) => e.releaseId),
+      ).toEqual(['rel-1.1.1'])
+
+      // Generate & verify chain + chunk Merkle proofs
+      const chainProof = await generateOtaProof({ dir: outDir, query: 'v1.1.1' })
+      expect(chainProof.kind).toBe('chain')
+      expect(chainProof.verified).toBe(true)
+      expect(chainProof.rootHash).toBe(chain.chainMerkleRoot)
+
+      const chunkProof = await generateOtaProof({ dir: outDir, query: 'rel-1.1.1', chunkIndex: 0 })
+      expect(chunkProof.kind).toBe('chunk')
+      expect(chunkProof.verified).toBe(true)
+      expect(chunkProof.rootHash).toBe(r1.manifest.integrity!.merkleRoot)
+
+      // verifyOtaRelease succeeds for linked manifest & detects corrupted chain
+      const verifiedR1 = await verifyOtaRelease(path.join(outDir, 'bundles/rel-1.1.1/manifest.json'), keys.publicKeyBase64)
+      expect(verifiedR1.chainVerified).toBe(true)
+      expect(verifiedR1.versionName).toBe('1.1.1')
+
+      // Corrupt merkle.json and verify detection
+      const merkleFile = path.join(outDir, 'bundles/rel-1.1.1/merkle.json')
+      const savedMerkle = readFileSync(merkleFile, 'utf8')
+      const badMerkle = { ...JSON.parse(savedMerkle), merkleRoot: 'f'.repeat(64) }
+      writeFileSync(merkleFile, JSON.stringify(badMerkle, null, 2))
+      await expect(
+        verifyOtaRelease(path.join(outDir, 'bundles/rel-1.1.1/manifest.json'), keys.publicKeyBase64),
+      ).rejects.toThrow('merkle.json root mismatch')
+      writeFileSync(merkleFile, savedMerkle)
+
+      // Corrupt chain.json link and verify detection
+      const corruptedChain = {
+        ...chain,
+        entries: chain.entries.map((entry, i) =>
+          i === 1 ? { ...entry, prevReleaseHash: 'a'.repeat(64) } : entry,
+        ),
+      }
+      writeFileSync(r2.chainPath, JSON.stringify(corruptedChain, null, 2))
+      await expect(
+        verifyOtaRelease(path.join(outDir, 'bundles/rel-1.1.1/manifest.json'), keys.publicKeyBase64),
+      ).rejects.toThrow('chain verification failed')
     } finally {
       rmSync(dir, { recursive: true, force: true })
     }

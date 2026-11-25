@@ -1,30 +1,31 @@
-# gpuix-android native host
+# gpuix-mobile Android host
 
 Native Android host for a GPUIX React entry point. Rendering uses GPUI and wgpu;
-JavaScript runs in standalone Hermes. No WebView or React Native view system is
-included.
+JavaScript runs in standalone Hermes. Shared native crates and the JS runtime live in
+`../native/` and `../runtime/`. No WebView or React Native view system is included.
 
 ## Reuse in another project
 
 From the target GPUIX React project, use the package CLI:
 
 ```sh
-bunx gpuix-android init --entry src/main.tsx --app-id com.example.myapp --name "My App"
+bunx gpuix-mobile init --entry src/main.tsx --app-id com.example.myapp --name "My App" --version 1.0.0
 gpuix doctor
-gpuix build
+gpuix build android
 gpuix install ADB_SERIAL
 ```
 
-`init` copies this directory without `.deps`, `.build`, Gradle/Rust caches, APKs or
-generated native libraries. It refuses to replace an existing `android/` directory.
-It also writes the target-root `gpuix.android.json`:
+In managed mode, no files are copied into your project root beyond `gpuix.config.json`.
+`gpuix eject` copies `android/`, `native/`, and `runtime/` without `.deps`, `.build`,
+Gradle/Rust caches, APKs or generated native libraries, and refuses to overwrite an existing
+`android/` directory. `gpuix.config.json` format (compatible with `gpuix.android.json`):
 
 ```json
 {
   "entrypoint": "src/main.tsx",
   "appId": "com.example.myapp",
   "appName": "My App",
-  "versionName": "0.1.0",
+  "versionName": "1.0.0",
   "versionCode": 1
 }
 ```

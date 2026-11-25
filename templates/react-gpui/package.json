@@ -11,7 +11,9 @@
     "gpuix:doctor": "gpuix doctor",
     "gpuix:dev": "gpuix dev",
     "gpuix:build": "gpuix build",
+    "gpuix:build:ios": "gpuix build ios",
     "gpuix:run": "gpuix run",
+    "gpuix:run:ios": "gpuix run ios",
     "gpuix:cache": "gpuix cache",
     "gpuix:bench": "gpuix bench"
   },
@@ -24,7 +26,7 @@
   "devDependencies": {
     "@types/bun": "1.4.5",
     "@types/react": "19.3.0",
-    "gpuix-android": "^__GPUIX_ANDROID_VERSION__",
+    "gpuix-mobile": "^__GPUIX_MOBILE_VERSION__",
     "typescript": "7.0.2"
   }
 }

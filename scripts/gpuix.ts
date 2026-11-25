@@ -5,7 +5,17 @@ import { createHash } from 'node:crypto'
 import { homedir } from 'node:os'
 import { existsSync } from 'node:fs'
 import { chmod, cp, lstat, mkdir, readdir, rm, stat } from 'node:fs/promises'
-import { loadGpuixAndroidConfig } from '../android/scripts/config'
+import { legacySharedCacheDir, sharedCacheDir } from './bundler'
+import {
+  loadGpuixConfig,
+  resolveAndroidAppId,
+  resolveConfigFile,
+  resolveIosBuildNumber,
+  resolveIosBundleId,
+  resolveIosDeploymentTarget,
+  resolveIosStatusBarStyle,
+  type GpuixConfig,
+} from './config'
 import { runDevServer } from './dev-server'
 import { runOtaCommand } from './ota'
 
@@ -18,6 +28,7 @@ type ParsedArgs = {
 type AndroidHost = {
   mode: 'ejected' | 'managed'
   androidRoot: string
+  nativeRoot: string
 }
 
 type ZipEntryInfo = {
@@ -30,33 +41,37 @@ type ZipEntryInfo = {
 
 const packageRoot = path.resolve(import.meta.dir, '..')
 const templateAndroidRoot = path.join(packageRoot, 'android')
+const templateNativeRoot = path.join(packageRoot, 'native')
+const templateRuntimeRoot = path.join(packageRoot, 'runtime')
+const templateIosRoot = path.join(packageRoot, 'ios')
 const starterRoot = path.join(packageRoot, 'templates/react-gpui')
-const booleanOptions = new Set(['aab', 'all', 'eject', 'fast', 'help', 'js-only', 'logcat', 'release'])
+const booleanOptions = new Set(['aab', 'all', 'eject', 'fast', 'help', 'js-only', 'logcat', 'no-hbc', 'release'])
 
 function usage(): string {
-  return `gpuix — React + GPUIX native project toolchain (no WebView)
+  return `gpuix — React + GPUIX unified native mobile toolchain (Android & iOS, no WebView)
 
 Usage:
+  gpuix --version
   gpuix create DIR [--app-id ID] [--name APP_NAME] [--version VERSION] [--version-code N] [--eject]
-  gpuix init [--cwd DIR] [--entry FILE] [--app-id ID] [--name APP_NAME] [--eject]
+  gpuix init [--cwd DIR] [--entry FILE] [--app-id ID] [--name APP_NAME] [--version VERSION] [--version-code N] [--eject]
   gpuix eject [--cwd DIR]
   gpuix doctor [--cwd DIR]
   gpuix info [--cwd DIR]
   gpuix dev [ADB_SERIAL] [--cwd DIR] [--port 8081] [--logcat]
-  gpuix build [--cwd DIR] [--release] [--aab] [--fast] [--js-only]
+  gpuix build [android|ios] [--cwd DIR] [--release] [--aab] [--fast] [--js-only] [--no-hbc]
   gpuix install ADB_SERIAL [--cwd DIR] [--release]
-  gpuix run ADB_SERIAL [--cwd DIR] [--release] [--fast] [--js-only]
+  gpuix run [android] ADB_SERIAL [--cwd DIR] [--release] [--fast] [--js-only]
+  gpuix run ios [DEVICE_NAME_OR_UDID] [--cwd DIR] [--device NAME_OR_UDID] [--entry FILE] [--release] [--js-only]
   gpuix bench [ADB_SERIAL] [--cwd DIR] [--release]
   gpuix cache [status|clean] [--cwd DIR] [--all]
-  gpuix ota <keygen|build|verify|serve> [OPTIONS]
+  gpuix ota <keygen|build|verify|chain|proof|locate|serve> [OPTIONS]
 
 Artifacts:
-  debug build  dist/android/<project>-debug.apk
-  release build dist/android/<project>-release.apk
-  --aab       dist/android/<project>-release.aab
+  Android debug   dist/android/<project>-debug.apk
+  Android release dist/android/<project>-release.apk / -release.aab
+  iOS Simulator   dist/ios/<project>.app
 
-The Android host is GPUI + wgpu with standalone Hermes. It does not use
-WebView or React Native's view system.`
+Both hosts render via GPUI + wgpu with standalone Hermes (no WebView / RN UI).`
 }
 
 function fail(message: string): never {
@@ -138,9 +153,9 @@ function packageSlug(projectRoot: string): string {
 async function packageVersion(): Promise<string> {
   try {
     const manifest = JSON.parse(await Bun.file(path.join(packageRoot, 'package.json')).text()) as { version?: unknown }
-    return typeof manifest.version === 'string' && manifest.version.length > 0 ? manifest.version : '0.1.0'
+    return typeof manifest.version === 'string' && manifest.version.length > 0 ? manifest.version : '1.0.0'
   } catch {
-    return '0.1.0'
+    return '1.0.0'
   }
 }
 
@@ -163,18 +178,25 @@ async function run(
 
 function shellCommand(): string {
   if (process.platform !== 'win32') return 'bash'
-  // Git for Windows provides the POSIX shell used by the checked-in Android
-  // scripts. Windows also ships a `bash.exe` alias for WSL, which is not a
-  // reliable fallback when no Linux distribution is installed.
   for (const candidate of ['C:\\Program Files\\Git\\bin\\bash.exe', 'C:\\Program Files\\Git\\usr\\bin\\bash.exe']) {
     if (existsSync(candidate)) return candidate
   }
   return 'bash'
 }
 
-async function capture(command: string, args: string[], cwd = process.cwd()): Promise<{ ok: boolean; output: string }> {
+async function capture(
+  command: string,
+  args: string[],
+  cwd = process.cwd(),
+  envOverrides?: Record<string, string>,
+): Promise<{ ok: boolean; output: string }> {
   try {
-    const child = Bun.spawn([command, ...args], { cwd, stdout: 'pipe', stderr: 'pipe' })
+    const child = Bun.spawn([command, ...args], {
+      cwd,
+      env: envOverrides ? { ...process.env, ...envOverrides } : process.env,
+      stdout: 'pipe',
+      stderr: 'pipe',
+    })
     const [stdout, stderr, exitCode] = await Promise.all([
       new Response(child.stdout).text(),
       new Response(child.stderr).text(),
@@ -221,16 +243,30 @@ function excludedTemplatePath(relativePath: string): boolean {
   ].some((excluded) => normalized === excluded || normalized.startsWith(`${excluded}/`))
 }
 
-async function copyAndroidHost(targetAndroidRoot: string): Promise<void> {
+async function copyAndroidHost(targetProjectRoot: string): Promise<void> {
   if (!(await exists(templateAndroidRoot))) {
     fail(`the packaged Android template is missing at ${templateAndroidRoot}`)
   }
+  const targetAndroidRoot = path.join(targetProjectRoot, 'android')
   await cp(templateAndroidRoot, targetAndroidRoot, {
     recursive: true,
     filter(source) {
       return !excludedTemplatePath(path.relative(templateAndroidRoot, source))
     },
   })
+  const targetNativeRoot = path.join(targetProjectRoot, 'native')
+  if ((await exists(templateNativeRoot)) && !(await exists(targetNativeRoot))) {
+    await cp(templateNativeRoot, targetNativeRoot, {
+      recursive: true,
+      filter(source) {
+        return !excludedTemplatePath(path.relative(templateNativeRoot, source))
+      },
+    })
+  }
+  const targetRuntimeRoot = path.join(targetProjectRoot, 'runtime')
+  if ((await exists(templateRuntimeRoot)) && !(await exists(targetRuntimeRoot))) {
+    await cp(templateRuntimeRoot, targetRuntimeRoot, { recursive: true })
+  }
   await Promise.all([
     chmod(path.join(targetAndroidRoot, 'gradlew'), 0o755),
     chmod(path.join(targetAndroidRoot, 'scripts/build-android.sh'), 0o755),
@@ -243,38 +279,73 @@ async function resolveAndroidHost(projectRoot: string): Promise<AndroidHost> {
   const localAndroidRoot = path.join(projectRoot, 'android')
   const localBuildScript = path.join(localAndroidRoot, 'scripts/build-android.sh')
   if (await exists(localBuildScript)) {
-    return { mode: 'ejected', androidRoot: localAndroidRoot }
+    const localNativeRoot = (await exists(path.join(projectRoot, 'native')))
+      ? path.join(projectRoot, 'native')
+      : (await exists(path.join(localAndroidRoot, 'vendor')))
+        ? localAndroidRoot
+        : templateNativeRoot
+    return { mode: 'ejected', androidRoot: localAndroidRoot, nativeRoot: localNativeRoot }
   }
-  const configPath = path.join(projectRoot, 'gpuix.android.json')
-  if (await exists(configPath)) {
-    return { mode: 'managed', androidRoot: templateAndroidRoot }
+  if (resolveConfigFile(projectRoot) !== null) {
+    return { mode: 'managed', androidRoot: templateAndroidRoot, nativeRoot: templateNativeRoot }
   }
   if (process.env.GPUIX_ENTRYPOINT && process.env.GPUIX_APP_ID) {
-    return { mode: 'managed', androidRoot: templateAndroidRoot }
+    return { mode: 'managed', androidRoot: templateAndroidRoot, nativeRoot: templateNativeRoot }
   }
-  fail(`no gpuix.android.json or android/ host in ${projectRoot}; run gpuix init first`)
+  fail(`no gpuix.config.json (or gpuix.android.json) or android/ host in ${projectRoot}; run gpuix init first`)
 }
 
-function hostEnv(projectRoot: string): Record<string, string> {
+function hostEnv(projectRoot: string, platform: 'android' | 'ios', nativeRoot = templateNativeRoot): Record<string, string> {
   return {
     GPUIX_PROJECT_ROOT: projectRoot,
-    GPUIX_OUT_DIR: path.join(projectRoot, 'dist/android'),
+    GPUIX_OUT_DIR: path.join(projectRoot, `dist/${platform}`),
+    GPUIX_NATIVE_ROOT: nativeRoot,
   }
+}
+
+function buildConfigJson(options: {
+  entrypoint: string
+  appId: string
+  appName: string
+  versionName: string
+  versionCode: number
+}): string {
+  return `${JSON.stringify(
+    {
+      entrypoint: options.entrypoint,
+      appId: options.appId,
+      appName: options.appName,
+      versionName: options.versionName,
+      versionCode: options.versionCode,
+      android: {
+        abis: ['arm64-v8a'],
+      },
+      ios: {
+        bundleId: options.appId,
+        buildNumber: String(options.versionCode),
+        deploymentTarget: '17.0',
+        statusBarStyle: 'light',
+      },
+    },
+    null,
+    2,
+  )}\n`
 }
 
 async function init(parsed: ParsedArgs, projectRoot: string): Promise<void> {
-  const configPath = path.join(projectRoot, 'gpuix.android.json')
+  const existingCfg = resolveConfigFile(projectRoot)
+  const configPath = path.join(projectRoot, 'gpuix.config.json')
   const localAndroidRoot = path.join(projectRoot, 'android')
   const shouldEject = hasFlag(parsed, 'eject')
 
-  if (await exists(configPath)) {
-    fail(`${configPath} already exists; refusing to overwrite it (run gpuix eject if you want a local android/ host)`)
+  if (existingCfg) {
+    fail(`${existingCfg.path} already exists; refusing to overwrite it (run gpuix eject if you want a local android/ host)`)
   }
   if (shouldEject && (await exists(localAndroidRoot))) {
     fail(`${localAndroidRoot} already exists; refusing to overwrite it`)
   }
 
-  const discoveredEntrypoint = option(parsed, 'entry', 'entrypoint') ?? await discoverEntrypoint(projectRoot)
+  const discoveredEntrypoint = option(parsed, 'entry', 'entrypoint') ?? (await discoverEntrypoint(projectRoot))
   if (!discoveredEntrypoint) {
     fail('could not find an entry point; pass --entry path/to/app.tsx')
   }
@@ -284,34 +355,37 @@ async function init(parsed: ParsedArgs, projectRoot: string): Promise<void> {
   }
   const appId = option(parsed, 'app-id') ?? `dev.gpuix.${appIdSuffix(projectRoot)}`
   if (!/^[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)+$/.test(appId)) {
-    fail('--app-id must be a dotted Android package id, for example com.example.myapp')
+    fail('--app-id must be a dotted package id, for example com.example.myapp')
   }
   const appName = (option(parsed, 'name', 'app-name') ?? defaultAppName(projectRoot)).trim()
   if (!appName || /[\r\n\0]/.test(appName)) fail('--name must be a non-empty single-line string')
+  const versionName = (option(parsed, 'version', 'version-name') ?? '1.0.0').trim()
+  if (!versionName || /[\r\n\0]/.test(versionName)) fail('--version must be a non-empty single-line string')
+  const versionCode = Number(option(parsed, 'version-code') ?? '1')
+  if (!Number.isSafeInteger(versionCode) || versionCode < 1) fail('--version-code must be a positive integer')
 
-  await Bun.write(
-    configPath,
-    `${JSON.stringify({ entrypoint, appId, appName, versionName: '0.1.0', versionCode: 1 }, null, 2)}\n`,
-  )
+  await Bun.write(configPath, buildConfigJson({ entrypoint, appId, appName, versionName, versionCode }))
   if (shouldEject) {
-    await copyAndroidHost(localAndroidRoot)
+    await copyAndroidHost(projectRoot)
     process.stdout.write(`Created ejected Android host in ${localAndroidRoot}\nConfig: ${configPath}\n`)
   } else {
-    process.stdout.write(`Initialized managed GPUIX config: ${configPath}\n(Zero-boilerplate mode: run \`gpuix eject\` if you need to customize Java/Gradle/Rust files.)\n`)
+    process.stdout.write(
+      `Initialized managed GPUIX config: ${configPath}\n(Zero-boilerplate mode: run \`gpuix run ios\` or \`gpuix run android <SERIAL>\`; use \`gpuix eject\` only if you need custom Java/Gradle/Rust files.)\n`,
+    )
   }
 }
 
 async function ejectHost(projectRoot: string): Promise<void> {
-  const configPath = path.join(projectRoot, 'gpuix.android.json')
+  const existingCfg = resolveConfigFile(projectRoot)
   const localAndroidRoot = path.join(projectRoot, 'android')
   if (await exists(localAndroidRoot)) {
     fail(`${localAndroidRoot} already exists; refusing to overwrite it`)
   }
-  if (!(await exists(configPath))) {
-    fail(`${configPath} does not exist; run gpuix init first`)
+  if (!existingCfg) {
+    fail(`${path.join(projectRoot, 'gpuix.config.json')} does not exist; run gpuix init first`)
   }
-  await loadGpuixAndroidConfig(projectRoot)
-  await copyAndroidHost(localAndroidRoot)
+  await loadGpuixConfig(projectRoot)
+  await copyAndroidHost(projectRoot)
   process.stdout.write(`Ejected Android host into ${localAndroidRoot}\n`)
 }
 
@@ -324,11 +398,11 @@ async function create(parsed: ParsedArgs): Promise<void> {
 
   const appId = option(parsed, 'app-id') ?? `dev.gpuix.${appIdSuffix(projectRoot)}`
   if (!/^[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)+$/.test(appId)) {
-    fail('--app-id must be a dotted Android package id, for example com.example.myapp')
+    fail('--app-id must be a dotted package id, for example com.example.myapp')
   }
   const appName = (option(parsed, 'name', 'app-name') ?? defaultAppName(projectRoot)).trim()
   if (!appName || /[\r\n\0]/.test(appName)) fail('--name must be a non-empty single-line string')
-  const versionName = (option(parsed, 'version', 'version-name') ?? '0.1.0').trim()
+  const versionName = (option(parsed, 'version', 'version-name') ?? '1.0.0').trim()
   if (!versionName || /[\r\n\0]/.test(versionName)) fail('--version must be a non-empty single-line string')
   const versionCode = Number(option(parsed, 'version-code') ?? '1')
   if (!Number.isSafeInteger(versionCode) || versionCode < 1) fail('--version-code must be a positive integer')
@@ -336,32 +410,28 @@ async function create(parsed: ParsedArgs): Promise<void> {
 
   await mkdir(projectRoot, { recursive: true })
   await cp(starterRoot, projectRoot, { recursive: true })
+  const pkgVersion = await packageVersion()
   const manifestPath = path.join(projectRoot, 'package.json')
   const manifest = (await Bun.file(manifestPath).text())
     .replaceAll('__PROJECT_NAME__', packageSlug(projectRoot))
-    .replaceAll('__GPUX_BASE_UI_VERSION__', '0.1.0')
-    .replaceAll('__GPUIX_ANDROID_VERSION__', await packageVersion())
+    .replaceAll('__GPUX_BASE_UI_VERSION__', '1.0.0')
+    .replaceAll('__GPUIX_MOBILE_VERSION__', pkgVersion)
+    .replaceAll('__GPUIX_ANDROID_VERSION__', pkgVersion)
   await Bun.write(manifestPath, manifest)
 
-  const configPath = path.join(projectRoot, 'gpuix.android.json')
+  const configPath = path.join(projectRoot, 'gpuix.config.json')
   await Bun.write(
     configPath,
-    `${JSON.stringify({ entrypoint: 'src/main.tsx', appId, appName, versionName, versionCode }, null, 2)}\n`,
+    buildConfigJson({ entrypoint: 'src/main.tsx', appId, appName, versionName, versionCode }),
   )
   const shouldEject = hasFlag(parsed, 'eject')
   if (shouldEject) {
-    await copyAndroidHost(path.join(projectRoot, 'android'))
+    await copyAndroidHost(projectRoot)
   }
   process.stdout.write(`Created GPUIX project in ${projectRoot} (${shouldEject ? 'ejected' : 'managed'} host)\n`)
-  process.stdout.write('Next:\n  cd ' + projectRoot + '\n  bun install\n  bun run gpuix:doctor\n  bun run gpuix:run -- ADB_SERIAL\n')
-}
-
-function sharedCacheRoot(): string {
-  const custom = process.env.GPUIX_CACHE_DIR
-  if (custom && custom.trim().length > 0) return path.resolve(custom)
-  const xdg = process.env.XDG_CACHE_HOME
-  const base = xdg && xdg.trim().length > 0 ? xdg : path.join(homedir(), '.cache')
-  return path.join(base, 'gpuix-android')
+  process.stdout.write(
+    `Next:\n  cd ${projectRoot}\n  bun install\n  bun run gpuix:doctor\n  bun run gpuix:run -- <ADB_SERIAL>\n  bun run gpuix -- run ios\n`,
+  )
 }
 
 async function dirSizeBytes(targetPath: string): Promise<number> {
@@ -395,16 +465,23 @@ function formatBytes(bytes: number): string {
 
 function redundantLocalTargetDirs(projectRoot: string): string[] {
   const androidRoot = path.join(projectRoot, 'android')
+  const nativeRoot = path.join(projectRoot, 'native')
   return [
     path.join(androidRoot, 'rust/target'),
+    path.join(nativeRoot, 'vendor/gpuix-native/target'),
+    path.join(nativeRoot, 'vendor/gpui-mobile/target'),
     path.join(androidRoot, 'vendor/gpuix-native/target'),
     path.join(androidRoot, 'vendor/gpui-mobile/target'),
     path.join(androidRoot, 'target/aarch64-linux-android/debug'),
+    path.join(projectRoot, 'ios/target'),
   ]
 }
 
 function resolveSdkAndNdk(): { sdkRoot: string; ndkRoot: string } {
-  const sdkRoot = process.env.ANDROID_HOME || process.env.ANDROID_SDK_ROOT || path.join(homedir(), process.platform === 'win32' ? 'AppData/Local/Android/Sdk' : 'Library/Android/sdk')
+  const sdkRoot =
+    process.env.ANDROID_HOME ||
+    process.env.ANDROID_SDK_ROOT ||
+    path.join(homedir(), process.platform === 'win32' ? 'AppData/Local/Android/Sdk' : 'Library/Android/sdk')
   const ndkRoot = process.env.ANDROID_NDK_ROOT || path.join(sdkRoot, 'ndk/30.0.16248370')
   return { sdkRoot, ndkRoot }
 }
@@ -416,6 +493,7 @@ function ndkHostTag(): string {
 }
 
 async function doctor(projectRoot: string): Promise<void> {
+  const cliVer = await packageVersion()
   const checks: Array<[string, string, string[]]> = [
     ['Bun', 'bun', ['--version']],
     ['Rust', 'rustc', ['--version']],
@@ -424,7 +502,7 @@ async function doctor(projectRoot: string): Promise<void> {
     ['Java', 'java', ['-version']],
   ]
   let failures = 0
-  process.stdout.write(`GPUIX doctor · ${projectRoot}\n`)
+  process.stdout.write(`GPUIX Mobile doctor v${cliVer} · ${projectRoot}\n`)
   for (const [label, command, args] of checks) {
     const result = await capture(command, args, projectRoot)
     if (result.ok) {
@@ -441,26 +519,49 @@ async function doctor(projectRoot: string): Promise<void> {
   const ndkAvailable = await exists(ndkRoot)
   if (!ndkAvailable) failures += 1
   process.stdout.write(`${ndkAvailable ? '✓' : '✗'} Android NDK: ${ndkRoot}\n`)
-  const cacheRoot = sharedCacheRoot()
+
+  if (process.platform === 'darwin') {
+    const devDir = process.env.DEVELOPER_DIR || (existsSync('/Applications/Xcode.app/Contents/Developer') ? '/Applications/Xcode.app/Contents/Developer' : '')
+    const macEnv = devDir ? { DEVELOPER_DIR: devDir } : undefined
+    const xcode = await capture('xcodebuild', ['-version'], projectRoot, macEnv)
+    const simctl = await capture('xcrun', ['simctl', 'help'], projectRoot, macEnv)
+    const rustTargets = await capture('rustup', ['+1.100.0', 'target', 'list', '--installed'], projectRoot)
+    const hasIosTarget = rustTargets.ok && rustTargets.output.split(/\r?\n/).includes('aarch64-apple-ios-sim')
+    process.stdout.write(`${xcode.ok ? '✓' : '!'} iOS Xcode: ${xcode.ok ? xcode.output.replace('\n', ' · ') : 'not active (set DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer)'}\n`)
+    process.stdout.write(`${simctl.ok ? '✓' : '!'} iOS Simulator (simctl): ${simctl.ok ? 'ready' : 'unavailable'}\n`)
+    process.stdout.write(`${hasIosTarget ? '✓' : '!'} Rust target (aarch64-apple-ios-sim): ${hasIosTarget ? 'installed' : 'missing (run rustup +1.100.0 target add aarch64-apple-ios-sim)'}\n`)
+  }
+
+  const cacheRoot = sharedCacheDir()
   if (process.env.GPUIX_SHARED_CACHE === '0') {
     process.stdout.write('! shared cache: disabled (GPUIX_SHARED_CACHE=0)\n')
   } else {
     const cacheBytes = await dirSizeBytes(cacheRoot)
     process.stdout.write(`✓ shared cache: ${cacheRoot} (${formatBytes(cacheBytes)})\n`)
+    const legacy = legacySharedCacheDir()
+    if (legacy !== cacheRoot && (await exists(legacy))) {
+      const st = await lstat(legacy)
+      if (st.isSymbolicLink()) {
+        process.stdout.write(`✓ legacy cache alias: ${legacy} -> ${cacheRoot}\n`)
+      }
+    }
   }
+
   const hasLocalAndroid = await exists(path.join(projectRoot, 'android/scripts/build-android.sh'))
-  const hasConfig = await exists(path.join(projectRoot, 'gpuix.android.json'))
-  if (hasLocalAndroid || hasConfig) {
-    process.stdout.write(`✓ host: ${hasLocalAndroid ? 'ejected (local android/)' : `managed (${templateAndroidRoot})`}\n`)
+  const existingCfg = resolveConfigFile(projectRoot)
+  if (hasLocalAndroid || existingCfg) {
+    process.stdout.write(`✓ host: ${hasLocalAndroid ? 'ejected (local android/)' : `managed (${packageRoot})`}\n`)
     try {
-      const config = await loadGpuixAndroidConfig(projectRoot)
-      process.stdout.write(`✓ config: ${config.appId} · ${config.entrypoint} · v${config.versionName} (${config.versionCode})\n`)
+      const config = await loadGpuixConfig(projectRoot)
+      process.stdout.write(
+        `✓ config (${existingCfg?.filename ?? 'env'}): ${config.appName} · Android=${resolveAndroidAppId(config)} · iOS=${resolveIosBundleId(config)} · v${config.versionName} (${config.versionCode})\n`,
+      )
     } catch (error) {
       failures += 1
       process.stdout.write(`✗ config: ${error instanceof Error ? error.message : String(error)}\n`)
     }
   } else {
-    process.stdout.write('! config: no Android config yet; run gpuix init\n')
+    process.stdout.write('! config: no gpuix.config.json yet; run gpuix init\n')
   }
   const adb = await capture('adb', ['devices'], projectRoot)
   const connected = adb.output.split('\n').some((line) => /\tdevice$/.test(line))
@@ -470,18 +571,30 @@ async function doctor(projectRoot: string): Promise<void> {
 
 async function info(projectRoot: string): Promise<void> {
   const host = await resolveAndroidHost(projectRoot)
-  const config = await loadGpuixAndroidConfig(projectRoot)
+  const config = await loadGpuixConfig(projectRoot)
+  const cfgFile = resolveConfigFile(projectRoot)?.filename ?? 'env'
   const artifactStem = packageSlug(projectRoot)
-  process.stdout.write(JSON.stringify({
+  const cliVersion = await packageVersion()
+  const appInfoPayload = {
+    cliVersion,
     projectRoot,
+    configFile: cfgFile,
     hostMode: host.mode,
     androidRoot: host.androidRoot,
+    iosRoot: templateIosRoot,
+    nativeRoot: host.nativeRoot,
     entrypoint: config.entrypoint,
-    appId: config.appId,
+    appId: resolveAndroidAppId(config),
     appName: config.appName,
     versionName: config.versionName,
     versionCode: config.versionCode,
-    renderer: 'GPUI + wgpu',
+    ios: {
+      bundleId: resolveIosBundleId(config),
+      buildNumber: resolveIosBuildNumber(config),
+      deploymentTarget: resolveIosDeploymentTarget(config),
+      statusBarStyle: resolveIosStatusBarStyle(config),
+    },
+    renderer: 'GPUI + wgpu (Vulkan / Metal)',
     javascript: 'standalone Hermes',
     webView: false,
     reactNativeViews: false,
@@ -489,11 +602,34 @@ async function info(projectRoot: string): Promise<void> {
       debugApk: path.join(projectRoot, `dist/android/${artifactStem}-debug.apk`),
       releaseApk: path.join(projectRoot, `dist/android/${artifactStem}-release.apk`),
       releaseAab: path.join(projectRoot, `dist/android/${artifactStem}-release.aab`),
+      iosSimApp: path.join(projectRoot, `dist/ios/${artifactStem}.app`),
     },
-  }, null, 2) + '\n')
+  }
+  process.stdout.write(`${JSON.stringify(appInfoPayload, null, 2)}\n`)
+}
+
+function splitPlatformTarget(positional: string[]): { target: 'android' | 'ios'; rest: string[] } {
+  if (positional[0] === 'ios') return { target: 'ios', rest: positional.slice(1) }
+  if (positional[0] === 'android') return { target: 'android', rest: positional.slice(1) }
+  return { target: 'android', rest: positional }
 }
 
 async function build(parsed: ParsedArgs, projectRoot: string): Promise<void> {
+  const { target, rest } = splitPlatformTarget(parsed.positional)
+  if (rest.length > 0) fail('build does not accept extra positional arguments')
+
+  if (target === 'ios') {
+    const args: string[] = ['--project', projectRoot]
+    if (hasFlag(parsed, 'release')) args.push('--release')
+    if (hasFlag(parsed, 'js-only')) args.push('--js-only')
+    if (hasFlag(parsed, 'no-hbc')) args.push('--no-hbc')
+    const entry = option(parsed, 'entry')
+    if (entry) args.push('--entry', entry)
+    const scriptPath = path.join(templateIosRoot, 'scripts/build-ios.sh')
+    await run(shellCommand(), [scriptPath, ...args], projectRoot, hostEnv(projectRoot, 'ios'))
+    return
+  }
+
   const host = await resolveAndroidHost(projectRoot)
   const args: string[] = []
   if (hasFlag(parsed, 'release')) args.push('--release')
@@ -501,7 +637,7 @@ async function build(parsed: ParsedArgs, projectRoot: string): Promise<void> {
   if (hasFlag(parsed, 'fast')) args.push('--fast')
   if (hasFlag(parsed, 'js-only')) args.push('--js-only')
   const scriptPath = path.join(host.androidRoot, 'scripts/build-android.sh')
-  await run(shellCommand(), [scriptPath, ...args], projectRoot, hostEnv(projectRoot))
+  await run(shellCommand(), [scriptPath, ...args], projectRoot, hostEnv(projectRoot, 'android', host.nativeRoot))
 }
 
 async function install(parsed: ParsedArgs, projectRoot: string): Promise<void> {
@@ -514,7 +650,44 @@ async function install(parsed: ParsedArgs, projectRoot: string): Promise<void> {
     shellCommand(),
     [scriptPath, serial, ...(hasFlag(parsed, 'release') ? ['--release'] : [])],
     projectRoot,
-    hostEnv(projectRoot),
+    hostEnv(projectRoot, 'android', host.nativeRoot),
+  )
+}
+
+async function runTarget(parsed: ParsedArgs, projectRoot: string): Promise<void> {
+  const { target, rest } = splitPlatformTarget(parsed.positional)
+  if (target === 'ios') {
+    if (rest.length > 1) fail('run ios accepts at most one simulator name or UDID')
+    const args: string[] = ['--project', projectRoot]
+    const device = option(parsed, 'device') ?? rest[0]
+    if (device) args.push('--device', device)
+    const entry = option(parsed, 'entry')
+    if (entry) args.push('--entry', entry)
+    if (hasFlag(parsed, 'release')) args.push('--release')
+    if (hasFlag(parsed, 'js-only')) args.push('--js-only')
+    if (hasFlag(parsed, 'no-hbc')) args.push('--no-hbc')
+    const scriptPath = path.join(templateIosRoot, 'scripts/run-ios-sim.sh')
+    await run(shellCommand(), [scriptPath, ...args], projectRoot, hostEnv(projectRoot, 'ios'))
+    return
+  }
+
+  if (rest.length !== 1) fail('run [android] needs exactly one ADB serial (or use `gpuix run ios`)')
+  const host = await resolveAndroidHost(projectRoot)
+  const buildArgs: string[] = []
+  if (hasFlag(parsed, 'release')) buildArgs.push('--release')
+  if (hasFlag(parsed, 'fast')) buildArgs.push('--fast')
+  if (hasFlag(parsed, 'js-only')) buildArgs.push('--js-only')
+  await run(
+    shellCommand(),
+    [path.join(host.androidRoot, 'scripts/build-android.sh'), ...buildArgs],
+    projectRoot,
+    hostEnv(projectRoot, 'android', host.nativeRoot),
+  )
+  await run(
+    shellCommand(),
+    [path.join(host.androidRoot, 'scripts/install-android.sh'), rest[0], ...(hasFlag(parsed, 'release') ? ['--release'] : [])],
+    projectRoot,
+    hostEnv(projectRoot, 'android', host.nativeRoot),
   )
 }
 
@@ -640,7 +813,8 @@ async function resolveBenchSerial(explicit?: string): Promise<string | undefined
 async function bench(parsed: ParsedArgs, projectRoot: string): Promise<void> {
   if (parsed.positional.length > 1) fail('bench accepts at most one ADB serial')
   const host = await resolveAndroidHost(projectRoot)
-  const config = await loadGpuixAndroidConfig(projectRoot)
+  const config = await loadGpuixConfig(projectRoot)
+  const appId = resolveAndroidAppId(config)
   const variant = hasFlag(parsed, 'release') ? 'release' : 'debug'
   const apkPath = path.join(projectRoot, `dist/android/${packageSlug(projectRoot)}-${variant}.apk`)
   if (!(await exists(apkPath))) {
@@ -672,7 +846,7 @@ async function bench(parsed: ParsedArgs, projectRoot: string): Promise<void> {
     }
   }
 
-  process.stdout.write(`GPUIX Benchmark · ${config.appName} (${config.appId}, ${variant})\n`)
+  process.stdout.write(`GPUIX Benchmark · ${config.appName} v${config.versionName} (${appId}, ${variant})\n`)
   process.stdout.write(`APK: ${apkPath}\n`)
   process.stdout.write(`  Total size : ${formatBytes(apkBuffer.length)} (${apkBuffer.length} bytes, sha256=${apkSha256.slice(0, 12)})\n`)
   process.stdout.write(`  Native .so : ${formatBytes(nativeBytes)} (${nativeEntries.map((e) => `${e.name.replace(/^lib\//, '')}=${formatBytes(e.compressedSize)}`).join(', ') || 'none'})\n`)
@@ -732,10 +906,10 @@ async function bench(parsed: ParsedArgs, projectRoot: string): Promise<void> {
   }
 
   process.stdout.write(`Device (${serial}):\n`)
-  const pmPath = await capture('adb', ['-s', serial, 'shell', 'pm', 'path', config.appId])
+  const pmPath = await capture('adb', ['-s', serial, 'shell', 'pm', 'path', appId])
   const remoteApk = pmPath.output.split(/\r?\n/).find((l) => l.startsWith('package:'))?.slice('package:'.length).trim()
   if (!pmPath.ok || !remoteApk) {
-    process.stdout.write(`  ! Installed APK: ${config.appId} is not installed on ${serial}\n`)
+    process.stdout.write(`  ! Installed APK: ${appId} is not installed on ${serial}\n`)
   } else {
     const remoteHashRes = await capture('adb', ['-s', serial, 'shell', 'sha256sum', remoteApk])
     const remoteHash = remoteHashRes.output.split(/\s+/)[0] ?? ''
@@ -747,8 +921,8 @@ async function bench(parsed: ParsedArgs, projectRoot: string): Promise<void> {
   }
 
   const sfList = await capture('adb', ['-s', serial, 'shell', 'dumpsys', 'SurfaceFlinger', '--list'])
-  const candidates = extractCandidateSurfaceLayers(sfList.ok ? sfList.output : '', config.appId)
-  let chosenLayer = candidates[0] ?? `SurfaceView[${config.appId}/dev.gpui.mobile.GpuiActivity]#0`
+  const candidates = extractCandidateSurfaceLayers(sfList.ok ? sfList.output : '', appId)
+  let chosenLayer = candidates[0] ?? `SurfaceView[${appId}/dev.gpui.mobile.GpuiActivity]#0`
   let refreshNs = 0
   let frameIntervalsMs: number[] = []
   for (const candidate of candidates) {
@@ -780,7 +954,7 @@ async function cacheCommand(parsed: ParsedArgs, projectRoot: string): Promise<vo
   if (parsed.positional.length > 1 || (action !== 'status' && action !== 'clean')) {
     fail('usage: gpuix cache [status|clean] [--cwd DIR] [--all]')
   }
-  const cacheRoot = sharedCacheRoot()
+  const cacheRoot = sharedCacheDir()
   if (action === 'status') {
     if (hasFlag(parsed, 'all')) fail('--all is only valid with `gpuix cache clean`')
     const buckets = ['deps', 'hermes', 'cargo-target', 'native'] as const
@@ -805,12 +979,12 @@ async function cacheCommand(parsed: ParsedArgs, projectRoot: string): Promise<vo
         redundant.push({ label: path.relative(projectRoot, localTarget), size: localTargetSize })
       }
       if (redundant.length > 0) {
-        process.stdout.write(`Local Android targets in ${projectRoot}:\n`)
+        process.stdout.write(`Local build targets in ${projectRoot}:\n`)
         for (const item of redundant) {
           process.stdout.write(`  - ${item.label}: ${formatBytes(item.size)}\n`)
         }
       } else {
-        process.stdout.write(`Local Android workspace (${projectRoot}): clean (no split targets)\n`)
+        process.stdout.write(`Local workspace (${projectRoot}): clean (no split targets)\n`)
       }
     }
     return
@@ -877,18 +1051,30 @@ async function main(): Promise<void> {
     process.stdout.write(`${usage()}\n`)
     return
   }
+  if (command === 'version' || command === '--version' || command === '-v') {
+    process.stdout.write(`gpuix-mobile v${await packageVersion()}\n`)
+    return
+  }
   if (command === 'ota') {
     await runOtaCommand(rawArgs, process.cwd())
     return
   }
   const parsed = parseArgs(rawArgs)
+  if (hasFlag(parsed, 'help')) {
+    process.stdout.write(`${usage()}\n`)
+    return
+  }
   const projectRoot = path.resolve(option(parsed, 'cwd') ?? process.cwd())
   if (command === 'create') {
     await create(parsed)
     return
   }
   if (command === 'init') {
-    assertKnownOptions(parsed, ['cwd', 'entry', 'entrypoint', 'app-id', 'name', 'app-name'], ['eject'])
+    assertKnownOptions(
+      parsed,
+      ['cwd', 'entry', 'entrypoint', 'app-id', 'name', 'app-name', 'version', 'version-name', 'version-code'],
+      ['eject'],
+    )
     if (parsed.positional.length > 0) fail('init does not accept positional arguments')
     await init(parsed, projectRoot)
     return
@@ -912,8 +1098,7 @@ async function main(): Promise<void> {
     return
   }
   if (command === 'build') {
-    assertKnownOptions(parsed, ['cwd'], ['release', 'aab', 'fast', 'js-only'])
-    if (parsed.positional.length > 0) fail('build does not accept positional arguments')
+    assertKnownOptions(parsed, ['cwd', 'entry'], ['release', 'aab', 'fast', 'js-only', 'no-hbc'])
     await build(parsed, projectRoot)
     return
   }
@@ -923,10 +1108,8 @@ async function main(): Promise<void> {
     return
   }
   if (command === 'run') {
-    assertKnownOptions(parsed, ['cwd'], ['release', 'fast', 'js-only'])
-    if (parsed.positional.length !== 1) fail('run needs exactly one ADB serial')
-    await build(parsed, projectRoot)
-    await install(parsed, projectRoot)
+    assertKnownOptions(parsed, ['cwd', 'device', 'entry'], ['release', 'fast', 'js-only', 'no-hbc'])
+    await runTarget(parsed, projectRoot)
     return
   }
   if (command === 'bench') {

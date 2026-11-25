@@ -5,36 +5,41 @@
 ## Quick start
 
 ```sh
-bunx gpuix-android create my-app \
+bunx gpuix-mobile create my-app \
   --app-id com.example.myapp \
   --name "My App" \
-  --version 0.1.0 \
+  --version 1.0.0 \
   --version-code 1
 
 cd my-app
 bun install
 bun run gpuix:doctor
 bun run gpuix:run -- <ADB_SERIAL>
+bun run gpuix -- run ios
 ```
 
 For an existing GPUIX app:
 
 ```sh
-bunx gpuix-android init \
+bunx gpuix-mobile init \
   --entry src/main.tsx \
   --app-id com.example.myapp \
-  --name "My App"
+  --name "My App" \
+  --version 1.0.0
 ```
 
 ## Artifact commands
 
 | Command | Artifact |
 | --- | --- |
-| `gpuix build` | `dist/android/<project>-debug.apk` |
-| `gpuix build --release` | `dist/android/<project>-release.apk` |
-| `gpuix build --aab` | `dist/android/<project>-release.aab` |
+| `gpuix build [android]` | `dist/android/<project>-debug.apk` |
+| `gpuix build android --release` | `dist/android/<project>-release.apk` |
+| `gpuix build android --aab` | `dist/android/<project>-release.aab` |
+| `gpuix build ios` | `dist/ios/<project>.app` |
 | `gpuix install SERIAL` | Install and launch an existing debug APK |
-| `gpuix run SERIAL` | Build, install and launch in one command |
+| `gpuix run [android] SERIAL` | Build, install and launch in one command |
+| `gpuix run ios [UDID]` | Build, install and launch on iOS Simulator |
+| `gpuix ota chain\|proof\|locate` | Inspect release hash chains and RFC 6962 Merkle proofs |
 
 The device serial is always explicit. The CLI never clears application data,
 changes device refresh settings, creates signing keys or uploads a release.
@@ -60,16 +65,15 @@ patterns:
 - [Flutter iOS deployment](https://docs.flutter.dev/deployment/ios) keeps Xcode
   archives, IPA export, build numbers and App Store upload as distinct stages.
 
-`gpuix-android` adopts those delivery boundaries while retaining its own
+`gpuix-mobile` adopts those delivery boundaries while retaining its own
 GPUI/wgpu renderer and standalone Hermes runtime.
 
 ## Current support
 
-- Android API 31+
-- arm64-v8a
-- Debug APK, local release APK, AAB and ADB install/run
-- Android safe-area, navigation-bar, display-cutout and IME insets
-- Adaptive interaction/idle frame-rate requests
+- Android API 31+ (`arm64-v8a`), debug APK, local release APK, AAB and ADB install/run
+- iOS Simulator (`arm64-apple-ios-sim`), templated `Info.plist`, Metal surface & `simctl` install/run
+- Android/iOS safe-area insets and unified `gpuix.config.json` (backward-compatible with `gpuix.android.json`)
+- Adaptive interaction/idle frame-rate requests on Android
+- OTA ECDSA P-256 signing, release hash chains, and chunk/chain RFC 6962 Merkle proofs
 
-iOS, macOS, production signing, store upload and automated rollout are not
-claimed as completed features.
+macOS desktop packaging, Apple App Store / Play Store production signing, store upload and automated rollout remain separate external steps.

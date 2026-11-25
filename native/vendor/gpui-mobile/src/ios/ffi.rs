@@ -102,12 +102,12 @@ pub extern "C" fn gpui_ios_get_window() -> *mut c_void {
         unsafe {
             let windows = &*wrapper.0.get();
             if let Some(&window) = windows.last() {
-                log::info!("GPUI iOS: Returning window {:p}", window);
+                log::trace!("GPUI iOS: Returning window {:p}", window);
                 return window as *mut c_void;
             }
         }
     }
-    log::warn!("GPUI iOS: No windows registered");
+    log::trace!("GPUI iOS: No windows registered");
     std::ptr::null_mut()
 }
 
@@ -328,6 +328,17 @@ pub extern "C" fn gpui_ios_show_keyboard(window_ptr: *mut c_void) {
 
     let window = unsafe { &*(window_ptr as *const super::window::IosWindow) };
     window.show_keyboard_with_type(crate::KeyboardType::Default);
+}
+
+/// Update the iOS status bar foreground content style (`0 = dark`, `1 = light`).
+#[unsafe(no_mangle)]
+pub extern "C" fn gpui_ios_set_status_bar_style(style: i32) {
+    let resolved = if style == 0 {
+        crate::StatusBarContentStyle::Dark
+    } else {
+        crate::StatusBarContentStyle::Light
+    };
+    super::window::set_status_bar_style(resolved);
 }
 
 /// Hide the software keyboard.

@@ -18,7 +18,7 @@ out_dir="${GPUIX_OUT_DIR:-$project_root/dist/android}"
 artifact_stem="$(basename "$project_root" | tr -cs 'A-Za-z0-9._-' '-')"
 artifact_stem="${artifact_stem#-}"
 artifact_stem="${artifact_stem%-}"
-artifact_stem="${artifact_stem:-gpuix-android}"
+artifact_stem="${artifact_stem:-gpuix-mobile}"
 apk_path="$out_dir/$artifact_stem-$variant.apk"
 [[ -f "$apk_path" ]] || { echo "Build the Android APK first." >&2; exit 1; }
 app_id="$(bun "$android_root/scripts/config.ts" --field appId --project "$project_root")"

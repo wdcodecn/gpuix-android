@@ -1,6 +1,6 @@
-# GPUIX Android 生产级 OTA 热更新指南
+# GPUIX Mobile 生产级 OTA 热更新指南
 
-GPUIX Android 内置了零第三方托管锁定、纯静态文件驱动的生产级 OTA（Over-The-Air）热更新能力。业务修改 JS / TSX 后，无需重新打包或重新安装 APK，即可通过 GitHub Releases / Cloudflare R2 / S3 / OSS / Nginx 或本地调试服务把新版本 Hermes 字节码（`.hbc`）安全推送到真机，并支持同进程热切换、冷重启生效与 Crash-Loop 自动回滚。
+GPUIX Mobile 内置了零第三方托管锁定、纯静态文件驱动的生产级 OTA（Over-The-Air）热更新能力，并提供**版本号关联、分块 RFC 6962 Merkle Tree、发布哈希链（Hash Chain）与防篡改包含证明**。业务修改 JS / TSX 后，无需重新打包或重新安装原生应用，即可把新版本 Hermes 字节码（`.hbc`）安全推送到端上，并支持同进程热切换、冷重启生效与 Crash-Loop 自动回滚。
 
 ---
 
@@ -9,19 +9,22 @@ GPUIX Android 内置了零第三方托管锁定、纯静态文件驱动的生产
 ```text
 开发者机器 / CI
   ├── gpuix ota keygen             生成 ECDSA P-256 签名密钥对
-  ├── gpuix ota build              产出 app.hbc + manifest.json（含 SHA-256 与 ECDSA 签名）
-  ├── gpuix ota verify             校验产物哈希、HBC 魔数与签名
+  ├── gpuix ota build              产出 app.hbc + merkle.json + manifest.json + chain.json（ECDSA v2 签名）
+  ├── gpuix ota verify             校验清单签名、分块 Merkle Root 与哈希链连续性
+  ├── gpuix ota chain [--verify]   校验整条发布哈希链与 Chain Merkle Root
+  ├── gpuix ota proof <QUERY>      导出单版本在发布链中的包含证明，或 --chunk N 的分块 Merkle 证明
+  ├── gpuix ota locate <QUERY>     通过 releaseId / v1.1.1 / #索引 / SHA-256 前缀定位历史版本与产物路径
   └── 上传到任意静态对象存储 / CDN / GitHub Releases（或本地 gpuix ota serve）
                 │
                 ▼ HTTPS (Release 强制 HTTPS)
-Android 原生端
-  ├── GpuiOtaManager.java          流式下载 -> 32 MiB 限制 -> SHA-256 -> SHA256withECDSA 验签
+移动端原生层
+  ├── GpuiOtaManager.java          流式下载 -> 32 MiB 限制 -> SHA-256 -> SHA256withECDSA（兼容 v1/v2 清单载荷）
   │     └── filesDir/gpuix_ota/state.kv（与 Rust 共用原子状态机）
   ├── android/rust/src/lib.rs & ota.rs
   │     ├── 冷启校验 baseline 三元组（versionCode + runtimeVersion + embeddedBuildId）
   │     ├── Crash-Loop Guard（未确认启动失败 >= 2 次自动回滚 prev / embedded）
   │     └── nativeTriggerHotApply / nativeTriggerHotRollback
-  └── android/hermes/runner.cpp
+  └── native/hermes/runner.cpp
         └── __gpuixHotCleanup() -> 清理定时器/rAF -> 持久化内存运行新 .hbc
 ```
 
@@ -37,16 +40,16 @@ gpuix ota keygen --out .gpuix-ota-keys
 
 产物包含：
 - `.gpuix-ota-keys/ota-private.pem`：私钥（仅用于 CI/发版机签名，**严禁提交进 Git**）。
-- `.gpuix-ota-keys/ota-public.b64`：SPKI Base64 公钥，写入 `gpuix.android.json`。
+- `.gpuix-ota-keys/ota-public.b64`：SPKI Base64 公钥，写入 `gpuix.config.json`（向下兼容 `gpuix.android.json`）。
 
-### 2. 在 `gpuix.android.json` 中启用 OTA 配置
+### 2. 在 `gpuix.config.json` 中启用 OTA 配置
 
 ```json
 {
   "entrypoint": "src/main.tsx",
   "appId": "com.example.myapp",
   "appName": "My App",
-  "versionName": "0.1.0",
+  "versionName": "1.0.0",
   "versionCode": 1,
   "ota": {
     "manifestUrl": "https://cdn.example.com/myapp/production/manifest.json",
@@ -61,15 +64,15 @@ gpuix ota keygen --out .gpuix-ota-keys
 配置说明：
 - `manifestUrl`：远端 `manifest.json` 地址；Release 包强制 `https://`，Debug 包允许 `http://127.0.0.1` 配合 `adb reverse` 联调。
 - `channel`：发布通道名（默认 `"production"`，匹配 `^[A-Za-z0-9._-]{1,64}$`）。
-- `runtimeVersion`：原生二进制兼容版本号（默认等于 `String(versionCode)`）。当原生 Rust/Java/ABI 或 Bridge API 发生不兼容变更时，务必递增 `runtimeVersion`；旧版 APK 会安全跳过不匹配的 OTA 包。
+- `runtimeVersion`：原生二进制兼容版本号（默认等于 `String(versionCode)`）。当原生 Rust/Java/ABI 或 Bridge API 发生不兼容变更时，务必递增 `runtimeVersion`；旧版包会安全跳过不匹配的 OTA 包。
 - `publicKey`：可选 ECDSA P-256 SPKI 公钥（支持 Base64 或 PEM）；配置后，客户端将强制校验 `bundle.signature` 与 `manifestSignature`。
 - `checkOnLaunch`：
   - `"manual"`（默认）：正常启动由业务代码调用 `gpuix.ota.check()` 触发；但当底座检测到连续早崩救援（`bootCrashStreak >= 2`）时，即使设为 `"manual"`，Native 底座仍会抢先尝试远端救援拉包；
   - `"background"`：Native 启动阶段及/或应用首帧挂载后静默检查并下载为 `staged`，下次冷启无缝生效（`mandatory: true` 仍会立即热切换）；
   - `"immediate"`：启动检查到新版本后，下载并立即热切换生效。
-- 声明式权限裁剪（`gpuix.android.json -> permissions`）：可选字符串数组（如 `["CAMERA", "VIBRATE"]`）。配置后，`android/scripts/config.ts` 会在 `android/.build/AndroidManifest.xml` 中自动生成裁剪后的权限清单并始终保留 `INTERNET`；未配置时保留默认全量底座权限。
+- 声明式权限裁剪（`gpuix.config.json -> android.permissions` 或顶层 `permissions`）：可选字符串数组（如 `["CAMERA", "VIBRATE"]`）。配置后，`scripts/config.ts` 会在 `android/.build/AndroidManifest.xml` 中自动生成裁剪后的权限清单并始终保留 `INTERNET`；未配置时保留默认全量底座权限。
 
-### 3. 构建并发布 OTA 包（免重装 APK）
+### 3. 构建 OTA 发布、哈希链与 Merkle 证明
 
 修改完页面代码后，执行：
 
@@ -77,15 +80,26 @@ gpuix ota keygen --out .gpuix-ota-keys
 gpuix ota build \
   --cwd . \
   --out dist/ota \
+  --platform all \
+  --version 1.1.1 \
   --seq 2001 \
   --base-url https://cdn.example.com/myapp/production \
   --private-key .gpuix-ota-keys/ota-private.pem \
   --notes "Fix layout and update copy"
 
 gpuix ota verify dist/ota/manifest.json --public-key .gpuix-ota-keys/ota-public.b64
+gpuix ota chain --dir dist/ota --verify
+gpuix ota locate v1.1.1 --dir dist/ota
+gpuix ota proof v1.1.1 --dir dist/ota
+gpuix ota proof v1.1.1 --dir dist/ota --chunk 0
 ```
 
-如需在紧急故障时从服务端签发“熔断回退至 APK 内置包”指令，可执行：
+每次 `gpuix ota build` 均会：
+1. 将 `.hbc`/`.js` 按 `--chunk-size`（默认 `65536` 字节）切块并构造 RFC 6962 `SHA-256` Merkle Tree，输出 `bundles/<releaseId>/merkle.json`。
+2. 以 `prevReleaseHash` 链接上一版 `releaseHash`（首版为 64 个 `0`），把 `versionName`、`runtimeVersion`、`manifestSeq`、`bundleSha256` 与 `merkleRoot` 共同摘要成当前 `releaseHash`，追加写入 `dist/ota/chain.json` 并刷新全链 `chainMerkleRoot`。
+3. 将 `integrity`（含 `merkleRoot`、`prevReleaseHash`、`releaseHash`、`chainIndex`、`chainMerkleRoot`）写入 `manifest.json`，使用 `gpuix-ota-manifest-v2` 规范载荷执行 ECDSA P-256 签名。
+
+如需在紧急故障时从服务端签发“熔断回退至内置包”指令，可执行：
 
 ```sh
 gpuix ota build \
@@ -97,7 +111,7 @@ gpuix ota build \
   --private-key .gpuix-ota-keys/ota-private.pem
 ```
 
-随后把 `dist/ota/` 目录（`manifest.json` + `bundles/<releaseId>/app.hbc`）上传到任意静态 HTTP 服务即可。
+随后把 `dist/ota/` 目录（`manifest.json`、`chain.json` 与 `bundles/`）上传到任意静态 HTTP 服务即可。
 
 ---
 

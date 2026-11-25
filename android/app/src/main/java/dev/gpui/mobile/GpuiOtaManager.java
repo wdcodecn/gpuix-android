@@ -940,6 +940,44 @@ public final class GpuiOtaManager {
         long bundleSize = bundle != null ? bundle.optLong("size", 0) : 0;
         long hbcVersion = bundle != null ? bundle.optLong("hermesBytecodeVersion", 0) : 0;
 
+        JSONObject integrity = manifest.optJSONObject("integrity");
+        if (integrity != null) {
+            String platform = manifest.optString("platform", "all").trim();
+            if (platform.isEmpty()) platform = "all";
+            String versionName = manifest.optString("versionName", "").trim();
+            long chunkSize = integrity.optLong("chunkSize", 0);
+            long chunkCount = integrity.optLong("chunkCount", 0);
+            String merkleRoot = integrity.optString("merkleRoot", "").trim().toLowerCase(Locale.US);
+            String prevReleaseHash = integrity.optString("prevReleaseHash", "").trim().toLowerCase(Locale.US);
+            String releaseHash = integrity.optString("releaseHash", "").trim().toLowerCase(Locale.US);
+            long chainIndex = integrity.optLong("chainIndex", 0);
+            String chainMerkleRoot = integrity.optString("chainMerkleRoot", "").trim().toLowerCase(Locale.US);
+
+            return "gpuix-ota-manifest-v2\n"
+                    + "schemaVersion=" + schemaVersion + "\n"
+                    + "action=" + action + "\n"
+                    + "appId=" + appId + "\n"
+                    + "channel=" + channel + "\n"
+                    + "platform=" + platform + "\n"
+                    + "versionName=" + versionName + "\n"
+                    + "runtimeVersion=" + runtimeVersion + "\n"
+                    + "releaseId=" + releaseId + "\n"
+                    + "minVersionCode=" + minVersionCode + "\n"
+                    + "manifestSeq=" + manifestSeq + "\n"
+                    + "mandatory=" + (mandatory ? "true" : "false") + "\n"
+                    + "bundleFormat=" + bundleFormat + "\n"
+                    + "bundleSha256=" + bundleSha256 + "\n"
+                    + "bundleSize=" + bundleSize + "\n"
+                    + "hermesBytecodeVersion=" + hbcVersion + "\n"
+                    + "chunkSize=" + chunkSize + "\n"
+                    + "chunkCount=" + chunkCount + "\n"
+                    + "merkleRoot=" + merkleRoot + "\n"
+                    + "prevReleaseHash=" + prevReleaseHash + "\n"
+                    + "releaseHash=" + releaseHash + "\n"
+                    + "chainIndex=" + chainIndex + "\n"
+                    + "chainMerkleRoot=" + chainMerkleRoot + "\n";
+        }
+
         return "gpuix-ota-manifest-v1\n"
                 + "schemaVersion=" + schemaVersion + "\n"
                 + "action=" + action + "\n"

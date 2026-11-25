@@ -1,7 +1,9 @@
 import type {
+  GpuixAppInfo,
   GpuixBatchMutation,
   GpuixNativeBinding,
   GpuixNativeSdk,
+  GpuixPlatform,
   GpuixRendererEventCallback,
   GpuixRendererInstance,
   ViewportInsets,
@@ -22,9 +24,28 @@ import { handleWsEvent, installWebSocket } from './websocket'
 import { ensureViewportMetrics } from './viewport'
 import { createStyleCache, encodeBatch } from './gpx1'
 
-export function installAndroidRuntime(): void {
+declare const __GPUIX_PLATFORM__: GpuixPlatform | undefined
+declare const __GPUIX_APP_INFO__: GpuixAppInfo | undefined
+
+export function installMobileRuntime(): void {
   const g = globalThis as Record<string, unknown>
-  g.__gpuixAndroid = true
+  const definedPlatform = typeof __GPUIX_PLATFORM__ === 'string' ? __GPUIX_PLATFORM__ : undefined
+  const platform: GpuixPlatform =
+    definedPlatform === 'ios' || definedPlatform === 'android'
+      ? definedPlatform
+      : g.__gpuixPlatform === 'ios'
+        ? 'ios'
+        : 'android'
+  g.__gpuixPlatform = platform
+  g.__gpuixMobile = true
+  if (platform === 'android') {
+    g.__gpuixAndroid = true
+  } else if (platform === 'ios') {
+    g.__gpuixIos = true
+  }
+  if (typeof __GPUIX_APP_INFO__ === 'object' && __GPUIX_APP_INFO__ !== null) {
+    g.__gpuixAppInfo = __GPUIX_APP_INFO__
+  }
   installHotLifecycleHooks()
   installTextPolyfills()
   installUrlPolyfills()
@@ -34,7 +55,10 @@ export function installAndroidRuntime(): void {
   ensureViewportMetrics()
 }
 
-installAndroidRuntime()
+/** Backward-compatible alias for `installMobileRuntime`. */
+export const installAndroidRuntime = installMobileRuntime
+
+installMobileRuntime()
 
 function isRedBoxActive(): boolean {
   const g = globalThis as {
@@ -242,9 +266,11 @@ export type {
   FsEntry,
   FsScope,
   FsStorageInfo,
+  GpuixAppInfo,
   GpuixBatchMutation,
   GpuixNativeBinding,
   GpuixNativeSdk,
+  GpuixPlatform,
   GpuixRendererEvent,
   GpuixRendererEventCallback,
   GpuixRendererInstance,
@@ -252,6 +278,7 @@ export type {
   MediaPickResult,
   NetworkChangeEvent,
   OtaManifest,
+  OtaManifestIntegrity,
   OtaProgressEvent,
   OtaState,
   SensorReading,

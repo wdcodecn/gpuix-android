@@ -33,7 +33,7 @@ android {
     }
     buildFeatures {
         // AGP 9 disables generated resource values by default. The app label
-        // is generated from gpuix.android.json for each consumer project.
+        // is generated from gpuix.config.json / gpuix.android.json for each consumer project.
         resValues = true
     }
     defaultConfig {

@@ -2,12 +2,20 @@
 set -euo pipefail
 
 android_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+repo_root="$(cd "$android_root/.." && pwd)"
+if [[ -n "${GPUIX_NATIVE_ROOT:-}" ]]; then
+  native_root="$GPUIX_NATIVE_ROOT"
+elif [[ -d "$android_root/vendor/gpuix-native" ]]; then
+  native_root="$android_root"
+else
+  native_root="$repo_root/native"
+fi
 project_root="${GPUIX_PROJECT_ROOT:-$(dirname "$android_root")}"
 out_dir="${GPUIX_OUT_DIR:-$project_root/dist/android}"
 sdk_root="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-$HOME/Library/Android/sdk}}"
 ndk_root="${ANDROID_NDK_ROOT:-$sdk_root/ndk/30.0.16248370}"
 shared_cache="${GPUIX_SHARED_CACHE:-1}"
-cache_root="${GPUIX_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/gpuix-android}"
+cache_root="${GPUIX_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/gpuix-mobile}"
 
 is_windows=0
 case "$(uname -s)" in
@@ -181,6 +189,7 @@ compute_native_fingerprint() {
   local rustc_ver="$3"
   local zed_dirty="$4"
   GPUIX_HASH_ROOT="$android_root" \
+  GPUIX_HASH_NATIVE_ROOT="$native_root" \
   GPUIX_HASH_ABI="$abi" \
   GPUIX_HASH_PROFILE="$rust_profile" \
   GPUIX_HASH_FEATURES="$features_key" \
@@ -193,6 +202,7 @@ compute_native_fingerprint() {
     const fs = require("node:fs");
     const path = require("node:path");
     const root = process.env.GPUIX_HASH_ROOT;
+    const nativeRoot = process.env.GPUIX_HASH_NATIVE_ROOT || root;
     const h = createHash("sha256");
     h.update("native-cache-v2-api26\n");
     for (const k of [
@@ -207,31 +217,31 @@ compute_native_fingerprint() {
       h.update(k + "=" + (process.env[k] || "") + "\n");
     }
     const ignoreDirs = new Set(["target", ".git"]);
-    function walk(rel) {
-      const abs = path.join(root, rel);
+    function walk(baseDir, rel) {
+      const abs = path.join(baseDir, rel);
       if (!fs.existsSync(abs)) return [];
       const st = fs.lstatSync(abs);
-      if (st.isFile()) return [rel];
+      if (st.isFile()) return [[baseDir, rel]];
       if (!st.isDirectory()) return [];
       const out = [];
       for (const entry of fs.readdirSync(abs, { withFileTypes: true })) {
         if (entry.name === ".DS_Store" || ignoreDirs.has(entry.name)) continue;
         const child = rel ? rel + "/" + entry.name : entry.name;
-        if (entry.isDirectory()) out.push(...walk(child));
-        else if (entry.isFile()) out.push(child);
+        if (entry.isDirectory()) out.push(...walk(baseDir, child));
+        else if (entry.isFile()) out.push([baseDir, child]);
       }
       return out;
     }
-    const files = [
-      ...walk(".cargo/config.toml"),
-      ...walk("rust"),
-      ...walk("vendor/gpuix-native"),
-      ...walk("vendor/gpui-mobile"),
-      ...walk(".build/hermes-android/libgpuix_js.so"),
-    ].sort();
-    for (const f of files) {
-      h.update("F:" + f + "\0");
-      h.update(fs.readFileSync(path.join(root, f)));
+    const items = [
+      ...walk(root, ".cargo/config.toml"),
+      ...walk(root, "rust"),
+      ...walk(nativeRoot, "vendor/gpuix-native"),
+      ...walk(nativeRoot, "vendor/gpui-mobile"),
+      ...walk(root, ".build/hermes-android/libgpuix_js.so"),
+    ].sort((a, b) => a[1].localeCompare(b[1]));
+    for (const [baseDir, rel] of items) {
+      h.update("F:" + rel + "\0");
+      h.update(fs.readFileSync(path.join(baseDir, rel)));
       h.update("\0");
     }
     process.stdout.write(h.digest("hex"));
@@ -283,7 +293,7 @@ if (( js_only )); then
       exit 1
     fi
   fi
-  if [[ ! -x "$android_root/.build/hermes-host/bin/hermesc" && ! -x "$android_root/.build/hermes-host/bin/hermesc.exe" ]]; then
+  if [[ ! -x "$native_root/.build/hermes-host/bin/hermesc" && ! -x "$native_root/.build/hermes-host/bin/hermesc.exe" ]]; then
     bash "$android_root/scripts/build-hermes.sh"
   fi
   if [[ "$variant" == "release" ]]; then
@@ -292,20 +302,21 @@ if (( js_only )); then
     bun "$android_root/scripts/build-js.ts" --debug
   fi
 else
+  zed_source="$native_root/.deps/zed"
   if [[ "$shared_cache" == "1" ]] && (( ! is_windows )); then
-    link_shared_dep "$android_root/.deps/zed" "$cache_root/deps/zed"
+    link_shared_dep "$zed_source" "$cache_root/deps/zed"
   fi
 
-  if [[ ! -d "$android_root/.deps/zed/.git" ]]; then
-    mkdir -p "$android_root/.deps/zed"
-    git -C "$android_root/.deps/zed" init -q
-    git -C "$android_root/.deps/zed" remote add origin https://github.com/remorses/zed.git
+  if [[ ! -d "$zed_source/.git" ]]; then
+    mkdir -p "$zed_source"
+    git -C "$zed_source" init -q
+    git -C "$zed_source" remote add origin https://github.com/remorses/zed.git
   fi
-  if [[ "$(git -C "$android_root/.deps/zed" rev-parse --verify HEAD 2>/dev/null || true)" != "$zed_revision" ]]; then
-    git -C "$android_root/.deps/zed" fetch --depth 1 origin "$zed_revision"
-    git -C "$android_root/.deps/zed" checkout --detach FETCH_HEAD
+  if [[ "$(git -C "$zed_source" rev-parse --verify HEAD 2>/dev/null || true)" != "$zed_revision" ]]; then
+    git -C "$zed_source" fetch --depth 1 origin "$zed_revision"
+    git -C "$zed_source" checkout --detach FETCH_HEAD
   fi
-  [[ "$(git -C "$android_root/.deps/zed" rev-parse HEAD)" == "$zed_revision" ]] || {
+  [[ "$(git -C "$zed_source" rev-parse HEAD)" == "$zed_revision" ]] || {
     echo "Android GPUI dependency is not at the pinned revision" >&2; exit 1;
   }
 
@@ -331,8 +342,14 @@ else
 
   cargo_features_arg=()
   features_key="<default>"
-  if bun_features="$(bun "$android_root/scripts/config.ts" --field features --project "$project_root" 2>/dev/null)"; then
-    if grep -q '"features"' "$project_root/gpuix.android.json" 2>/dev/null; then
+  cfg_file=""
+  if [[ -f "$project_root/gpuix.config.json" ]]; then
+    cfg_file="$project_root/gpuix.config.json"
+  elif [[ -f "$project_root/gpuix.android.json" ]]; then
+    cfg_file="$project_root/gpuix.android.json"
+  fi
+  if [[ -n "$cfg_file" ]] && grep -q '"features"' "$cfg_file" 2>/dev/null; then
+    if bun_features="$(bun "$android_root/scripts/config.ts" --field features --project "$project_root" 2>/dev/null)"; then
       if [[ -n "$bun_features" ]]; then
         cargo_features_arg=(--no-default-features --features "$bun_features")
         features_key="--no-default-features --features $bun_features"
@@ -346,7 +363,7 @@ else
   ndk_toolchain="$ndk_root/toolchains/llvm/prebuilt/$ndk_host"
   llvm_strip="$ndk_toolchain/bin/llvm-strip"
   rustc_ver="$(cd "$android_root/rust" && rustc -vV | tr '\n' ' ')"
-  zed_dirty="$({ git -C "$android_root/.deps/zed" status --porcelain; git -C "$android_root/.deps/zed" diff; } | sha256_stream)"
+  zed_dirty="$({ git -C "$zed_source" status --porcelain; git -C "$zed_source" diff; } | sha256_stream)"
 
   for abi in "${target_abis[@]}"; do
     case "$abi" in
@@ -477,7 +494,7 @@ mkdir -p "$out_dir"
 artifact_stem="$(basename "$project_root" | tr -cs 'A-Za-z0-9._-' '-')"
 artifact_stem="${artifact_stem#-}"
 artifact_stem="${artifact_stem%-}"
-artifact_stem="${artifact_stem:-gpuix-android}"
+artifact_stem="${artifact_stem:-gpuix-mobile}"
 if (( bundle )); then
   artifact_path="$out_dir/$artifact_stem-release.aab"
   cp "$android_root/app/build/outputs/bundle/release/app-release.aab" "$artifact_path"

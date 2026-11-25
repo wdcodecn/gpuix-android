@@ -13,20 +13,25 @@ bun run typecheck
 bun run dev
 ```
 
-## Android
+## 移动端构建与运行（Android & iOS）
 
 ```sh
 bun run gpuix:doctor
-bun run gpuix:build
+bun run gpuix:build             # Android debug APK
 bun run gpuix:run -- <ADB_SERIAL>
+bun run gpuix:build:ios         # iOS 模拟器 .app
+bun run gpuix:run:ios           # 构建并在 iOS 模拟器安装启动
 ```
 
 发布构建：
 
 ```sh
-gpuix build --release       # 本地 release APK
-gpuix build --aab           # Google Play App Bundle
+gpuix build android --release       # 本地 release APK
+gpuix build android --aab           # Google Play App Bundle
+gpuix build ios                     # iOS 模拟器 .app
 ```
 
-`gpuix.android.json` 是 Android 交付配置。`versionCode` 每次发布必须递增；当前
-starter 的 release 构建使用 debug keystore 仅用于本地验收，商店发布前要配置正式签名。
+`gpuix.config.json` 管理跨端应用 ID、显示名称、展示版本号 `versionName`
+（例如 `1.0.0`、`1.1.1`）、`versionCode` 以及 `android` / `ios` / `ota` 分区配置。
+`versionCode` 每次发布必须递增；当前 Android release 构建使用 debug keystore
+仅用于本地验收，商店发布前要配置正式签名。

@@ -8,8 +8,8 @@ import {
   GpxTextEncoder,
   utf8Decode,
   utf8Encode,
-} from '../android/runtime/utf8'
-import { GpxURL, GpxURLSearchParams } from '../android/runtime/url'
+} from '../runtime/utf8'
+import { GpxURL, GpxURLSearchParams } from '../runtime/url'
 import {
   GpxAbortController,
   GpxAbortSignal,
@@ -17,20 +17,20 @@ import {
   GpxHeaders,
   GpxResponse,
   installWebApis,
-} from '../android/runtime/web-apis'
-import { createStyleCache, encodeBatch, GPX1_OPCODES } from '../android/runtime/gpx1'
+} from '../runtime/web-apis'
+import { createStyleCache, encodeBatch, GPX1_OPCODES } from '../runtime/gpx1'
 import {
   createGpuixNativeSdk,
   handleBackPressedEvent,
   handleBridgeChannelEvent,
   handleBridgeResultEvent,
   handleDeepLinkEvent,
-} from '../android/runtime/native-bridge'
-import { GpxWebSocket, handleWsEvent } from '../android/runtime/websocket'
-import { ensureViewportMetrics } from '../android/runtime/viewport'
-import { getBridgeState, installHotLifecycleHooks } from '../android/runtime/bridge-state'
-import { GpuixRenderer } from '../android/runtime/index'
-import type { GpuixBatchMutation, ViewportInsets, ViewportSize } from '../android/runtime/types'
+} from '../runtime/native-bridge'
+import { GpxWebSocket, handleWsEvent } from '../runtime/websocket'
+import { ensureViewportMetrics } from '../runtime/viewport'
+import { getBridgeState, installHotLifecycleHooks } from '../runtime/bridge-state'
+import { GpuixRenderer, installMobileRuntime } from '../runtime/index'
+import type { GpuixAppInfo, GpuixBatchMutation, ViewportInsets, ViewportSize } from '../runtime/types'
 
 const g = globalThis as Record<string, unknown>
 const originalNative = g.__gpuixNative
@@ -783,5 +783,47 @@ describe('android/runtime native-bridge, websocket, viewport & renderer', () => 
     ;(g.__gpuixHotCleanup as () => void)()
     expect(getBridgeState().pendingBridge.size).toBe(0)
     await expect(inFlight).rejects.toThrow('cancelled by hot reload')
+  })
+})
+
+describe('installMobileRuntime platform detection & app info', () => {
+  test('marks iOS without setting __gpuixAndroid and exposes __GPUIX_APP_INFO__', () => {
+    const keys = [
+      '__gpuixPlatform',
+      '__gpuixMobile',
+      '__gpuixIos',
+      '__gpuixAndroid',
+      '__GPUIX_APP_INFO__',
+      '__gpuixAppInfo',
+    ] as const
+    const prev = Object.fromEntries(keys.map((k) => [k, g[k]]))
+    try {
+      for (const k of keys) delete g[k]
+      const mockAppInfo: GpuixAppInfo = {
+        appId: 'dev.gpuix.baseui',
+        appName: 'GPUIX Base UI',
+        versionName: '2.7.0',
+        versionCode: 27,
+        platform: 'ios',
+        channel: 'production',
+        runtimeVersion: '27',
+        buildHash: 'abcdef012345',
+      }
+      g.__gpuixPlatform = 'ios'
+      g.__GPUIX_APP_INFO__ = mockAppInfo
+
+      installMobileRuntime()
+
+      expect(g.__gpuixMobile).toBe(true)
+      expect(g.__gpuixPlatform).toBe('ios')
+      expect(g.__gpuixIos).toBe(true)
+      expect(g.__gpuixAndroid).toBeUndefined()
+      expect(g.__gpuixAppInfo).toEqual(mockAppInfo)
+    } finally {
+      for (const k of keys) {
+        if (prev[k] === undefined) delete g[k]
+        else g[k] = prev[k]
+      }
+    }
   })
 })

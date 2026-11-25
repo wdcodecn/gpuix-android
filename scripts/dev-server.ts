@@ -1,12 +1,14 @@
 import path from 'node:path'
 import { watch } from 'node:fs'
 import {
-  createAndroidPlugins,
+  buildInjectedAppInfo,
+  createRuntimePlugins,
   DEBUG_WRAPPER_LINE_OFFSET,
   normalizeAndroidFonts,
+  stampBuildHash,
   wrapDebugBundle,
-} from '../android/scripts/build-js'
-import { loadGpuixAndroidConfig } from '../android/scripts/config'
+} from './bundler'
+import { loadGpuixConfig, type GpuixConfig } from './config'
 import { parseSourceMap, symbolicateStack, type ParsedSourceMap, type RawSourceMap } from './sourcemap'
 
 export type DevServerOptions = {
@@ -21,7 +23,19 @@ type PendingWaiter = {
   timer: ReturnType<typeof setTimeout>
 }
 
-const IGNORED_PREFIXES = ['.git/', 'node_modules/', 'dist/', 'android/.build/', 'android/target/', 'android/.gradle/', 'android/app/build/']
+const IGNORED_PREFIXES = [
+  '.git/',
+  'node_modules/',
+  'dist/',
+  'native/.build/',
+  'native/target/',
+  'android/.build/',
+  'android/target/',
+  'android/.gradle/',
+  'android/app/build/',
+  'ios/.build/',
+  'ios/target/',
+]
 
 function isIgnoredPath(relativePath: string): boolean {
   const normalized = relativePath.split(path.sep).join('/')
@@ -86,10 +100,11 @@ function startLogcatStream(serial: string): ReturnType<typeof Bun.spawn> {
 
 async function buildHotBundle(
   projectRoot: string,
-  entrypointRel: string,
+  config: GpuixConfig,
   port: number,
 ): Promise<{ bundle: string; sourceMap: ParsedSourceMap | null }> {
-  const entrypoint = path.join(projectRoot, entrypointRel)
+  const entrypoint = path.join(projectRoot, config.entrypoint)
+  const appInfo = buildInjectedAppInfo('android', config)
   const result = await Bun.build({
     entrypoints: [entrypoint],
     naming: 'app.js',
@@ -102,8 +117,10 @@ async function buildHotBundle(
       process: 'undefined',
       window: 'undefined',
       Bun: 'undefined',
+      __GPUIX_PLATFORM__: '"android"',
+      __GPUIX_APP_INFO__: JSON.stringify(appInfo),
     },
-    plugins: createAndroidPlugins(),
+    plugins: createRuntimePlugins(),
   })
 
   if (!result.success) {
@@ -126,8 +143,9 @@ async function buildHotBundle(
     sourceMap = null
   }
 
+  const normalized = stampBuildHash(normalizeAndroidFonts(rawSource), 'android', config).source
   return {
-    bundle: wrapDebugBundle(normalizeAndroidFonts(rawSource), port),
+    bundle: wrapDebugBundle(normalized, port),
     sourceMap,
   }
 }
@@ -145,7 +163,7 @@ function buildCompileErrorScript(title: string, message: string): string {
 
 export async function runDevServer(options: DevServerOptions): Promise<void> {
   const { projectRoot, serial, port, logcat = false } = options
-  const config = await loadGpuixAndroidConfig(projectRoot)
+  const config = await loadGpuixConfig(projectRoot)
   const targetSerial = await resolveOnlineSerial(serial)
   await setupAdbReverse(port, targetSerial)
   const logcatProc = logcat && targetSerial ? startLogcatStream(targetSerial) : null
@@ -183,7 +201,7 @@ export async function runDevServer(options: DevServerOptions): Promise<void> {
     building = true
     const startedAt = performance.now()
     try {
-      const built = await buildHotBundle(projectRoot, config.entrypoint, port)
+      const built = await buildHotBundle(projectRoot, config, port)
       lastBuildMs = Math.round((performance.now() - startedAt) * 10) / 10
       lastError = null
       version += 1
